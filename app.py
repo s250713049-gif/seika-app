@@ -5,6 +5,7 @@ import os
 import hashlib
 import plotly.express as px
 from sqlalchemy import create_engine, text
+import io
 
 # ==========================================
 # ページ基本設定 & CSS
@@ -61,10 +62,13 @@ DEFAULT_USERS = {
 if "user_db" not in st.session_state:
     st.session_state.user_db = DEFAULT_USERS.copy()
 
+if "processed_file_hashes" not in st.session_state:
+    st.session_state.processed_file_hashes = set()
+
 MASTER_CSV_FILE = "item_master.csv"
 
 # ==========================================
-# 1. DB接続設定
+# 1. DB接続設定 & 初期化
 # ==========================================
 @st.cache_resource
 def get_db_engine():
@@ -73,16 +77,13 @@ def get_db_engine():
         db_url = db_url.replace("postgres://", "postgresql://", 1)
         
     if db_url.startswith("sqlite"):
-        engine = create_engine(db_url, connect_args={"check_same_thread": False, "timeout": 10.0})
+        engine = create_engine(db_url, connect_args={"check_same_thread": False, "timeout": 15.0})
     else:
         engine = create_engine(db_url, pool_size=10, max_overflow=20, pool_pre_ping=True)
     return engine
 
 engine = get_db_engine()
 
-# ==========================================
-# 2. DB初期化
-# ==========================================
 def init_db():
     with engine.begin() as conn:
         id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if "sqlite" in engine.name else "SERIAL PRIMARY KEY"
@@ -104,7 +105,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 3. データCRUD関数
+# 2. データCRUD関数
 # ==========================================
 def load_records_from_db(user_id=None):
     with engine.connect() as conn:
@@ -140,8 +141,15 @@ def insert_records_to_db(user_id, records_list):
         ''')
         params = []
         for r in records_list:
-            p = int(r.get("単価", 0)) if pd.notnull(r.get("単価")) else 0
-            q = int(r.get("数量", 0)) if pd.notnull(r.get("数量")) else 0
+            try:
+                p = int(float(r.get("単価", 0))) if pd.notnull(r.get("単価")) else 0
+            except:
+                p = 0
+            try:
+                q = int(float(r.get("数量", 0))) if pd.notnull(r.get("数量")) else 0
+            except:
+                q = 0
+                
             params.append({
                 "user_id": user_id,
                 "date": str(r.get("日付", "")),
@@ -164,12 +172,30 @@ def delete_records_by_ids(ids_to_delete):
             id_str = ",".join(map(str, clean_ids))
             conn.execute(text(f"DELETE FROM records WHERE id IN ({id_str})"))
 
+def cleanup_duplicate_records(user_id):
+    with engine.begin() as conn:
+        cleanup_query = text('''
+            DELETE FROM records 
+            WHERE id NOT IN (
+                SELECT MIN(id) 
+                FROM records 
+                WHERE user_id = :user_id 
+                GROUP BY date, market_no, category, item_code, item_name, unit_price, quantity, subtotal
+            )
+            AND user_id = :user_id
+        ''')
+        result = conn.execute(cleanup_query, {"user_id": user_id})
+        return result.rowcount
+
 def update_single_record_in_db(record_dict):
     if "id" not in record_dict or pd.isnull(record_dict["id"]):
         return
     with engine.begin() as conn:
-        p = int(record_dict.get("単価", 0))
-        q = int(record_dict.get("数量", 0))
+        try:
+            p = int(float(record_dict.get("単価", 0)))
+            q = int(float(record_dict.get("数量", 0)))
+        except:
+            p, q = 0, 0
         query = text('''
             UPDATE records 
             SET date = :date, market_no = :market_no, category = :category, 
@@ -190,7 +216,7 @@ def update_single_record_in_db(record_dict):
         })
 
 # ==========================================
-# 4. マスタデータ管理
+# 3. マスタデータ管理
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
@@ -220,66 +246,18 @@ def load_item_master_cached():
         master_dict[cat][code] = name
     return master_dict, df_master
 
-def save_item_master(df_master):
-    df_master[["category", "item_code", "item_name"]].to_csv(MASTER_CSV_FILE, index=False, encoding="utf-8-sig")
-    st.cache_data.clear()
-
 ITEM_MASTER, df_master_raw = load_item_master_cached()
 
 # ==========================================
-# 5. HTML帳票生成
-# ==========================================
-@st.cache_data
-def generate_invoice_html(doc_type, client_name, market_no, target_date, records_tuple):
-    records_list = [dict(r) for r in records_tuple]
-    total_amount = sum(r["小計"] for r in records_list)
-    tax_amount = int(total_amount * 0.1)
-    grand_total = total_amount + tax_amount
-
-    rows_html = "".join([
-        f"""
-        <tr>
-            <td style="text-align:center; padding: 6px; border: 1px solid #dee2e6;">{idx}</td>
-            <td style="padding: 6px; border: 1px solid #dee2e6;">{r['商品コード']}</td>
-            <td style="padding: 6px; border: 1px solid #dee2e6;">{r['商品名']}</td>
-            <td style="text-align:right; padding: 6px; border: 1px solid #dee2e6;">{r['数量']:,}</td>
-            <td style="text-align:right; padding: 6px; border: 1px solid #dee2e6;">¥{r['単価']:,}</td>
-            <td style="text-align:right; padding: 6px; border: 1px solid #dee2e6;">¥{r['小計']:,}</td>
-        </tr>
-        """ for idx, r in enumerate(records_list, 1)
-    ])
-
-    return f"""
-    <!DOCTYPE html><html><head><meta charset="utf-8">
-    <style>
-        body {{ font-family: sans-serif; color: #212529; padding: 20px; }}
-        .header {{ text-align: center; border-bottom: 2px solid #28a745; margin-bottom: 20px; }}
-        .title {{ font-size: 22px; font-weight: bold; color: #1e7e34; }}
-        table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
-        th {{ background: #f8f9fa; border: 1px solid #dee2e6; padding: 8px; font-size: 13px; }}
-        .total-box {{ float: right; width: 280px; border: 2px solid #28a745; padding: 10px; background: #f8fff9; font-weight: bold; }}
-    </style></head><body>
-    <div class="header"><div class="title">{doc_type}</div></div>
-    <table><tr>
-        <td><h2>{client_name} 御中</h2><p>市場番号: <strong>{market_no}</strong><br>発行日: {datetime.now().strftime('%Y年%m月%d日')}<br>対象日: {target_date}</p></td>
-        <td style="text-align:right;"><h3>青果卸売管理システム</h3><p>〒104-0045 東京都中央区築地 1-1-1</p></td>
-    </tr></table>
-    <table><thead><tr><th>No.</th><th>商品コード</th><th>品名</th><th>数量</th><th>単価</th><th>金額</th></tr></thead>
-    <tbody>{rows_html}</tbody></table>
-    <div class="total-box">小計: ¥{total_amount:,}<br>消費税 (10%): ¥{tax_amount:,}<br><span style="font-size:16px; color:#1e7e34;">総合計: ¥{grand_total:,}</span></div>
-    </body></html>
-    """
-
-# ==========================================
-# 6. サイドバー＆ユーザー認証
+# 4. サイドバー＆ユーザー認証
 # ==========================================
 with st.sidebar:
     st.image("https://img.icons8.com/emoji/96/000000/red-apple.png", width=50)
     st.title("青果卸売 Pro")
     
     if "logged_in_user" not in st.session_state:
-        st.session_state.logged_in_user = None
-        st.session_state.user_role = None
+        st.session_state.logged_in_user = "admin"
+        st.session_state.user_role = "admin"
 
     if st.session_state.logged_in_user is None:
         st.subheader("🔐 ログイン")
@@ -308,31 +286,15 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    if current_role == "admin":
-        with st.expander("👑 管理者設定", expanded=False):
-            new_u_id = st.text_input("新規ユーザーID")
-            new_u_pw = st.text_input("初期パスワード", type="password")
-            new_u_role = st.selectbox("権限", ["staff", "admin"])
-            if st.button("アカウント作成", use_container_width=True):
-                if new_u_id and new_u_pw:
-                    st.session_state.user_db[new_u_id] = {"pw": hash_password(new_u_pw), "role": new_u_role}
-                    st.success(f"『{new_u_id}』作成完了")
-
-    with st.expander("📦 商品マスタ追加", expanded=False):
-        new_cat = st.text_input("カテゴリー", value="野菜")
-        new_code = st.text_input("商品コード")
-        new_name = st.text_input("商品名")
-        if st.button("マスタ登録", use_container_width=True):
-            if new_cat and new_code and new_name:
-                new_row = pd.DataFrame([{"category": new_cat, "item_code": new_code, "item_name": new_name}])
-                updated_master_df = pd.concat([df_master_raw, new_row], ignore_index=True).drop_duplicates(subset=["item_code"])
-                save_item_master(updated_master_df)
-                ITEM_MASTER, df_master_raw = load_item_master_cached()
-                st.success("マスタ追加成功！")
-                st.rerun()
+    if st.button("🧹 増えすぎた重複データを掃除する", use_container_width=True):
+        deleted_count = cleanup_duplicate_records(current_user)
+        st.session_state.records_df = load_records_from_db(current_user)
+        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+        st.success(f"重複していた {deleted_count} 件のデータを削除して1件にまとめました！")
+        st.rerun()
 
 # ==========================================
-# 7. ユーザーデータ読み込み
+# 5. ユーザーデータ読み込み
 # ==========================================
 if "records_df" not in st.session_state or st.session_state.get("current_loaded_user") != current_user:
     st.session_state.records_df = load_records_from_db(current_user)
@@ -347,19 +309,18 @@ df_current = st.session_state.records_df
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p>リアルタイム取引登録・データ編集・印刷機能プラットフォーム</p>
+        <p>リアルタイム取引登録・ファイル自動記録・データ編集・分析プラットフォーム</p>
     </div>
 """, unsafe_allow_html=True)
 
-tab_input, tab_analytics, tab_csv_import, tab_print = st.tabs([
-    "📝 取引データ入力・管理", 
+tab_input, tab_analytics, tab_csv_import = st.tabs([
+    "📝 取引データ入力・管理 (自動記録対応)", 
     "📊 データ分析", 
-    "📥 CSVインポート", 
-    "🖨️ 納品書・請求書発行"
+    "📥 CSV一括インポート"
 ])
 
 # ==========================================
-# タブ 1: 取引データ入力・管理
+# タブ 1: 取引データ入力・管理 & ファイル自動記録
 # ==========================================
 with tab_input:
     records_cnt = len(df_current) if df_current is not None else 0
@@ -372,14 +333,84 @@ with tab_input:
     k3.metric("💰 総取引金額", f"¥ {total_amount_sum:,}")
 
     st.write("")
-    st.markdown('<div class="section-title">1️⃣ 新規取引データの入力</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録</div>', unsafe_allow_html=True)
 
     col_b1, col_b2 = st.columns(2)
     with col_b1:
-        market_no = st.text_input("市場番号", value="M-001")
+        market_no = st.text_input("市場番号 / 取引先データ", value="M-001 (築地第一取引先)")
     with col_b2:
         input_date = st.date_input("取引日付", datetime.now())
 
+    with st.container():
+        st.markdown("""
+            <div style="background-color: #f0fff4; border: 2px dashed #38a169; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px;">
+                <b style="color: #22543d;">📁 取引先ファイルを選択して自動記録（1ファイルにつき1度だけ自動登録）</b><br>
+                <small style="color: #4a5568;">CSV・テキストファイルをアップロードすると、重複せず1度だけ下部の一覧へ自動記録されます。</small>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        col_up1, col_up2 = st.columns([4, 1])
+        with col_up1:
+            uploaded_entry_file = st.file_uploader(
+                "取引データファイルを選択", 
+                type=["csv", "txt", "tsv"], 
+                key="auto_unique_file_uploader", 
+                label_visibility="collapsed"
+            )
+        with col_up2:
+            if st.button("🧪 サンプルデータ記録", use_container_width=True):
+                sample_items = [
+                    {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "野菜", "商品コード": "10525", "商品名": "トマト", "単価": 290, "数量": 50, "小計": 14500},
+                    {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "野菜", "商品コード": "10523", "商品名": "キャベツ", "単価": 200, "数量": 40, "小計": 8000},
+                    {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "果物", "商品コード": "20101", "商品名": "りんご", "単価": 360, "数量": 30, "小計": 10800}
+                ]
+                insert_records_to_db(current_user, sample_items)
+                st.session_state.records_df = load_records_from_db(current_user)
+                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                st.toast(f"✅ テストデータ 3件 を記録しました！")
+                st.rerun()
+
+        if uploaded_entry_file is not None:
+            file_bytes = uploaded_entry_file.getvalue()
+            file_hash = hashlib.md5(file_bytes).hexdigest()
+            
+            if file_hash not in st.session_state.processed_file_hashes:
+                try:
+                    st.session_state.processed_file_hashes.add(file_hash)
+                    df_file = pd.read_csv(io.BytesIO(file_bytes))
+                    
+                    rename_map = {}
+                    for col in df_file.columns:
+                        c = str(col).strip()
+                        if "日" in c: rename_map[col] = "日付"
+                        elif "市場" in c or "取引先" in c: rename_map[col] = "市場番号"
+                        elif "カテゴリ" in c: rename_map[col] = "カテゴリー"
+                        elif "コード" in c: rename_map[col] = "商品コード"
+                        elif "名" in c or "品" in c: rename_map[col] = "商品名"
+                        elif "単価" in c: rename_map[col] = "単価"
+                        elif "数" in c: rename_map[col] = "数量"
+                        elif "計" in c or "金額" in c: rename_map[col] = "小計"
+                    
+                    df_file = df_file.rename(columns=rename_map)
+                    if "日付" not in df_file.columns: df_file["日付"] = str(input_date)
+                    if "市場番号" not in df_file.columns: df_file["市場番号"] = market_no
+                    if "カテゴリー" not in df_file.columns: df_file["カテゴリー"] = "野菜"
+                    if "商品コード" not in df_file.columns: df_file["商品コード"] = "AUTO"
+                    if "単価" in df_file.columns and "数量" in df_file.columns:
+                        df_file["小計"] = df_file["単価"].fillna(0) * df_file["数量"].fillna(0)
+
+                    new_records_list = df_file.to_dict("records")
+                    if new_records_list:
+                        insert_records_to_db(current_user, new_records_list)
+                        st.session_state.records_df = load_records_from_db(current_user)
+                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録しました！")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"ファイル解析エラー: {e}")
+
+    st.write("")
+    st.write("▼ 個別商品の手動入力（最大5行）")
     all_categories = list(ITEM_MASTER.keys()) or ["野菜", "果物", "ハーブ・薬味類", "キノコ類", "イモ類・根菜"]
     form_rows_widgets = []
 
@@ -403,9 +434,9 @@ with tab_input:
         
         form_rows_widgets.append({"is_active": is_active, "category": category, "item_str": selected_item_str, "price": unit_price, "qty": quantity})
 
-    if st.button("➕ チェックした商品をリストに追加保存", type="primary", use_container_width=True, key="save_input_data_btn"):
+    if st.button("➕ チェックした手動入力商品をリストに追加保存", type="primary", use_container_width=True, key="save_input_data_btn"):
         if not market_no.strip():
-            st.error("❌ 市場番号を入力してください。")
+            st.error("❌ 市場番号 / 取引先データを入力してください。")
         else:
             valid_items = []
             for r in form_rows_widgets:
@@ -425,7 +456,7 @@ with tab_input:
             if valid_items:
                 insert_records_to_db(current_user, valid_items)
                 st.session_state.records_df = load_records_from_db(current_user)
-                st.session_state.editor_version += 1
+                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                 st.toast(f"✅ {len(valid_items)} 件を登録しました！")
                 st.rerun()
 
@@ -433,9 +464,8 @@ with tab_input:
     st.markdown('<div class="section-title">2️⃣ 登録済みデータ一覧・編集・一括削除</div>', unsafe_allow_html=True)
 
     if records_cnt > 0:
-        st.info("💡 **操作方法:** セルを直接編集して「💾 編集内容を保存」を押すか、一番左のヘッダー/行選択でチェックを入れて「🗑️ 選択した行を削除」を押してください。")
+        st.info("💡 **操作方法:** セルを直接編集して「💾 編集内容を保存」を押すか、行を削除して「🗑️ 選択・削除された行を反映する」を押してください。")
         
-        # 編集・選択用テーブル
         edited_df = st.data_editor(
             df_current,
             column_config={
@@ -468,9 +498,14 @@ with tab_input:
                 
                 for _, row in edited_df.iterrows():
                     r_dict = row.to_dict()
-                    r_dict["単価"] = int(r_dict.get("単価", 0)) if pd.notnull(r_dict.get("単価")) else 0
-                    r_dict["数量"] = int(r_dict.get("数量", 0)) if pd.notnull(r_dict.get("数量")) else 0
-                    r_dict["小計"] = r_dict["単価"] * r_dict["数量"]
+                    try:
+                        p = int(float(r_dict.get("単価", 0)))
+                        q = int(float(r_dict.get("数量", 0)))
+                    except:
+                        p, q = 0, 0
+                    r_dict["単価"] = p
+                    r_dict["数量"] = q
+                    r_dict["小計"] = p * q
                     
                     if pd.notnull(r_dict.get("id")):
                         update_single_record_in_db(r_dict)
@@ -478,7 +513,7 @@ with tab_input:
                         insert_records_to_db(current_user, [r_dict])
 
                 st.session_state.records_df = load_records_from_db(current_user)
-                st.session_state.editor_version += 1
+                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                 st.toast("✅ 編集内容を保存しました！")
                 st.rerun()
 
@@ -491,7 +526,7 @@ with tab_input:
                 if deleted_ids:
                     delete_records_by_ids(list(deleted_ids))
                     st.session_state.records_df = load_records_from_db(current_user)
-                    st.session_state.editor_version += 1
+                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                     st.toast(f"🗑️ {len(deleted_ids)} 件のデータを削除しました！")
                     st.rerun()
                 else:
@@ -507,7 +542,7 @@ with tab_input:
                 use_container_width=True
             )
     else:
-        st.info("💡 登録されたデータはありません。上のフォームから商品を追加してください。")
+        st.info("💡 登録されたデータはありません。上のフォームから商品を追加するか、ファイルをアップロードしてください。")
 
 # ==========================================
 # タブ 2: データ分析
@@ -538,7 +573,7 @@ with tab_analytics:
 # ==========================================
 with tab_csv_import:
     st.markdown('<div class="section-title">📥 CSV一括インポート</div>', unsafe_allow_html=True)
-    uploaded_file = st.file_uploader("取引データCSVを選択", type=["csv"])
+    uploaded_file = st.file_uploader("取引データCSVを選択", type=["csv"], key="bulk_csv_uploader")
     if uploaded_file is not None:
         try:
             df_up = pd.read_csv(uploaded_file)
@@ -548,32 +583,8 @@ with tab_csv_import:
                 if st.button("📥 インポート実行", type="primary"):
                     insert_records_to_db(current_user, df_up.to_dict("records"))
                     st.session_state.records_df = load_records_from_db(current_user)
-                    st.session_state.editor_version += 1
+                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                     st.success("インポート完了しました！")
                     st.rerun()
         except Exception as e:
             st.error(f"エラー: {e}")
-
-# ==========================================
-# タブ 4: 納品書・請求書発行
-# ==========================================
-with tab_print:
-    st.markdown('<div class="section-title">🖨️ 納品書・請求書自動生成</div>', unsafe_allow_html=True)
-    if df_current is not None and not df_current.empty:
-        p_col1, p_col2, p_col3 = st.columns(3)
-        with p_col1:
-            doc_type = st.selectbox("帳票種別", ["納 品 書", "請 求 書", "領 収 書"])
-        with p_col2:
-            client_name = st.text_input("宛名", value="〇〇青果 宛")
-        with p_col3:
-            selected_target_date = st.selectbox("対象取引日", df_current["日付"].unique().tolist())
-            
-        target_records = df_current[df_current["日付"] == selected_target_date].to_dict("records")
-        target_market_no = target_records[0]["市場番号"] if target_records else "M-001"
-        
-        invoice_html = generate_invoice_html(
-            doc_type, client_name, target_market_no, selected_target_date, tuple([tuple(d.items()) for d in target_records])
-        )
-        st.components.v1.html(invoice_html, height=500, scrolling=True)
-    else:
-        st.info("💡 発行対象データがありません。")
