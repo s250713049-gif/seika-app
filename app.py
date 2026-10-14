@@ -40,7 +40,15 @@ st.markdown("""
     }
     .role-badge-admin { background-color: #dc3545; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .role-badge-staff { background-color: #28a745; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
-    
+    .login-container {
+        max-width: 440px;
+        margin: 50px auto;
+        padding: 30px;
+        background: white;
+        border-radius: 16px;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.08);
+        border: 1px solid #e2e8f0;
+    }
     div[data-testid="stStatusWidget"] { visibility: hidden; display: none; }
     div[data-st-mode="running"] { opacity: 1 !important; filter: none !important; }
     </style>
@@ -62,8 +70,17 @@ DEFAULT_USERS = {
 if "user_db" not in st.session_state:
     st.session_state.user_db = DEFAULT_USERS.copy()
 
+# ★重要★ 初回アクセス時は未ログイン状態（None）にしてログイン画面を強制表示
+if "logged_in_user" not in st.session_state:
+    st.session_state.logged_in_user = None
+    st.session_state.user_role = None
+
 if "processed_file_hashes" not in st.session_state:
     st.session_state.processed_file_hashes = set()
+
+# 照合結果保持用ステート
+if "verification_batch" not in st.session_state:
+    st.session_state.verification_batch = None
 
 MASTER_CSV_FILE = "item_master.csv"
 
@@ -133,7 +150,7 @@ def load_records_from_db(user_id=None):
 
 def insert_records_to_db(user_id, records_list):
     if not records_list:
-        return
+        return []
     with engine.begin() as conn:
         insert_query = text('''
             INSERT INTO records (user_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal)
@@ -249,41 +266,73 @@ def load_item_master_cached():
 ITEM_MASTER, df_master_raw = load_item_master_cached()
 
 # ==========================================
-# 4. サイドバー＆ユーザー認証
+# 4. ★【新機能】ログイン画面（未ログイン時は全画面で表示）★
+# ==========================================
+if st.session_state.logged_in_user is None:
+    st.markdown("""
+        <div style="text-align: center; margin-top: 30px;">
+            <span style="font-size: 54px;">🍎</span>
+            <h1 style="color: #1e7e34; margin-bottom: 4px;">青果卸売 在庫・取引管理 Pro</h1>
+            <p style="color: #718096; font-size: 14px;">システムへログインしてください</p>
+        </div>
+    """, unsafe_allow_html=True)
+
+    col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
+    with col_l2:
+        with st.container():
+            username_input = st.text_input("👤 ユーザーID", placeholder="admin または 社員ID")
+            password_input = st.text_input("🔒 パスワード", type="password", placeholder="••••••••")
+            
+            if st.button("ログインする", use_container_width=True, type="primary"):
+                hashed_input = hash_password(password_input)
+                user_data = st.session_state.user_db.get(username_input)
+                if user_data and user_data["pw"] == hashed_input:
+                    st.session_state.logged_in_user = username_input
+                    st.session_state.user_role = user_data["role"]
+                    st.rerun()
+                else:
+                    st.error("IDまたはパスワードが無効です")
+
+            st.write("")
+            st.markdown("---")
+            st.caption("テスト用クイックログイン:")
+            q1, q2, q3 = st.columns(3)
+            with q1:
+                if st.button("👑 管理者", use_container_width=True):
+                    st.session_state.logged_in_user = "admin"
+                    st.session_state.user_role = "admin"
+                    st.rerun()
+            with q2:
+                if st.button("👤 user1", use_container_width=True):
+                    st.session_state.logged_in_user = "user1"
+                    st.session_state.user_role = "staff"
+                    st.rerun()
+            with q3:
+                if st.button("👤 staff_a", use_container_width=True):
+                    st.session_state.logged_in_user = "staff_a"
+                    st.session_state.user_role = "staff"
+                    st.rerun()
+    st.stop()  # ログインするまでこれ以降のメインコンテンツは一切実行・表示しない
+
+# ログイン中のユーザー情報を取得
+current_user = st.session_state.logged_in_user
+current_role = st.session_state.user_role
+
+# ==========================================
+# 5. サイドバー
 # ==========================================
 with st.sidebar:
     st.image("https://img.icons8.com/emoji/96/000000/red-apple.png", width=50)
     st.title("青果卸売 Pro")
     
-    if "logged_in_user" not in st.session_state:
-        st.session_state.logged_in_user = "admin"
-        st.session_state.user_role = "admin"
-
-    if st.session_state.logged_in_user is None:
-        st.subheader("🔐 ログイン")
-        username_input = st.text_input("ユーザーID", placeholder="admin または 社員ID")
-        password_input = st.text_input("パスワード", type="password", placeholder="••••••••")
-        
-        if st.button("ログインする", use_container_width=True, type="primary"):
-            hashed_input = hash_password(password_input)
-            user_data = st.session_state.user_db.get(username_input)
-            if user_data and user_data["pw"] == hashed_input:
-                st.session_state.logged_in_user = username_input
-                st.session_state.user_role = user_data["role"]
-                st.rerun()
-            else:
-                st.error("IDまたはパスワードが無効です")
-        st.stop()
-    else:
-        current_user = st.session_state.logged_in_user
-        current_role = st.session_state.user_role
-        role_badge = '<span class="role-badge-admin">👑 管理者</span>' if current_role == "admin" else '<span class="role-badge-staff">👤 一般社員</span>'
-        st.markdown(f"**{current_user}** {role_badge}", unsafe_allow_html=True)
-        if st.button("ログアウト", use_container_width=True):
-            st.session_state.logged_in_user = None
-            st.session_state.user_role = None
-            st.session_state.records_df = None
-            st.rerun()
+    role_badge = '<span class="role-badge-admin">👑 管理者</span>' if current_role == "admin" else '<span class="role-badge-staff">👤 一般社員</span>'
+    st.markdown(f"**{current_user}** {role_badge}", unsafe_allow_html=True)
+    if st.button("ログアウト", use_container_width=True):
+        st.session_state.logged_in_user = None
+        st.session_state.user_role = None
+        st.session_state.records_df = None
+        st.session_state.verification_batch = None
+        st.rerun()
 
     st.divider()
     if st.button("🧹 増えすぎた重複データを掃除する", use_container_width=True):
@@ -294,7 +343,7 @@ with st.sidebar:
         st.rerun()
 
 # ==========================================
-# 5. ユーザーデータ読み込み
+# 6. ユーザーデータ読み込み
 # ==========================================
 if "records_df" not in st.session_state or st.session_state.get("current_loaded_user") != current_user:
     st.session_state.records_df = load_records_from_db(current_user)
@@ -309,18 +358,18 @@ df_current = st.session_state.records_df
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p>リアルタイム取引登録・ファイル自動記録・データ編集・分析プラットフォーム</p>
+        <p>リアルタイム取引登録・ファイル自動記録・データ照合・分析プラットフォーム</p>
     </div>
 """, unsafe_allow_html=True)
 
 tab_input, tab_analytics, tab_csv_import = st.tabs([
-    "📝 取引データ入力・管理 (自動記録対応)", 
+    "📝 取引データ入力・管理 (自動記録・照合対応)", 
     "📊 データ分析", 
     "📥 CSV一括インポート"
 ])
 
 # ==========================================
-# タブ 1: 取引データ入力・管理 & ファイル自動記録
+# タブ 1: 取引データ入力・管理 & ファイル自動記録・整合性照合
 # ==========================================
 with tab_input:
     records_cnt = len(df_current) if df_current is not None else 0
@@ -332,8 +381,64 @@ with tab_input:
     k2.metric("📦 総取引数量", f"{total_qty_sum:,} 個")
     k3.metric("💰 総取引金額", f"¥ {total_amount_sum:,}")
 
+    # ★【新機能】元ファイルとの整合性・完全一致照合表示パネル★
+    if st.session_state.verification_batch is not None:
+        v_batch = st.session_state.verification_batch
+        v_file_name = v_batch["file_name"]
+        expected_df = v_batch["df"]
+        
+        # 現在のDBレコードと照合
+        mismatches = []
+        if df_current is not None and not df_current.empty:
+            for idx, exp_row in expected_df.iterrows():
+                # 商品名と日付で該当行を探す
+                match_cand = df_current[
+                    (df_current["商品名"] == exp_row["商品名"]) & 
+                    (df_current["日付"] == exp_row["日付"])
+                ]
+                if match_cand.empty:
+                    mismatches.append({
+                        "行": idx + 1,
+                        "商品名": exp_row["商品名"],
+                        "不一致項目": "登録データなし",
+                        "元ファイルの値(正)": f"{exp_row['商品名']} (単価: {exp_row['単価']}, 数量: {exp_row['数量']})",
+                        "現在の登録値(誤)": "未登録または削除済み"
+                    })
+                else:
+                    db_row = match_cand.iloc[-1]
+                    for col in ["単価", "数量", "小計", "市場番号", "カテゴリー"]:
+                        exp_val = str(exp_row.get(col, "")).strip()
+                        db_val = str(db_row.get(col, "")).strip()
+                        if exp_val and db_val and exp_val != db_val:
+                            mismatches.append({
+                                "行": idx + 1,
+                                "商品名": exp_row["商品名"],
+                                "不一致項目": col,
+                                "元ファイルの値(正)": exp_val,
+                                "現在の登録値(誤)": db_val
+                            })
+        
+        st.write("")
+        if len(mismatches) == 0:
+            st.success(f"🛡️ **元ファイル照合結果: 『{v_file_name}』の全 {len(expected_df)} 件が記録データと100%完全一致しています（整合性確認済み）**")
+        else:
+            st.error(f"🚨 **元ファイル照合エラー: 『{v_file_name}』との間に {len(mismatches)} 箇所の不一致が検出されました**")
+            st.caption("元のファイルデータと登録データの内容が異なります。以下の差異を確認し修正してください。")
+            
+            diff_df = pd.DataFrame(mismatches)
+            st.dataframe(diff_df, use_container_width=True)
+            
+            # ワンクリック自動修正ボタン
+            if st.button("🛠️ 元ファイルの値に一括自動修正する", type="primary"):
+                insert_records_to_db(current_user, expected_df.to_dict("records"))
+                cleanup_duplicate_records(current_user)
+                st.session_state.records_df = load_records_from_db(current_user)
+                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                st.toast("✅ 元ファイルの内容に完全修正・同期しました！")
+                st.rerun()
+
     st.write("")
-    st.markdown('<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録・照合</div>', unsafe_allow_html=True)
 
     col_b1, col_b2 = st.columns(2)
     with col_b1:
@@ -344,8 +449,8 @@ with tab_input:
     with st.container():
         st.markdown("""
             <div style="background-color: #f0fff4; border: 2px dashed #38a169; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px;">
-                <b style="color: #22543d;">📁 取引先ファイルを選択して自動記録（1ファイルにつき1度だけ自動登録）</b><br>
-                <small style="color: #4a5568;">CSV・テキストファイルをアップロードすると、重複せず1度だけ下部の一覧へ自動記録されます。</small>
+                <b style="color: #22543d;">📁 取引先ファイルを選択して自動記録（元データとの自動照合・検証付き）</b><br>
+                <small style="color: #4a5568;">ファイルをアップロードすると重複せず1度だけ自動記録され、元の内容と100%一致しているか直ちに自動照合されます。</small>
             </div>
         """, unsafe_allow_html=True)
         
@@ -354,7 +459,7 @@ with tab_input:
             uploaded_entry_file = st.file_uploader(
                 "取引データファイルを選択", 
                 type=["csv", "txt", "tsv"], 
-                key="auto_unique_file_uploader", 
+                key="auto_unique_verified_uploader", 
                 label_visibility="collapsed"
             )
         with col_up2:
@@ -365,9 +470,13 @@ with tab_input:
                     {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "果物", "商品コード": "20101", "商品名": "りんご", "単価": 360, "数量": 30, "小計": 10800}
                 ]
                 insert_records_to_db(current_user, sample_items)
+                st.session_state.verification_batch = {
+                    "file_name": "サンプルデータ",
+                    "df": pd.DataFrame(sample_items)
+                }
                 st.session_state.records_df = load_records_from_db(current_user)
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast(f"✅ テストデータ 3件 を記録しました！")
+                st.toast(f"✅ テストデータ 3件 を記録・照合しました！")
                 st.rerun()
 
         if uploaded_entry_file is not None:
@@ -402,9 +511,16 @@ with tab_input:
                     new_records_list = df_file.to_dict("records")
                     if new_records_list:
                         insert_records_to_db(current_user, new_records_list)
+                        
+                        # 照合用バッチとして元データをセッションに保持
+                        st.session_state.verification_batch = {
+                            "file_name": uploaded_entry_file.name,
+                            "df": df_file
+                        }
+                        
                         st.session_state.records_df = load_records_from_db(current_user)
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録しました！")
+                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録・照合完了しました！")
                         st.rerun()
                 except Exception as e:
                     st.error(f"ファイル解析エラー: {e}")
