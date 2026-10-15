@@ -3,6 +3,8 @@ import pandas as pd
 from datetime import datetime
 import os
 import hashlib
+import json
+import glob
 import plotly.express as px
 from sqlalchemy import create_engine, text
 import io
@@ -40,6 +42,8 @@ st.markdown("""
     }
     .role-badge-admin { background-color: #dc3545; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .role-badge-staff { background-color: #28a745; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+    .db-badge-cloud { background-color: #0284c7; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+    .db-badge-local { background-color: #4b5563; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .restore-box {
         background-color: #f0fdf4;
         border: 1px solid #86efac;
@@ -92,28 +96,66 @@ if "last_deleted_records" not in st.session_state:
     st.session_state.last_deleted_records = []
 
 MASTER_CSV_FILE = "item_master.csv"
+BACKUP_DIR = "db_backups"
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ==========================================
-# 1. DB接続設定 & 初期化
+# 1. クラウドDB対応（PostgreSQL / Supabase / Neon / SQLite）
 # ==========================================
+def get_db_url():
+    """環境変数またはセッションからデータベースURLを取得"""
+    custom_url = st.session_state.get("custom_database_url", "").strip()
+    if custom_url:
+        return custom_url
+    return os.environ.get("DATABASE_URL", "sqlite:///seika_inventory.db")
+
 @st.cache_resource
-def get_db_engine():
-    db_url = os.environ.get("DATABASE_URL", "sqlite:///seika_inventory.db")
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
+def get_db_engine(db_url: str):
+    clean_url = db_url.strip()
+    if clean_url.startswith("postgres://"):
+        clean_url = clean_url.replace("postgres://", "postgresql://", 1)
         
-    if db_url.startswith("sqlite"):
-        engine = create_engine(db_url, connect_args={"check_same_thread": False, "timeout": 15.0})
+    is_sqlite = clean_url.startswith("sqlite")
+    
+    if is_sqlite:
+        engine = create_engine(
+            clean_url,
+            connect_args={"check_same_thread": False, "timeout": 30.0}
+        )
     else:
-        engine = create_engine(db_url, pool_size=10, max_overflow=20, pool_pre_ping=True)
+        # PostgreSQL / Supabase 接続時：自動再接続・接続プール・タイムアウトを完全制御
+        engine = create_engine(
+            clean_url,
+            pool_size=20,           # 同時書き込みに耐える基本プール数
+            max_overflow=40,        # ピーク時のバッファ接続数
+            pool_recycle=300,       # 接続の自動リフレッシュ（5分）
+            pool_pre_ping=True      # 切断エラーを自動検知して復帰
+        )
     return engine
 
-engine = get_db_engine()
+def get_current_engine():
+    current_url = get_db_url()
+    return get_db_engine(current_url)
+
+def get_db_info():
+    """現在のデータベース接続状態・種別を診断"""
+    url = get_db_url()
+    is_cloud = not url.startswith("sqlite")
+    if is_cloud:
+        try:
+            parts = url.split("@")
+            host_part = parts[-1] if len(parts) > 1 else "Cloud DB"
+            masked_desc = f"クラウド PostgreSQL / Supabase ({host_part.split('/')[0]})"
+        except:
+            masked_desc = "クラウド PostgreSQL / Supabase"
+        return {"type": "cloud", "badge": "☁️ クラウド PostgreSQL", "desc": masked_desc, "is_cloud": True}
+    else:
+        return {"type": "local", "badge": "📁 ローカル SQLite", "desc": "sqlite:///seika_inventory.db (ローカル単一ファイル)", "is_cloud": False}
 
 def init_db():
+    engine = get_current_engine()
     with engine.begin() as conn:
         id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if "sqlite" in engine.name else "SERIAL PRIMARY KEY"
-        # 現行の取引レコードテーブル
         conn.execute(text(f'''
             CREATE TABLE IF NOT EXISTS records (
                 id {id_type},
@@ -128,7 +170,6 @@ def init_db():
                 subtotal INTEGER
             )
         '''))
-        # ★【新機能】削除データ退避・復元用テーブル（ゴミ箱）★
         conn.execute(text(f'''
             CREATE TABLE IF NOT EXISTS deleted_records (
                 id {id_type},
@@ -145,13 +186,153 @@ def init_db():
                 deleted_at VARCHAR(50)
             )
         '''))
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_records_user ON records(user_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_records_date ON records(date)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_records_market ON records(market_no)"))
+        except Exception:
+            pass
 
 init_db()
 
 # ==========================================
-# 2. データCRUD関数 & 復元（Restore）関数
+# 2. 自動バックアップ & BCPリストア エンジン
+# ==========================================
+def create_backup_snapshot(user_id=None, trigger_reason="自動バックアップ"):
+    try:
+        engine = get_current_engine()
+        with engine.connect() as conn:
+            df_rec = pd.read_sql_query(text("SELECT * FROM records ORDER BY id ASC"), conn)
+            df_del = pd.read_sql_query(text("SELECT * FROM deleted_records ORDER BY id ASC"), conn)
+
+        now = datetime.now()
+        ts_str = now.strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"seika_backup_{ts_str}.json"
+        backup_path = os.path.join(BACKUP_DIR, backup_filename)
+
+        backup_payload = {
+            "version": "2.0",
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger": trigger_reason,
+            "created_by": user_id or "system",
+            "records_count": len(df_rec),
+            "total_amount": int(df_rec["subtotal"].sum()) if not df_rec.empty and "subtotal" in df_rec.columns else 0,
+            "records": df_rec.to_dict("records"),
+            "deleted_records": df_del.to_dict("records")
+        }
+
+        with open(backup_path, "w", encoding="utf-8") as f:
+            json.dump(backup_payload, f, ensure_ascii=False, indent=2)
+
+        # 直近30世代を自動ローテーション保持
+        all_backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "seika_backup_*.json")))
+        if len(all_backups) > 30:
+            for old_f in all_backups[:-30]:
+                try:
+                    os.remove(old_f)
+                except:
+                    pass
+
+        return {
+            "success": True,
+            "filename": backup_filename,
+            "path": backup_path,
+            "count": len(df_rec),
+            "timestamp": backup_payload["timestamp"]
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def list_all_backups():
+    backup_files = sorted(glob.glob(os.path.join(BACKUP_DIR, "seika_backup_*.json")), reverse=True)
+    backups_meta = []
+    for fpath in backup_files:
+        try:
+            fname = os.path.basename(fpath)
+            fsize_kb = round(os.path.getsize(fpath) / 1024, 1)
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            backups_meta.append({
+                "filename": fname,
+                "filepath": fpath,
+                "timestamp": data.get("timestamp", "不明"),
+                "trigger": data.get("trigger", "自動"),
+                "records_count": data.get("records_count", 0),
+                "total_amount": data.get("total_amount", 0),
+                "size_kb": f"{fsize_kb} KB",
+                "created_by": data.get("created_by", "system")
+            })
+        except:
+            continue
+    return backups_meta
+
+def restore_from_backup_file(filepath: str, user_id: str):
+    try:
+        # リストア直前の安全セーフティスナップショット
+        create_backup_snapshot(user_id, trigger_reason="BCPリストア直前セーフティ")
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        records_to_restore = data.get("records", [])
+        deleted_to_restore = data.get("deleted_records", [])
+
+        engine = get_current_engine()
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM records"))
+            conn.execute(text("DELETE FROM deleted_records"))
+
+            if records_to_restore:
+                ins_rec = text('''
+                    INSERT INTO records (user_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal)
+                    VALUES (:user_id, :date, :market_no, :category, :item_code, :item_name, :unit_price, :quantity, :subtotal)
+                ''')
+                for r in records_to_restore:
+                    p = int(float(r.get("unit_price", 0)))
+                    q = int(float(r.get("quantity", 0)))
+                    conn.execute(ins_rec, {
+                        "user_id": r.get("user_id", user_id),
+                        "date": str(r.get("date", "")),
+                        "market_no": str(r.get("market_no", "")),
+                        "category": str(r.get("category", "")),
+                        "item_code": str(r.get("item_code", "")),
+                        "item_name": str(r.get("item_name", "")),
+                        "unit_price": p,
+                        "quantity": q,
+                        "subtotal": p * q
+                    })
+
+            if deleted_to_restore:
+                ins_del = text('''
+                    INSERT INTO deleted_records (original_id, user_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal, deleted_at)
+                    VALUES (:original_id, :user_id, :date, :market_no, :category, :item_code, :item_name, :unit_price, :quantity, :subtotal, :deleted_at)
+                ''')
+                for d in deleted_to_restore:
+                    p = int(float(d.get("unit_price", 0)))
+                    q = int(float(d.get("quantity", 0)))
+                    conn.execute(ins_del, {
+                        "original_id": d.get("original_id", 0),
+                        "user_id": d.get("user_id", user_id),
+                        "date": str(d.get("date", "")),
+                        "market_no": str(d.get("market_no", "")),
+                        "category": str(d.get("category", "")),
+                        "item_code": str(d.get("item_code", "")),
+                        "item_name": str(d.get("item_name", "")),
+                        "unit_price": p,
+                        "quantity": q,
+                        "subtotal": p * q,
+                        "deleted_at": str(d.get("deleted_at", ""))
+                    })
+
+        return {"success": True, "count": len(records_to_restore)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# ==========================================
+# 3. データCRUD関数
 # ==========================================
 def load_records_from_db(user_id=None):
+    engine = get_current_engine()
     with engine.connect() as conn:
         if user_id is None:
             query = text("SELECT id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal FROM records ORDER BY id ASC")
@@ -175,10 +356,10 @@ def load_records_from_db(user_id=None):
         })
     return df
 
-def insert_records_to_db(user_id, records_list):
-    """レコードをDBの最下部に新規追加登録する"""
+def insert_records_to_db(user_id, records_list, auto_backup=True):
     if not records_list:
         return []
+    engine = get_current_engine()
     with engine.begin() as conn:
         insert_query = text('''
             INSERT INTO records (user_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal)
@@ -208,11 +389,10 @@ def insert_records_to_db(user_id, records_list):
             })
         conn.execute(insert_query, params)
 
-def delete_records_by_ids(ids_to_delete, user_id=None):
-    """
-    ★【新機能】データを完全消去せず、deleted_records（ゴミ箱）に退避保存してから削除する仕様
-    これにより、いつでも元通りに復元可能！
-    """
+    if auto_backup:
+        create_backup_snapshot(user_id, trigger_reason=f"データ追加 ({len(records_list)}件)")
+
+def delete_records_by_ids(ids_to_delete, user_id=None, auto_backup=True):
     if not ids_to_delete:
         return []
     clean_ids = [int(i) for i in ids_to_delete if pd.notnull(i) and str(i).replace('.0','').isdigit()]
@@ -220,16 +400,15 @@ def delete_records_by_ids(ids_to_delete, user_id=None):
         return []
         
     backed_up_rows = []
+    engine = get_current_engine()
     with engine.begin() as conn:
         id_str = ",".join(map(str, clean_ids))
-        # 1. 削除対象データを取得してバックアップ用に確保
         fetch_query = text(f"SELECT id, user_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal FROM records WHERE id IN ({id_str})")
         res = conn.execute(fetch_query).fetchall()
         
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for row in res:
             backed_up_rows.append(dict(row._mapping))
-            # 2. ゴミ箱（deleted_records）テーブルに挿入
             conn.execute(text('''
                 INSERT INTO deleted_records (original_id, user_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal, deleted_at)
                 VALUES (:original_id, :user_id, :date, :market_no, :category, :item_code, :item_name, :unit_price, :quantity, :subtotal, :deleted_at)
@@ -247,13 +426,15 @@ def delete_records_by_ids(ids_to_delete, user_id=None):
                 "deleted_at": now_str
             })
             
-        # 3. 現行テーブルから削除
         conn.execute(text(f"DELETE FROM records WHERE id IN ({id_str})"))
+
+    if auto_backup:
+        create_backup_snapshot(user_id, trigger_reason=f"データ削除 ({len(clean_ids)}件)")
         
     return backed_up_rows
 
-# ★【新機能】削除済みデータ（ゴミ箱）の読み込み
 def load_deleted_records_from_db(user_id=None):
+    engine = get_current_engine()
     with engine.connect() as conn:
         if user_id is None:
             query = text("SELECT id, original_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal, deleted_at FROM deleted_records ORDER BY id DESC")
@@ -278,9 +459,7 @@ def load_deleted_records_from_db(user_id=None):
         })
     return df
 
-# ★【新機能】ゴミ箱から元のrecordsテーブルへ完全復元する関数
 def restore_records_from_trash(deleted_ids_to_restore, user_id):
-    """指定されたゴミ箱レコードを元のリストに完全復元する"""
     if not deleted_ids_to_restore:
         return 0
     clean_ids = [int(i) for i in deleted_ids_to_restore if pd.notnull(i) and str(i).replace('.0','').isdigit()]
@@ -288,6 +467,7 @@ def restore_records_from_trash(deleted_ids_to_restore, user_id):
         return 0
         
     restored_count = 0
+    engine = get_current_engine()
     with engine.begin() as conn:
         id_str = ",".join(map(str, clean_ids))
         fetch_query = text(f"SELECT date, market_no, category, item_code, item_name, unit_price, quantity, subtotal FROM deleted_records WHERE id IN ({id_str})")
@@ -312,13 +492,13 @@ def restore_records_from_trash(deleted_ids_to_restore, user_id):
             })
             restored_count += 1
             
-        # 復元したデータをゴミ箱テーブルから削除
         conn.execute(text(f"DELETE FROM deleted_records WHERE id IN ({id_str})"))
-        
+
+    create_backup_snapshot(user_id, trigger_reason=f"ゴミ箱からの復元 ({restored_count}件)")
     return restored_count
 
 def purge_deleted_records(user_id=None):
-    """ゴミ箱を完全に空にする"""
+    engine = get_current_engine()
     with engine.begin() as conn:
         if user_id:
             conn.execute(text("DELETE FROM deleted_records WHERE user_id = :user_id"), {"user_id": user_id})
@@ -326,6 +506,7 @@ def purge_deleted_records(user_id=None):
             conn.execute(text("DELETE FROM deleted_records"))
 
 def cleanup_duplicate_records(user_id):
+    engine = get_current_engine()
     with engine.begin() as conn:
         cleanup_query = text('''
             DELETE FROM records 
@@ -343,6 +524,7 @@ def cleanup_duplicate_records(user_id):
 def update_single_record_in_db(record_dict):
     if "id" not in record_dict or pd.isnull(record_dict["id"]):
         return
+    engine = get_current_engine()
     with engine.begin() as conn:
         try:
             p = int(float(record_dict.get("単価", 0)))
@@ -369,7 +551,7 @@ def update_single_record_in_db(record_dict):
         })
 
 # ==========================================
-# 3. マスタデータ管理
+# 4. マスタデータ管理
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
@@ -402,14 +584,14 @@ def load_item_master_cached():
 ITEM_MASTER, df_master_raw = load_item_master_cached()
 
 # ==========================================
-# 4. ログイン画面（未ログイン時は全画面で表示）
+# 5. ログイン画面（未ログイン時は全画面で表示）
 # ==========================================
 if st.session_state.logged_in_user is None:
     st.markdown("""
         <div style="text-align: center; margin-top: 30px;">
             <span style="font-size: 54px;">🍎</span>
             <h1 style="color: #1e7e34; margin-bottom: 4px;">青果卸売 在庫・取引管理 Pro</h1>
-            <p style="color: #718096; font-size: 14px;">システムへログインしてください</p>
+            <p style="color: #718096; font-size: 14px;">エンタープライズ クラウドデータベース対応・BCPバックアップ完備</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -425,6 +607,7 @@ if st.session_state.logged_in_user is None:
                 if user_data and user_data["pw"] == hashed_input:
                     st.session_state.logged_in_user = username_input
                     st.session_state.user_role = user_data["role"]
+                    create_backup_snapshot(username_input, trigger_reason="ログイン時定期バックアップ")
                     st.rerun()
                 else:
                     st.error("IDまたはパスワードが無効です")
@@ -453,9 +636,10 @@ if st.session_state.logged_in_user is None:
 # ログイン中のユーザー情報を取得
 current_user = st.session_state.logged_in_user
 current_role = st.session_state.user_role
+db_status = get_db_info()
 
 # ==========================================
-# 5. サイドバー
+# 6. サイドバー
 # ==========================================
 with st.sidebar:
     st.image("https://img.icons8.com/emoji/96/000000/red-apple.png", width=50)
@@ -463,6 +647,11 @@ with st.sidebar:
     
     role_badge = '<span class="role-badge-admin">👑 管理者</span>' if current_role == "admin" else '<span class="role-badge-staff">👤 一般社員</span>'
     st.markdown(f"**{current_user}** {role_badge}", unsafe_allow_html=True)
+
+    db_badge_html = f'<span class="db-badge-cloud">{db_status["badge"]}</span>' if db_status["is_cloud"] else f'<span class="db-badge-local">{db_status["badge"]}</span>'
+    st.markdown(f"**DB環境**: {db_badge_html}", unsafe_allow_html=True)
+    st.caption(f"接続: {db_status['desc']}")
+
     if st.button("ログアウト", use_container_width=True):
         st.session_state.logged_in_user = None
         st.session_state.user_role = None
@@ -472,15 +661,53 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    if st.button("🧹 増えすぎた重複データを掃除する", use_container_width=True):
+    # クラウドDB接続先設定（PostgreSQL / Supabase）
+    with st.expander("⚙️ データベース クラウド接続設定", expanded=False):
+        st.caption("PostgreSQL / Supabase / Neon 等のURLを指定すると、同時数十人の書き込み競合を防げます。")
+        new_db_url = st.text_input(
+            "接続文字列 (DATABASE_URL)", 
+            value=st.session_state.get("custom_database_url", os.environ.get("DATABASE_URL", "")),
+            placeholder="postgresql://postgres:[PASSWORD]@db.xxxx.supabase.co:5432/postgres",
+            type="password"
+        )
+        col_db1, col_db2 = st.columns(2)
+        with col_db1:
+            if st.button("クラウドDB接続", type="primary", use_container_width=True):
+                if new_db_url.strip():
+                    st.session_state.custom_database_url = new_db_url.strip()
+                    try:
+                        init_db()
+                        st.session_state.records_df = load_records_from_db(current_user)
+                        st.success("☁️ クラウドDBに接続しました！")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"接続エラー: {e}")
+                else:
+                    st.warning("URLを入力してください")
+        with col_db2:
+            if st.button("ローカルに戻す", use_container_width=True):
+                st.session_state.custom_database_url = ""
+                init_db()
+                st.session_state.records_df = load_records_from_db(current_user)
+                st.info("📁 ローカルDBに切り替えました")
+                st.rerun()
+
+    if st.button("⚡ 今すぐDBスナップショット作成", use_container_width=True):
+        res = create_backup_snapshot(current_user, trigger_reason="手動即時バックアップ")
+        if res.get("success"):
+            st.success(f"💾 バックアップ作成完了 ({res['count']}件)")
+        else:
+            st.error(f"エラー: {res.get('error')}")
+
+    if st.button("🧹 重複データを整理する", use_container_width=True):
         deleted_count = cleanup_duplicate_records(current_user)
         st.session_state.records_df = load_records_from_db(current_user)
         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-        st.success(f"重複していた {deleted_count} 件のデータを削除して1件にまとめました！")
+        st.success(f"重複していた {deleted_count} 件を整理しました！")
         st.rerun()
 
 # ==========================================
-# 6. ユーザーデータ読み込み
+# 7. ユーザーデータ読み込み
 # ==========================================
 if "records_df" not in st.session_state or st.session_state.get("current_loaded_user") != current_user:
     st.session_state.records_df = load_records_from_db(current_user)
@@ -495,13 +722,14 @@ df_current = st.session_state.records_df
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p>リアルタイム取引登録・元ファイル自動照合・不一致修正自動追記・削除データ元通り復元プラットフォーム</p>
+        <p>クラウドDB(PostgreSQL/Supabase)対応・BCP自動バックアップ復旧・元ファイル照合・不一致自動追記</p>
     </div>
 """, unsafe_allow_html=True)
 
-tab_input, tab_analytics, tab_csv_import = st.tabs([
+tab_input, tab_analytics, tab_bcp_backup, tab_csv_import = st.tabs([
     "📝 取引データ入力・管理 (自動記録・照合・復元対応)", 
     "📊 データ分析", 
+    "🛡️ BCP自動バックアップ・データ復旧センター",
     "📥 CSV一括インポート"
 ])
 
@@ -513,12 +741,13 @@ with tab_input:
     total_qty_sum = df_current["数量"].sum() if records_cnt > 0 else 0
     total_amount_sum = df_current["小計"].sum() if records_cnt > 0 else 0
 
-    k1, k2, k3 = st.columns(3)
+    k1, k2, k3, k4 = st.columns([1, 1, 1.2, 1])
     k1.metric("📋 登録取引件数", f"{records_cnt:,} 件")
     k2.metric("📦 総取引数量", f"{total_qty_sum:,} 個")
     k3.metric("💰 総取引金額", f"¥ {total_amount_sum:,}")
+    k4.metric("🛡️ 接続DB種別", "PostgreSQL" if db_status["is_cloud"] else "SQLite", delta="クラウド稼働中" if db_status["is_cloud"] else "ローカル稼働")
 
-    # ★【新機能】直前に削除したデータがある場合の即時「元通りに復元する（Undo）」バナー★
+    # 直前に削除したデータがある場合の即時「元通りに復元する（Undo）」バナー
     if st.session_state.last_deleted_records:
         st.markdown(f"""
             <div class="restore-box">
@@ -541,13 +770,12 @@ with tab_input:
                 st.session_state.last_deleted_records = []
                 st.rerun()
 
-    # ★【新機能】元ファイルとの整合性・完全一致照合 ＆ 不一致箇所の修正と「下に自動的に記録される」機能★
+    # 元ファイルとの整合性・完全一致照合 ＆ 不一致箇所の修正と「下に自動的に記録される」機能
     if st.session_state.verification_batch is not None:
         v_batch = st.session_state.verification_batch
         v_file_name = v_batch["file_name"]
         expected_df = v_batch["df"]
         
-        # 現在のDBレコードと照合
         mismatches = []
         if df_current is not None and not df_current.empty:
             for idx, exp_row in expected_df.iterrows():
@@ -607,7 +835,6 @@ with tab_input:
             diff_display_df = pd.DataFrame(mismatches)[["行番号", "商品名", "不一致項目", "元ファイルの値(正)", "現在の登録値(誤)"]]
             st.dataframe(diff_display_df, use_container_width=True)
 
-            # ★【新機能】不一致データを修正し、下に自動的に追記記録するフォーム★
             st.write("▼ **不一致データを修正し、リストの一番下に自動追記記録する**")
             
             mismatch_options = [f"行{m['行番号']}: {m['商品名']} ({m['不一致項目']}の不一致)" for m in mismatches]
@@ -635,7 +862,6 @@ with tab_input:
             
             col_act1, col_act2 = st.columns([3, 2.5])
             with col_act1:
-                # ★修正したデータを最下部に自動的に追記記録する実行ボタン★
                 if st.button("✍️ 修正したデータをリストの最下部に自動記録する", type="primary", use_container_width=True, key="fix_and_append_below_btn"):
                     fixed_record = [{
                         "日付": fix_date,
@@ -647,10 +873,8 @@ with tab_input:
                         "数量": fix_qty,
                         "小計": fix_subtotal
                     }]
-                    # リストの一番下（DBの末尾）に新規自動記録
                     insert_records_to_db(current_user, fixed_record)
                     
-                    # 以前の不一致レコードが存在する場合は、ゴミ箱へ退避して差し替え
                     if target_mismatch.get("record_id"):
                         delete_records_by_ids([target_mismatch["record_id"]], current_user)
                     
@@ -660,7 +884,6 @@ with tab_input:
                     st.rerun()
 
             with col_act2:
-                # ワンクリックで元ファイルの値に合わせて全件修正し下に自動記録
                 if st.button("🛠️ 全不一致を元ファイル通りに修正して自動記録", use_container_width=True, key="fix_all_mismatch_btn"):
                     insert_records_to_db(current_user, expected_df.to_dict("records"))
                     cleanup_duplicate_records(current_user)
@@ -681,8 +904,8 @@ with tab_input:
     with st.container():
         st.markdown("""
             <div style="background-color: #f0fff4; border: 2px dashed #38a169; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px;">
-                <b style="color: #22543d;">📁 取引先ファイルを選択して自動記録（元データとの自動照合・検証付き）</b><br>
-                <small style="color: #4a5568;">ファイルをアップロードすると重複せず1度だけ自動記録され、元の内容と100%一致しているか直ちに自動照合されます。</small>
+                <b style="color: #22543d;">📁 取引先ファイルを選択して自動記録（元データとの自動照合・バックアップ自動生成付き）</b><br>
+                <small style="color: #4a5568;">ファイルをアップロードすると重複せず1度だけ自動記録され、元ファイルとの整合性が自動検証され、BCPバックアップも即座に自動生成されます。</small>
             </div>
         """, unsafe_allow_html=True)
         
@@ -838,7 +1061,6 @@ with tab_input:
                 current_ids = set(int(i) for i in edited_df["id"].dropna().tolist() if pd.notnull(i))
                 deleted_ids = existing_ids - current_ids
                 
-                # ★削除されたデータは退避してゴミ箱に保管（復元可能）
                 if deleted_ids:
                     backed = delete_records_by_ids(list(deleted_ids), current_user)
                     st.session_state.last_deleted_records = backed
@@ -857,11 +1079,12 @@ with tab_input:
                     if pd.notnull(r_dict.get("id")):
                         update_single_record_in_db(r_dict)
                     else:
-                        insert_records_to_db(current_user, [r_dict])
+                        insert_records_to_db(current_user, [r_dict], auto_backup=False)
 
+                create_backup_snapshot(current_user, trigger_reason="データ編集・保存")
                 st.session_state.records_df = load_records_from_db(current_user)
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast("✅ 編集内容を保存しました！")
+                st.toast("✅ 編集内容を保存し、自動バックアップを作成しました！")
                 st.rerun()
 
         with col_del:
@@ -871,7 +1094,6 @@ with tab_input:
                 deleted_ids = existing_ids - current_ids
                 
                 if deleted_ids:
-                    # ★削除時にゴミ箱へ保管（復元可能にする）★
                     backed = delete_records_by_ids(list(deleted_ids), current_user)
                     st.session_state.last_deleted_records = backed
                     st.session_state.records_df = load_records_from_db(current_user)
@@ -893,9 +1115,7 @@ with tab_input:
     else:
         st.info("💡 登録されたデータはありません。上のフォームから商品を追加するか、ファイルをアップロードしてください。")
 
-    # ==========================================
-    # ★【新機能】3️⃣ 削除済みデータ保管庫（ゴミ箱） & 元通り復元システム★
-    # ==========================================
+    # 削除済みデータ保管庫（ゴミ箱） & 元通り復元システム
     st.write("")
     with st.expander("♻️ 削除したデータの確認・元通り復元（ゴミ箱）", expanded=False):
         df_deleted = load_deleted_records_from_db(current_user)
@@ -965,7 +1185,72 @@ with tab_analytics:
         st.info("💡 分析対象データがありません。")
 
 # ==========================================
-# タブ 3: CSV一括インポート
+# タブ 3: BCP自動バックアップ・データ復旧センター
+# ==========================================
+with tab_bcp_backup:
+    st.markdown('<div class="section-title">🛡️ 企業のBCP対策：自動バックアップ履歴 & データ復旧（リストア）</div>', unsafe_allow_html=True)
+    st.markdown("""
+        万が一のサーバー障害・データ破損・誤操作に備え、データ変更時に**自動スナップショット**を保持しています。
+        過去の任意の世代を選んで、ワンクリックでその時点の状態へシステムを完全に復旧（ロールバック）できます。
+    """)
+
+    b_col1, b_col2, b_col3 = st.columns([2, 2, 2])
+    with b_col1:
+        if st.button("💾 今すぐフルバックアップを作成", type="primary", use_container_width=True):
+            res = create_backup_snapshot(current_user, trigger_reason="管理画面手動実行")
+            if res.get("success"):
+                st.success(f"✅ バックアップ完了: {res['filename']} ({res['count']}件)")
+                st.rerun()
+            else:
+                st.error(f"作成失敗: {res.get('error')}")
+
+    backups = list_all_backups()
+    
+    st.write("")
+    st.subheader(f"📂 保持されているバックアップ履歴 ({len(backups)} 世代)")
+
+    if backups:
+        df_bk = pd.DataFrame(backups)[["timestamp", "trigger", "records_count", "total_amount", "size_kb", "created_by", "filename"]]
+        df_bk.columns = ["バックアップ日時", "作成トリガー", "レコード件数", "総取引金額(円)", "容量", "実行者", "ファイル名"]
+        st.dataframe(df_bk, use_container_width=True)
+
+        st.write("▼ **指定したバックアップ時点へ完全復旧（BCPリストア）**")
+        r_col1, r_col2 = st.columns([3, 1.5])
+        with r_col1:
+            backup_select_opts = [
+                f"{b['timestamp']} | {b['trigger']} | {b['records_count']}件 (¥{b['total_amount']:,}) [{b['filename']}]" 
+                for b in backups
+            ]
+            selected_bk_idx = st.selectbox("復元するスナップショット世代を選択", range(len(backup_select_opts)), format_func=lambda i: backup_select_opts[i])
+        with r_col2:
+            st.write("")
+            target_bk = backups[selected_bk_idx]
+            if st.button("♻️ この時点に復旧する", type="primary", use_container_width=True):
+                r_res = restore_from_backup_file(target_bk["filepath"], current_user)
+                if r_res.get("success"):
+                    st.session_state.records_df = load_records_from_db(current_user)
+                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                    st.success(f"🎉 {target_bk['timestamp']} の状態へ完全復旧しました ({r_res['count']}件)！")
+                    st.rerun()
+                else:
+                    st.error(f"復旧失敗: {r_res.get('error')}")
+
+        st.write("")
+        st.write("▼ **選択したバックアップファイルのダウンロード保管**")
+        with open(target_bk["filepath"], "r", encoding="utf-8") as bf:
+            file_data = bf.read()
+        st.download_button(
+            label=f"📥 バックアップJSONをダウンロード ({target_bk['filename']})",
+            data=file_data,
+            file_name=target_bk["filename"],
+            mime="application/json",
+            use_container_width=True
+        )
+    else:
+        st.info("バックアップデータはまだ作成されていません。")
+
+# ==========================================
+# タブ 4: CSV一括インポート
 # ==========================================
 with tab_csv_import:
     st.markdown('<div class="section-title">📥 CSV一括インポート</div>', unsafe_allow_html=True)
