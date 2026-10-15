@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
+from collections import OrderedDict
 import os
 import hashlib
 import hmac
@@ -90,7 +91,6 @@ def get_secret(key: str, default: str = "") -> str:
     return default
 
 APP_SECRET_KEY = get_secret("SECRET_KEY", "seika-enterprise-secure-salt-2026-v2")
-MASTER_CSV_FILE = "item_master.csv"
 BACKUP_DIR = "db_backups"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
@@ -727,39 +727,256 @@ def update_single_record_in_db(record_dict):
     invalidate_records_cache()
 
 # ==========================================
-# 8. マスタデータ管理（キャッシュ最適化）
+# 8. マスタデータ（コード表の課別商品をプログラム内に内蔵）
 # ==========================================
+BUILTIN_ITEM_GROUPS = [
+    {
+        "departments": ["1課（熊谷）", "4課（大宮）", "2課", "栗原"],
+        "items": [
+            ("11", "かぶ"),
+            ("130", "胡瓜"),
+            ("233", "アーリーレッド"),
+            ("319", "青唐辛子"),
+            ("319", "トレビス"),
+            ("57", "スリムネギ"),
+            ("143", "茄子"),
+            ("262", "赤唐辛子"),
+            ("319", "みょうが竹"),
+            ("319", "あみたけ"),
+            ("66", "水耕みつば"),
+            ("155", "ピーマン"),
+            ("288", "カイワレ"),
+            ("319", "食用菊系"),
+            ("319", "ラーメン"),
+            ("63", "根みつば"),
+            ("268", "大葉"),
+            ("288", "豆苗"),
+            ("319", "食用花系"),
+            ("319", "ルッコラ"),
+            ("69", "にら"),
+            ("126", "水菜"),
+            ("288", "ブロスプ"),
+            ("319", "山菜系"),
+            ("319", "MIXマッシュ"),
+            ("71", "ほうれん草"),
+            ("87", "クレソン"),
+            ("288", "レッドスプ"),
+            ("319", "銀杏"),
+            ("319", "ぬか"),
+            ("71", "ちぢみほうれん草"),
+            ("108", "菜の花"),
+            ("288", "ベニーナ"),
+            ("319", "ゆず"),
+            ("319", "紅芯大根"),
+            ("72", "春菊"),
+            ("119", "パオ"),
+            ("94", "紫キャベツ"),
+            ("319", "すだち"),
+            ("319", "仙台麩"),
+            ("73", "雪菜"),
+            ("156", "ししとう"),
+            ("365", "切干大根"),
+            ("319", "かぼす"),
+            ("1334", "仙台麩カット"),
+            ("73", "ちぢみ雪菜"),
+            ("303", "にんにくの芽"),
+            ("368", "凍り豆腐"),
+            ("319", "ハス芽"),
+            ("1334", "ズッキーニ"),
+            ("123", "雪菜の花"),
+            ("150", "トマト"),
+            ("369", "もやし"),
+            ("319", "ミニキャロット"),
+            ("1334", "青ネギ"),
+            ("78", "小松菜"),
+            ("171", "ミニトマト"),
+            ("369", "豆もやし"),
+            ("319", "とんぶり"),
+            ("1334", "カット野菜"),
+            ("79", "山東菜"),
+            ("117", "つぼみ菜"),
+            ("345", "岡ヒジキ"),
+            ("319", "エンダイブ"),
+            ("856", "野菜MIX系"),
+            ("81", "レタス"),
+            ("92", "サラダ菜"),
+            ("890", "油揚げ"),
+            ("319", "ラディッシュ"),
+            ("4502", "立桂"),
+            ("47", "グリーンカール"),
+            ("891", "豆腐"),
+            ("319", "芽キャベツ"),
+            ("83", "サニーレタス"),
+            ("892", "蒟蒻"),
+            ("319", "ハーブ系"),
+            ("95", "セロリ"),
+            ("893", "納豆"),
+            ("319", "パプリカ"),
+            ("90", "ブロッコリー"),
+            ("373", "筍水煮"),
+            ("319", "冬瓜"),
+            ("85", "カリフラワー"),
+            ("375", "ふき水煮"),
+            ("319", "ゴーヤ"),
+            ("98", "パセリ"),
+            ("377", "ぜんまい水煮"),
+            ("319", "モロッコいんげん"),
+            ("116", "モロヘイヤ"),
+            ("379", "蓮根水煮"),
+            ("319", "絹さや"),
+            ("111", "つる菜"),
+            ("319", "大和芋"),
+            ("319", "スナップエンドウ"),
+            ("121", "チンゲン菜"),
+            ("319", "エシャロット"),
+            ("319", "グリーンピース"),
+            ("319", "わさび"),
+            ("319", "そら豆"),
+        ],
+    },
+    {
+        "departments": ["3課（照井）", "11課（相澤 史）"],
+        "items": [
+            ("21", "ごぼう"),
+            ("360", "梅"),
+            ("89", "アスパラガス"),
+            ("23", "切ごぼうMIX"),
+            ("360", "赤しそ"),
+            ("169", "赤パプリカ"),
+            ("26", "蓮根"),
+            ("386", "梅干し"),
+            ("170", "黄パプリカ"),
+            ("60", "ふき"),
+            ("386", "黒にんにく"),
+            ("161", "オクラ"),
+            ("225", "にんにく"),
+            ("270", "花茗荷"),
+            ("227", "らっきょう"),
+            ("250", "生姜"),
+            ("230", "ゆり根"),
+            ("214", "洗い里芋"),
+            ("218", "長いも"),
+            ("901", "卵"),
+            ("218", "山の芋"),
+            ("902", "うずらの卵"),
+            ("1", "大根"),
+            ("339", "ヤングコーン"),
+            ("14", "人参"),
+            ("339", "山伏茸"),
+            ("24", "筍"),
+            ("321", "生椎茸"),
+            ("41", "白菜"),
+            ("322", "なめこ"),
+            ("42", "キャベツ"),
+            ("323", "えのき"),
+            ("51", "長ネギ"),
+            ("330", "しめじ"),
+            ("53", "曲がりネギ"),
+            ("324", "平茸"),
+            ("136", "南瓜"),
+            ("324", "あわび茸"),
+            ("160", "とうもろこし"),
+            ("325", "マッシュルーム"),
+            ("201", "さつま芋"),
+            ("327", "舞茸"),
+            ("208", "じゃが芋"),
+            ("1193", "エリンギ"),
+            ("210", "メークイン"),
+            ("326", "松茸"),
+            ("221", "玉葱"),
+            ("213", "里芋"),
+            ("213", "芋ガラ"),
+        ],
+    },
+    {
+        "departments": ["5課", "12課（小林・牧野）"],
+        "items": [
+            ("400", "甘夏"),
+            ("637", "貴陽"),
+            ("692", "レッドグローブ"),
+            ("415", "八朔"),
+            ("604", "桃"),
+            ("761", "バナナ"),
+            ("418", "伊予柑"),
+            ("632", "佐藤錦"),
+            ("764", "パイナップル"),
+            ("420", "デコポン"),
+            ("649", "おうとう"),
+            ("765", "パパイヤ"),
+            ("452", "金柑"),
+            ("660", "デラウェア"),
+            ("767", "キウイフルーツ"),
+            ("452", "ポンカン"),
+            ("666", "キャンベル"),
+            ("768", "アボカド"),
+            ("452", "マーコット"),
+            ("667", "シャインマスカット"),
+            ("772", "ブルーベリー"),
+            ("452", "ジューシーオレンジ"),
+            ("669", "巨峰"),
+            ("772", "ライム"),
+            ("452", "みかん"),
+            ("670", "ナイヤガラ"),
+            ("776", "甘栗"),
+            ("481", "三角みかん"),
+            ("674", "ピオーネ"),
+            ("773", "干し芋"),
+            ("463", "味丸みかん"),
+            ("681", "スチューベン"),
+            ("780", "落花生"),
+            ("519", "富士りんご"),
+            ("704", "苺"),
+            ("796", "ナッツ類"),
+            ("510", "つがる"),
+            ("741", "西瓜"),
+            ("542", "幸水"),
+            ("714", "アールスメロン"),
+            ("544", "豊水"),
+            ("723", "青肉メロン"),
+            ("545", "新高梨"),
+            ("731", "赤肉メロン"),
+            ("564", "ラフランス"),
+            ("766", "マンゴー"),
+            ("571", "富有柿"),
+            ("775", "無花果"),
+            ("573", "平種柿"),
+            ("1467", "果物セット"),
+            ("573", "干し柿"),
+            ("450", "グレープフルーツ"),
+            ("573", "あんぽ柿"),
+            ("450", "メロゴールド"),
+            ("616", "大石"),
+            ("450", "スウィーティー"),
+            ("617", "ソルダム"),
+            ("425", "レモン"),
+            ("613", "太陽"),
+            ("427", "オレンジ"),
+        ],
+    },
+]
+
+
+def item_options_for_category(category: str):
+    items = ITEM_MASTER.get(category, [])
+    return [f"{code} : {name}" for code, name in items]
+
+
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
-    if not os.path.exists(MASTER_CSV_FILE):
-        default_master = pd.DataFrame([
-            {"category": "ハーブ・薬味類", "item_code": "10401", "item_name": "大葉"},
-            {"category": "ハーブ・薬味類", "item_code": "10402", "item_name": "ミント"},
-            {"category": "ハーブ・薬味類", "item_code": "10403", "item_name": "バジル"},
-            {"category": "キノコ類", "item_code": "10501", "item_name": "しいたけ"},
-            {"category": "キノコ類", "item_code": "10502", "item_name": "えのき"},
-            {"category": "野菜", "item_code": "10523", "item_name": "キャベツ"},
-            {"category": "野菜", "item_code": "10524", "item_name": "レタス"},
-            {"category": "野菜", "item_code": "10525", "item_name": "トマト"},
-            {"category": "野菜", "item_code": "10528", "item_name": "人参"},
-            {"category": "イモ類・根菜", "item_code": "10601", "item_name": "長いも"},
-            {"category": "イモ類・根菜", "item_code": "10602", "item_name": "さつまいも"},
-            {"category": "果物", "item_code": "20101", "item_name": "りんご"}
-        ])
-        default_master.to_csv(MASTER_CSV_FILE, index=False, encoding="utf-8-sig")
-    
-    df_master = pd.read_csv(MASTER_CSV_FILE, dtype=str)
-    master_dict = {}
+    master_dict = OrderedDict()
     item_flat_list = []
-    for _, row in df_master.iterrows():
-        cat, code, name = str(row["category"]), str(row["item_code"]), str(row["item_name"])
-        if cat not in master_dict:
-            master_dict[cat] = {}
-        master_dict[cat][code] = name
-        item_flat_list.append(f"[{cat}] {code} : {name}")
-    return master_dict, df_master, item_flat_list
+    rows = []
+    for group in BUILTIN_ITEM_GROUPS:
+        for dept in group["departments"]:
+            master_dict.setdefault(dept, [])
+            for code, name in group["items"]:
+                master_dict[dept].append((code, name))
+                item_flat_list.append(f"[{dept}] {code} : {name}")
+                rows.append({"category": dept, "item_code": code, "item_name": name})
+    return master_dict, pd.DataFrame(rows), item_flat_list
 
 ITEM_MASTER, df_master_raw, ITEM_FLAT_LIST = load_item_master_cached()
+DEFAULT_CATEGORY = next(iter(ITEM_MASTER.keys()), "1課（熊谷）")
 
 # ==========================================
 # 9. セッション状態の初期化 & 自動ログイン復帰（F5リロード対策）
@@ -1194,9 +1411,9 @@ with tabs[0]:
         with col_up2:
             if st.button("🧪 テストデータ3件", use_container_width=True):
                 sample_items = [
-                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "野菜", "商品コード": "10525", "商品名": "トマト", "単価": 290, "数量": 50, "小計": 14500},
-                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "野菜", "商品コード": "10523", "商品名": "キャベツ", "単価": 200, "数量": 40, "小計": 8000},
-                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "果物", "商品コード": "20101", "商品名": "りんご", "単価": 360, "数量": 30, "小計": 10800}
+                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "1課（熊谷）", "商品コード": "150", "商品名": "トマト", "単価": 290, "数量": 50, "小計": 14500},
+                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "3課（照井）", "商品コード": "42", "商品名": "キャベツ", "単価": 200, "数量": 40, "小計": 8000},
+                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "5課", "商品コード": "519", "商品名": "富士りんご", "単価": 360, "数量": 30, "小計": 10800}
                 ]
                 insert_records_to_db(current_user, sample_items)
                 st.session_state.verification_batch = {
@@ -1231,7 +1448,7 @@ with tabs[0]:
                     df_file = df_file.rename(columns=rename_map)
                     if "日付" not in df_file.columns: df_file["日付"] = str(datetime.now().date())
                     if "市場番号" not in df_file.columns: df_file["市場番号"] = "M-001"
-                    if "カテゴリー" not in df_file.columns: df_file["カテゴリー"] = "野菜"
+                    if "カテゴリー" not in df_file.columns: df_file["カテゴリー"] = DEFAULT_CATEGORY
                     if "商品コード" not in df_file.columns: df_file["商品コード"] = "AUTO"
                     if "単価" in df_file.columns and "数量" in df_file.columns:
                         df_file["小計"] = df_file["単価"].fillna(0) * df_file["数量"].fillna(0)
@@ -1250,130 +1467,137 @@ with tabs[0]:
                     st.error(f"ファイル解析エラー: {e}")
 
     # -------------------------------------------------------------
-    # ⚡ B. 【超高速】手動連続入力フォーム（st.form + 前回値自動キープ）
+    # ⚡ B. 手動記録（カテゴリー＝○課 / 商品＝選択した課のコード表）
     # -------------------------------------------------------------
     st.markdown("""
         <div style="background-color: #f0fdf4; border: 1.5px solid #86efac; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px;">
-            <b style="color: #166534;">⚡ 高速連続入力フォーム:</b>
+            <b style="color: #166534;">📝 手動記録（課別コード表連動）:</b>
             <span style="color: #4b5563; font-size: 13px;">
-                値を入力中や切り替え時に画面が再読込（リロード）されず、瞬時に何件でも連続で記録できます。
+                カテゴリーで課を選ぶと、商品欄にはその課のコード表に載っている品名だけが表示されます。
             </span>
         </div>
     """, unsafe_allow_html=True)
 
-    with st.form("speed_continuous_input_form", clear_on_submit=False):
-        col_top1, col_top2 = st.columns([2, 1])
-        with col_top1:
-            form_market_no = st.text_input(
-                "市場番号 / 取引先名 (連続入力中は記憶されます)", 
-                value=st.session_state.last_input_market_no,
-                key="speed_form_market"
+    col_top1, col_top2 = st.columns([2, 1])
+    with col_top1:
+        form_market_no = st.text_input(
+            "市場番号 / 取引先名 (連続入力中は記憶されます)",
+            value=st.session_state.last_input_market_no,
+            key="speed_form_market"
+        )
+    with col_top2:
+        form_input_date = st.date_input(
+            "取引日付",
+            value=st.session_state.last_input_date,
+            key="speed_form_date"
+        )
+
+    st.caption("▼ 商品行（カテゴリーで課を選び、該当商品にチェックを入れて記録してください）")
+
+    form_rows_data = []
+    all_categories = list(ITEM_MASTER.keys()) or [DEFAULT_CATEGORY]
+
+    header_chk, header_cat, header_item, header_price, header_qty = st.columns([0.8, 2.2, 3.2, 1.9, 1.9])
+    header_chk.markdown("**行**")
+    header_cat.markdown("**カテゴリー（課）**")
+    header_item.markdown("**商品（選択した課の品目）**")
+    header_price.markdown("**単価**")
+    header_qty.markdown("**数量**")
+
+    for i in range(1, 6):
+        c_chk, c_cat, c_item, c_price, c_qty = st.columns([0.8, 2.2, 3.2, 1.9, 1.9])
+        with c_chk:
+            is_active = st.checkbox(f"行 {i}", value=(i == 1), key=f"f_active_{i}")
+        with c_cat:
+            cat_val = st.selectbox(
+                f"カテゴリー（課） #{i}",
+                all_categories,
+                index=(i - 1) % len(all_categories),
+                key=f"f_cat_{i}",
+                label_visibility="collapsed"
             )
-        with col_top2:
-            form_input_date = st.date_input(
-                "取引日付", 
-                value=st.session_state.last_input_date,
-                key="speed_form_date"
+
+        item_options = item_options_for_category(cat_val)
+        if not item_options:
+            item_options = ["（この課の商品マスタがありません）"]
+
+        with c_item:
+            item_val = st.selectbox(
+                f"商品 #{i}",
+                item_options,
+                index=0,
+                key=f"f_item_{i}_{cat_val}",
+                label_visibility="collapsed"
+            )
+        with c_price:
+            price_val = st.number_input(
+                f"単価 #{i}",
+                min_value=0,
+                value=150 if is_active else 0,
+                step=10,
+                key=f"f_price_{i}",
+                label_visibility="collapsed"
+            )
+        with c_qty:
+            qty_val = st.number_input(
+                f"数量 #{i}",
+                min_value=0,
+                value=10 if is_active else 0,
+                step=1,
+                key=f"f_qty_{i}",
+                label_visibility="collapsed"
             )
 
-        st.caption("▼ 商品行（入力したい商品にチェックを入れて『追加保存』を押してください）")
-        
-        form_rows_data = []
-        all_categories = list(ITEM_MASTER.keys()) or ["野菜", "果物", "ハーブ・薬味類", "キノコ類", "イモ類・根菜"]
+        form_rows_data.append({
+            "active": is_active,
+            "category": cat_val,
+            "item_str": item_val,
+            "price": price_val,
+            "qty": qty_val
+        })
 
-        for i in range(1, 6):
-            c_chk, c_cat, c_item, c_price, c_qty = st.columns([0.8, 2.2, 3.2, 1.9, 1.9])
-            with c_chk:
-                is_active = st.checkbox(f"行 {i}", value=(i == 1), key=f"f_active_{i}")
-            with c_cat:
-                cat_val = st.selectbox(
-                    f"カテゴリ #{i}", 
-                    all_categories, 
-                    index=(i - 1) % len(all_categories),
-                    key=f"f_cat_{i}", 
-                    label_visibility="collapsed" if i > 1 else "visible"
-                )
-            
-            items_in_cat = ITEM_MASTER.get(cat_val, {})
-            item_options = [f"{code} : {name}" for code, name in items_in_cat.items()] if items_in_cat else ["10525 : トマト"]
-            
-            with c_item:
-                item_val = st.selectbox(
-                    f"商品 #{i}", 
-                    item_options, 
-                    index=0, 
-                    key=f"f_item_{i}", 
-                    label_visibility="collapsed" if i > 1 else "visible"
-                )
-            with c_price:
-                price_val = st.number_input(
-                    f"単価 #{i}", 
-                    min_value=0, 
-                    value=150 if is_active else 0, 
-                    step=10, 
-                    key=f"f_price_{i}", 
-                    label_visibility="collapsed" if i > 1 else "visible"
-                )
-            with c_qty:
-                qty_val = st.number_input(
-                    f"数量 #{i}", 
-                    min_value=0, 
-                    value=10 if is_active else 0, 
-                    step=1, 
-                    key=f"f_qty_{i}", 
-                    label_visibility="collapsed" if i > 1 else "visible"
-                )
+    col_sub1, col_sub2 = st.columns([3, 1])
+    with col_sub1:
+        submit_manual_batch = st.button(
+            "➕ 入力した商品を手動記録する",
+            type="primary",
+            use_container_width=True,
+            key="manual_record_submit"
+        )
+    with col_sub2:
+        st.caption("※ 課を切り替えると商品一覧が即時に変わります")
 
-            form_rows_data.append({
-                "active": is_active,
-                "category": cat_val,
-                "item_str": item_val,
-                "price": price_val,
-                "qty": qty_val
-            })
+    if submit_manual_batch:
+        if not form_market_no.strip():
+            st.error("❌ 市場番号を入力してください。")
+        else:
+            st.session_state.last_input_market_no = form_market_no
+            st.session_state.last_input_date = form_input_date
 
-        col_sub1, col_sub2 = st.columns([3, 1])
-        with col_sub1:
-            submit_manual_batch = st.form_submit_button(
-                "➕ 入力した商品を瞬時に記録する（画面のリフレッシュなしで高速保存）", 
-                type="primary", 
-                use_container_width=True
-            )
-        with col_sub2:
-            st.caption("※ 登録後も市場番号と日付は自動保持されます")
+            valid_new_items = []
+            for r in form_rows_data:
+                if r["active"] and r["item_str"] and " : " in r["item_str"] and r["price"] > 0 and r["qty"] > 0:
+                    parts = r["item_str"].split(" : ", 1)
+                    code = parts[0]
+                    name = parts[1] if len(parts) > 1 else parts[0]
+                    valid_new_items.append({
+                        "日付": str(form_input_date),
+                        "市場番号": form_market_no,
+                        "カテゴリー": r["category"],
+                        "商品コード": code,
+                        "商品名": name,
+                        "単価": r["price"],
+                        "数量": r["qty"],
+                        "小計": r["price"] * r["qty"]
+                    })
 
-        if submit_manual_batch:
-            if not form_market_no.strip():
-                st.error("❌ 市場番号を入力してください。")
+            if valid_new_items:
+                insert_records_to_db(current_user, valid_new_items, auto_backup=False)
+                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                st.toast(f"⚡ {len(valid_new_items)} 件を手動記録しました！続けて次のデータを入力できます。")
+                st.rerun()
             else:
-                # 前回値をセッションに保持（次回入力用）
-                st.session_state.last_input_market_no = form_market_no
-                st.session_state.last_input_date = form_input_date
-
-                valid_new_items = []
-                for r in form_rows_data:
-                    if r["active"] and r["item_str"] and r["price"] > 0 and r["qty"] > 0:
-                        parts = r["item_str"].split(" : ")
-                        code = parts[0]
-                        name = parts[1] if len(parts) > 1 else parts[0]
-                        valid_new_items.append({
-                            "日付": str(form_input_date),
-                            "市場番号": form_market_no,
-                            "カテゴリー": r["category"],
-                            "商品コード": code,
-                            "商品名": name,
-                            "単価": r["price"],
-                            "数量": r["qty"],
-                            "小計": r["price"] * r["qty"]
-                        })
-
-                if valid_new_items:
-                    insert_records_to_db(current_user, valid_new_items, auto_backup=False)
-                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.toast(f"⚡ {len(valid_new_items)} 件を瞬時に記録しました！続けて次のデータを入力できます。")
-                    st.rerun()
-                else:
-                    st.warning("⚠️ チェックを入れた行の単価と数量が1以上であるか確認してください。")
+                st.warning("⚠️ チェックを入れた行の単価と数量が1以上であるか確認してください。")
 
     # -------------------------------------------------------------
     # 2️⃣ 登録済みデータ一覧・編集・削除
@@ -1386,7 +1610,7 @@ with tabs[0]:
             "id": None,
             "日付": st.column_config.TextColumn("日付", required=True),
             "市場番号": st.column_config.TextColumn("市場番号", required=True),
-            "カテゴリー": st.column_config.TextColumn("カテゴリー"),
+            "カテゴリー": st.column_config.SelectboxColumn("カテゴリー（課）", options=list(ITEM_MASTER.keys()) or [DEFAULT_CATEGORY]),
             "商品コード": st.column_config.TextColumn("商品コード"),
             "商品名": st.column_config.TextColumn("商品名"),
             "単価": st.column_config.NumberColumn("単価 (円)", min_value=0, format="¥%d"),
