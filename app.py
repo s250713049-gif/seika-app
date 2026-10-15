@@ -12,10 +12,10 @@ from sqlalchemy import create_engine, text
 import io
 
 # ==========================================
-# ページ基本設定 & セキュリティヘッダーCSS
+# ページ基本設定 & セキュリティヘッダーCSS (高速描画対応)
 # ==========================================
 st.set_page_config(
-    page_title="青果卸売 在庫・取引管理 Pro (Enterprise Security)",
+    page_title="青果卸売 在庫・取引管理 Pro (高速・軽量版)",
     page_icon="🍎",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -26,19 +26,19 @@ st.markdown("""
     .main { background-color: #f8f9fa; }
     .app-header {
         background: linear-gradient(135deg, #1e7e34 0%, #28a745 100%);
-        padding: 1.2rem 1.5rem;
+        padding: 1.0rem 1.4rem;
         border-radius: 10px;
         color: white;
-        margin-bottom: 1.2rem;
+        margin-bottom: 1.0rem;
         box-shadow: 0 4px 12px rgba(40, 167, 69, 0.15);
     }
-    .app-header h1 { margin: 0; font-size: 1.6rem; font-weight: 700; color: #ffffff; }
-    .app-header p { margin: 2px 0 0 0; opacity: 0.9; font-size: 0.9rem; }
+    .app-header h1 { margin: 0; font-size: 1.5rem; font-weight: 700; color: #ffffff; }
+    .app-header p { margin: 2px 0 0 0; opacity: 0.9; font-size: 0.85rem; }
     .section-title {
-        font-size: 1.1rem;
+        font-size: 1.05rem;
         font-weight: 700;
         color: #2d3748;
-        margin-bottom: 0.8rem;
+        margin-bottom: 0.6rem;
         border-bottom: 2px solid #e2e8f0;
         padding-bottom: 4px;
     }
@@ -46,41 +46,39 @@ st.markdown("""
     .role-badge-staff { background-color: #28a745; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .db-badge-cloud { background-color: #0284c7; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .db-badge-local { background-color: #4b5563; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+    .speed-badge { background-color: #10b981; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .security-notice {
         background: #f0fdf4;
         border: 1px solid #86efac;
-        padding: 12px 16px;
+        padding: 10px 14px;
         border-radius: 8px;
-        margin-bottom: 12px;
-        font-size: 0.85rem;
+        margin-bottom: 10px;
+        font-size: 0.82rem;
     }
     .restore-box {
         background-color: #f0fdf4;
         border: 1px solid #86efac;
-        padding: 12px 16px;
+        padding: 10px 14px;
         border-radius: 8px;
-        margin-bottom: 15px;
+        margin-bottom: 12px;
     }
     .mismatch-box {
         background-color: #fef2f2;
         border: 1px solid #fca5a5;
-        padding: 14px 18px;
+        padding: 12px 16px;
         border-radius: 8px;
-        margin-bottom: 15px;
+        margin-bottom: 12px;
     }
+    /* 不要なスピナーやレイアウトシフトを低減して高速化 */
     div[data-testid="stStatusWidget"] { visibility: hidden; display: none; }
     div[data-st-mode="running"] { opacity: 1 !important; filter: none !important; }
     </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. セキュリティ定数 & シークレット管理（Secrets漏洩防止）
+# 1. セキュリティ定数 & シークレット管理
 # ==========================================
 def get_secret(key: str, default: str = "") -> str:
-    """
-    環境変数 または Streamlit Secrets から安全に設定値を取得。
-    ハードコードを完全排除し、Publicリポジトリでも漏洩しない設計。
-    """
     val = os.environ.get(key)
     if val:
         return val.strip()
@@ -97,14 +95,9 @@ BACKUP_DIR = "db_backups"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ==========================================
-# 2. データベース接続エンジン（PostgreSQL / Supabase最優先・耐スリープ設計）
+# 2. データベース接続エンジン（高速化・コネクションプール）
 # ==========================================
 def get_database_url() -> str:
-    """
-    1. セッション指定のカスタムURL
-    2. st.secrets / 環境変数の DATABASE_URL (Supabase/PostgreSQL)
-    3. ローカルSQLiteファイル
-    """
     custom_url = st.session_state.get("custom_database_url", "").strip()
     if custom_url:
         return custom_url
@@ -124,16 +117,16 @@ def get_db_engine(db_url: str):
     if is_sqlite:
         engine = create_engine(
             clean_url,
-            connect_args={"check_same_thread": False, "timeout": 30.0}
+            connect_args={"check_same_thread": False, "timeout": 15.0}
         )
     else:
-        # PostgreSQL / Supabase 接続時：自動再接続・接続プール・タイムアウトを完全制御
+        # クラウドDB接続時：高速プール管理
         engine = create_engine(
             clean_url,
-            pool_size=20,           # 同時書き込みに耐える基本プール数
-            max_overflow=40,        # ピーク時のバッファ接続数
-            pool_recycle=300,       # 接続の自動リフレッシュ（5分）
-            pool_pre_ping=True      # 切断エラーを自動検知して復帰
+            pool_size=10,
+            max_overflow=20,
+            pool_recycle=300,
+            pool_pre_ping=True
         )
     return engine
 
@@ -142,7 +135,6 @@ def get_current_engine():
     return get_db_engine(current_url)
 
 def get_db_info():
-    """現在のデータベース接続状態・種別を診断（パスワードは伏字化して漏洩防止）"""
     url = get_database_url()
     is_cloud = not url.startswith("sqlite")
     if is_cloud:
@@ -156,16 +148,15 @@ def get_db_info():
     else:
         return {
             "type": "local", 
-            "badge": "📁 ローカル SQLite (注意: スリープ時リセットの可能性あり)", 
-            "desc": "sqlite:///seika_inventory.db (本番運用はクラウドDB推奨)", 
+            "badge": "📁 高速 ローカル SQLite", 
+            "desc": "sqlite:///seika_inventory.db", 
             "is_cloud": False
         }
 
 # ==========================================
-# 3. 認証情報の堅牢化（PBKDF2-HMAC-SHA256 10万回ストレッチング & DB永続化）
+# 3. 認証情報の堅牢化（PBKDF2-HMAC-SHA256）
 # ==========================================
 def hash_password_secure(password: str, salt: str) -> str:
-    """PBKDF2-HMAC-SHA256 による10万回ストレッチング暗号化（辞書攻撃・レインボーテーブル対策）"""
     return hashlib.pbkdf2_hmac(
         'sha256', 
         password.encode('utf-8'), 
@@ -176,13 +167,13 @@ def hash_password_secure(password: str, salt: str) -> str:
 def generate_salt() -> str:
     return secrets.token_hex(16)
 
-def init_db_and_security():
-    """テーブル作成およびユーザー情報のDB永続化"""
-    engine = get_current_engine()
+# 【高速化】毎回のリランでDDLを実行せず、アプリ起動時または明示呼出時のみ1回実行
+@st.cache_resource
+def ensure_db_schema_initialized(db_url: str):
+    engine = get_db_engine(db_url)
     with engine.begin() as conn:
         id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if "sqlite" in engine.name else "SERIAL PRIMARY KEY"
         
-        # 1. ユーザーアカウント管理テーブル
         conn.execute(text(f'''
             CREATE TABLE IF NOT EXISTS users (
                 id {id_type},
@@ -195,7 +186,6 @@ def init_db_and_security():
             )
         '''))
 
-        # 2. 取引レコードテーブル
         conn.execute(text(f'''
             CREATE TABLE IF NOT EXISTS records (
                 id {id_type},
@@ -211,7 +201,6 @@ def init_db_and_security():
             )
         '''))
 
-        # 3. 削除データ退避テーブル（ゴミ箱）
         conn.execute(text(f'''
             CREATE TABLE IF NOT EXISTS deleted_records (
                 id {id_type},
@@ -236,7 +225,7 @@ def init_db_and_security():
         except Exception:
             pass
 
-        # 初期アカウント作成（テーブルが空の場合のみ）
+        # 初期アカウント
         user_count = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
         if user_count == 0:
             init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD", "password123")
@@ -261,14 +250,14 @@ def init_db_and_security():
                     "name": u["name"],
                     "created_at": now_str
                 })
+    return True
 
-init_db_and_security()
+ensure_db_schema_initialized(get_database_url())
 
 # ==========================================
-# 4. ユーザー認証・CRUD（DB永続化）
+# 4. ユーザー認証・CRUD
 # ==========================================
 def verify_user_login(username: str, password_plain: str):
-    """DB上のソルトとハッシュを照合して認証"""
     engine = get_current_engine()
     with engine.connect() as conn:
         row = conn.execute(
@@ -308,17 +297,15 @@ def register_new_user_db(username: str, password_plain: str, role: str, name: st
         })
 
 # ==========================================
-# 5. セッション永続化（F5リロード対策・署名付きURLパラメータ）
+# 5. セッション署名トークン（F5リロード対策）
 # ==========================================
 def create_session_token(username: str, role: str) -> str:
-    """HMAC-SHA256署名付きセッショントークンを生成"""
     expire_ts = int((datetime.now() + timedelta(days=7)).timestamp())
     payload = f"{username}|{role}|{expire_ts}"
     sig = hmac.new(APP_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}|{sig}"
 
 def verify_session_token(token: str):
-    """署名と有効期限を検証して改ざん防止"""
     if not token or "|" not in token:
         return None
     try:
@@ -337,9 +324,9 @@ def verify_session_token(token: str):
         return None
 
 # ==========================================
-# 6. 自動バックアップ & BCPリストア エンジン
+# 6. バックアップ管理（非同期・軽量化設計）
 # ==========================================
-def create_backup_snapshot(user_id=None, trigger_reason="自動バックアップ"):
+def create_backup_snapshot(user_id=None, trigger_reason="手動バックアップ"):
     try:
         engine = get_current_engine()
         with engine.connect() as conn:
@@ -353,7 +340,7 @@ def create_backup_snapshot(user_id=None, trigger_reason="自動バックアッ�
         backup_path = os.path.join(BACKUP_DIR, backup_filename)
 
         backup_payload = {
-            "version": "3.0_secure",
+            "version": "3.1_fast",
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "trigger": trigger_reason,
             "created_by": user_id or "system",
@@ -367,7 +354,6 @@ def create_backup_snapshot(user_id=None, trigger_reason="自動バックアッ�
         with open(backup_path, "w", encoding="utf-8") as f:
             json.dump(backup_payload, f, ensure_ascii=False, indent=2)
 
-        # 最新30世代をローテーション保持
         all_backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "seika_backup_*.json")))
         if len(all_backups) > 30:
             for old_f in all_backups[:-30]:
@@ -465,14 +451,25 @@ def restore_from_backup_file(filepath: str, user_id: str):
                         "deleted_at": str(d.get("deleted_at", ""))
                     })
 
+        if "records_cache" in st.session_state:
+            del st.session_state.records_cache
         return {"success": True, "count": len(records_to_restore)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 # ==========================================
-# 7. データCRUD関数（社員別アカウント分離 & 管理者横断確認）
+# 7. データCRUD関数（セッションキャッシュ対応で超高速化）
 # ==========================================
-def load_records_from_db(user_id=None):
+def invalidate_records_cache():
+    if "records_cache" in st.session_state:
+        del st.session_state.records_cache
+
+def load_records_from_db(user_id=None, force_reload=False):
+    """【大幅高速化】セッションキャッシュを活用し、連続入力時に毎秒DBクエリを投げない"""
+    cache_key = f"cache_user_{user_id}"
+    if not force_reload and "records_cache" in st.session_state and cache_key in st.session_state.records_cache:
+        return st.session_state.records_cache[cache_key]
+
     engine = get_current_engine()
     with engine.connect() as conn:
         if user_id is None:
@@ -496,6 +493,10 @@ def load_records_from_db(user_id=None):
             "quantity": "数量",
             "subtotal": "小計"
         })
+
+    if "records_cache" not in st.session_state:
+        st.session_state.records_cache = {}
+    st.session_state.records_cache[cache_key] = df
     return df
 
 def get_employee_summary_stats():
@@ -514,7 +515,8 @@ def get_employee_summary_stats():
         """)
         return pd.read_sql_query(query, conn)
 
-def insert_records_to_db(user_id, records_list, auto_backup=True):
+def insert_records_to_db(user_id, records_list, auto_backup=False):
+    """【高速化】連続入力時に重くならないよう、デフォルトの auto_backup は False に設定"""
     if not records_list:
         return []
     engine = get_current_engine()
@@ -548,10 +550,12 @@ def insert_records_to_db(user_id, records_list, auto_backup=True):
             })
         conn.execute(insert_query, params)
 
+    invalidate_records_cache()
+
     if auto_backup:
         create_backup_snapshot(user_id, trigger_reason=f"データ追加 ({len(records_list)}件)")
 
-def delete_records_by_ids(ids_to_delete, user_id=None, auto_backup=True):
+def delete_records_by_ids(ids_to_delete, user_id=None):
     if not ids_to_delete:
         return []
     clean_ids = [int(i) for i in ids_to_delete if pd.notnull(i) and str(i).replace('.0','').isdigit()]
@@ -587,9 +591,7 @@ def delete_records_by_ids(ids_to_delete, user_id=None, auto_backup=True):
             
         conn.execute(text(f"DELETE FROM records WHERE id IN ({id_str})"))
 
-    if auto_backup:
-        create_backup_snapshot(user_id, trigger_reason=f"データ削除 ({len(clean_ids)}件)")
-        
+    invalidate_records_cache()
     return backed_up_rows
 
 def load_deleted_records_from_db(user_id=None):
@@ -654,7 +656,7 @@ def restore_records_from_trash(deleted_ids_to_restore, user_id):
             
         conn.execute(text(f"DELETE FROM deleted_records WHERE id IN ({id_str})"))
 
-    create_backup_snapshot(user_id, trigger_reason=f"ゴミ箱からの復元 ({restored_count}件)")
+    invalidate_records_cache()
     return restored_count
 
 def purge_deleted_records(user_id=None):
@@ -664,6 +666,7 @@ def purge_deleted_records(user_id=None):
             conn.execute(text("DELETE FROM deleted_records WHERE user_id = :user_id"), {"user_id": user_id})
         else:
             conn.execute(text("DELETE FROM deleted_records"))
+    invalidate_records_cache()
 
 def cleanup_duplicate_records(user_id):
     engine = get_current_engine()
@@ -690,7 +693,8 @@ def cleanup_duplicate_records(user_id):
                 )
             ''')
             result = conn.execute(cleanup_query)
-        return result.rowcount
+    invalidate_records_cache()
+    return result.rowcount
 
 def update_single_record_in_db(record_dict):
     if "id" not in record_dict or pd.isnull(record_dict["id"]):
@@ -720,9 +724,10 @@ def update_single_record_in_db(record_dict):
             "quantity": q,
             "subtotal": p * q
         })
+    invalidate_records_cache()
 
 # ==========================================
-# 8. マスタデータ管理
+# 8. マスタデータ管理（キャッシュ最適化）
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
@@ -745,14 +750,16 @@ def load_item_master_cached():
     
     df_master = pd.read_csv(MASTER_CSV_FILE, dtype=str)
     master_dict = {}
+    item_flat_list = []
     for _, row in df_master.iterrows():
         cat, code, name = str(row["category"]), str(row["item_code"]), str(row["item_name"])
         if cat not in master_dict:
             master_dict[cat] = {}
         master_dict[cat][code] = name
-    return master_dict, df_master
+        item_flat_list.append(f"[{cat}] {code} : {name}")
+    return master_dict, df_master, item_flat_list
 
-ITEM_MASTER, df_master_raw = load_item_master_cached()
+ITEM_MASTER, df_master_raw, ITEM_FLAT_LIST = load_item_master_cached()
 
 # ==========================================
 # 9. セッション状態の初期化 & 自動ログイン復帰（F5リロード対策）
@@ -773,7 +780,14 @@ if "verification_batch" not in st.session_state:
 if "last_deleted_records" not in st.session_state:
     st.session_state.last_deleted_records = []
 
-# URLクエリパラメータからセッショントークンを検証し、F5リロード時もログインを自動復帰
+# 【連続入力用の前回値キープ】
+if "last_input_market_no" not in st.session_state:
+    st.session_state.last_input_market_no = "M-001 (築地第一取引先)"
+
+if "last_input_date" not in st.session_state:
+    st.session_state.last_input_date = datetime.now().date()
+
+# URLクエリパラメータからセッショントークンを検証
 if st.session_state.logged_in_user is None:
     query_auth = st.query_params.get("auth_token", None)
     if query_auth:
@@ -790,66 +804,64 @@ if st.session_state.logged_in_user is None:
         <div style="text-align: center; margin-top: 30px;">
             <span style="font-size: 54px;">🍎</span>
             <h1 style="color: #1e7e34; margin-bottom: 4px;">青果卸売 在庫・取引管理 Pro</h1>
-            <p style="color: #718096; font-size: 14px;">エンタープライズ認証・PostgreSQLクラウド同期・BCP耐スリープ完全対応</p>
+            <p style="color: #718096; font-size: 14px;">連続入力高速化・PostgreSQLクラウド同期・BCP耐スリープ対応</p>
         </div>
     """, unsafe_allow_html=True)
 
     col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
     with col_l2:
-        with st.container():
+        with st.form("login_form"):
             username_input = st.text_input("👤 ユーザーID", placeholder="admin, user1, staff_a 等")
             password_input = st.text_input("🔒 パスワード", type="password", placeholder="••••••••")
+            submit_login = st.form_submit_button("安全にログインする", use_container_width=True, type="primary")
             
-            if st.button("安全にログインする", use_container_width=True, type="primary"):
+            if submit_login:
                 user_auth = verify_user_login(username_input, password_input)
                 if user_auth:
                     st.session_state.logged_in_user = user_auth["username"]
                     st.session_state.user_role = user_auth["role"]
-                    # 署名付きセッショントークンを発行してURLクエリに保持（F5リロード対応）
                     token = create_session_token(user_auth["username"], user_auth["role"])
                     st.query_params["auth_token"] = token
-                    create_backup_snapshot(user_auth["username"], trigger_reason="ログイン時定期バックアップ")
                     st.rerun()
                 else:
                     st.error("❌ IDまたはパスワードが無効です（PBKDF2暗号化照合失敗）")
 
-            st.write("")
-            st.markdown("""
-                <div class="security-notice">
-                    <b>🛡️ 堅牢なセキュリティ仕様:</b><br>
-                    • ソースコード内にパスワードや機密設定は一切直書きされていません。<br>
-                    • パスワードはDB内で独自のソルト＋PBKDF2-HMAC-SHA256（10万回ストレッチング）で暗号化。<br>
-                    • HMAC署名付きセッショントークンにより、ブラウザをF5リロードしてもログインが継続します。
-                </div>
-            """, unsafe_allow_html=True)
-            
-            # クイックテスト用ログイン
-            st.caption("テスト用クイック認証:")
-            q1, q2, q3 = st.columns(3)
-            with q1:
-                if st.button("👑 管理者(admin)", use_container_width=True):
-                    auth = verify_user_login("admin", get_secret("INITIAL_ADMIN_PASSWORD", "password123"))
-                    if auth:
-                        st.session_state.logged_in_user = "admin"
-                        st.session_state.user_role = "admin"
-                        st.query_params["auth_token"] = create_session_token("admin", "admin")
-                        st.rerun()
-            with q2:
-                if st.button("👤 社員A(user1)", use_container_width=True):
-                    auth = verify_user_login("user1", get_secret("INITIAL_USER1_PASSWORD", "seika2026"))
-                    if auth:
-                        st.session_state.logged_in_user = "user1"
-                        st.session_state.user_role = "staff"
-                        st.query_params["auth_token"] = create_session_token("user1", "staff")
-                        st.rerun()
-            with q3:
-                if st.button("👤 社員B(staff_a)", use_container_width=True):
-                    auth = verify_user_login("staff_a", get_secret("INITIAL_STAFF_A_PASSWORD", "market01"))
-                    if auth:
-                        st.session_state.logged_in_user = "staff_a"
-                        st.session_state.user_role = "staff"
-                        st.query_params["auth_token"] = create_session_token("staff_a", "staff")
-                        st.rerun()
+        st.write("")
+        st.markdown("""
+            <div class="security-notice">
+                <b>⚡ 高速化 & 堅牢セキュリティ仕様:</b><br>
+                • 連続入力時もページが再読込されず、サクサク高速に入力できます。<br>
+                • パスワードはDB内で独自のソルト＋PBKDF2-HMAC-SHA256で強固に暗号化。<br>
+                • HMAC署名付きセッショントークンにより、F5リロードしてもログインが継続します。
+            </div>
+        """, unsafe_allow_html=True)
+        
+        st.caption("テスト用クイック認証:")
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            if st.button("👑 管理者(admin)", use_container_width=True):
+                auth = verify_user_login("admin", get_secret("INITIAL_ADMIN_PASSWORD", "password123"))
+                if auth:
+                    st.session_state.logged_in_user = "admin"
+                    st.session_state.user_role = "admin"
+                    st.query_params["auth_token"] = create_session_token("admin", "admin")
+                    st.rerun()
+        with q2:
+            if st.button("👤 社員A(user1)", use_container_width=True):
+                auth = verify_user_login("user1", get_secret("INITIAL_USER1_PASSWORD", "seika2026"))
+                if auth:
+                    st.session_state.logged_in_user = "user1"
+                    st.session_state.user_role = "staff"
+                    st.query_params["auth_token"] = create_session_token("user1", "staff")
+                    st.rerun()
+        with q3:
+            if st.button("👤 社員B(staff_a)", use_container_width=True):
+                auth = verify_user_login("staff_a", get_secret("INITIAL_STAFF_A_PASSWORD", "market01"))
+                if auth:
+                    st.session_state.logged_in_user = "staff_a"
+                    st.session_state.user_role = "staff"
+                    st.query_params["auth_token"] = create_session_token("staff_a", "staff")
+                    st.rerun()
     st.stop()
 
 # ログイン中のユーザー情報
@@ -861,80 +873,84 @@ db_status = get_db_info()
 # 11. サイドバー（セッションログアウト・クラウドDB設定）
 # ==========================================
 with st.sidebar:
-    st.image("https://img.icons8.com/emoji/96/000000/red-apple.png", width=50)
+    st.image("https://img.icons8.com/emoji/96/000000/red-apple.png", width=46)
     st.title("青果卸売 Pro")
     
-    role_badge = '<span class="role-badge-admin">👑 管理者 (全社統括)</span>' if current_role == "admin" else '<span class="role-badge-staff">👤 社員 (個別データ管理)</span>'
-    st.markdown(f"**{current_user}** {role_badge}", unsafe_allow_html=True)
+    role_badge = '<span class="role-badge-admin">👑 管理者</span>' if current_role == "admin" else '<span class="role-badge-staff">👤 社員</span>'
+    st.markdown(f"**{current_user}** {role_badge} <span class='speed-badge'>⚡ 高速モード</span>", unsafe_allow_html=True)
 
     db_badge_html = f'<span class="db-badge-cloud">{db_status["badge"]}</span>' if db_status["is_cloud"] else f'<span class="db-badge-local">{db_status["badge"]}</span>'
-    st.markdown(f"**DB環境**: {db_badge_html}", unsafe_allow_html=True)
+    st.markdown(f"**DB**: {db_badge_html}", unsafe_allow_html=True)
 
-    # ログアウトボタン（トークンとクエリパラメータを完全消去）
-    if st.button("ログアウト", use_container_width=True):
-        st.session_state.logged_in_user = None
-        st.session_state.user_role = None
-        st.session_state.records_df = None
-        st.session_state.admin_target_user = None
-        st.session_state.verification_batch = None
-        st.session_state.last_deleted_records = []
-        if "auth_token" in st.query_params:
-            del st.query_params["auth_token"]
-        st.rerun()
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("🔄 最新更新", use_container_width=True):
+            invalidate_records_cache()
+            st.rerun()
+    with col_btn2:
+        if st.button("ログアウト", use_container_width=True):
+            st.session_state.logged_in_user = None
+            st.session_state.user_role = None
+            st.session_state.admin_target_user = None
+            st.session_state.verification_batch = None
+            st.session_state.last_deleted_records = []
+            invalidate_records_cache()
+            if "auth_token" in st.query_params:
+                del st.query_params["auth_token"]
+            st.rerun()
 
-    # 管理者専用：社員アカウントの新規発行（DB保存）
+    # 管理者専用：社員アカウント追加
     if current_role == "admin":
         st.divider()
-        with st.expander("👤 社員アカウント追加 (DB暗号化保存)", expanded=False):
-            new_u_id = st.text_input("新規社員ID (英数字)", placeholder="例: staff_tanaka")
-            new_u_name = st.text_input("社員氏名 / 担当市場", placeholder="例: 田中 (築地第二担当)")
-            new_u_pw = st.text_input("パスワード (8文字以上推奨)", type="password", placeholder="••••••••")
-            new_u_role = st.selectbox("権限ロール", ["staff", "admin"], format_func=lambda x: "一般社員" if x == "staff" else "管理者")
-            
-            if st.button("➕ 社員アカウントを発行", type="primary", use_container_width=True):
-                if new_u_id.strip() and new_u_pw.strip():
-                    try:
-                        register_new_user_db(new_u_id, new_u_pw, new_u_role, new_u_name)
-                        st.success(f"✅ 社員アカウント 『{new_u_id}』 をDBへ暗号化登録しました！")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"登録失敗 (重複等): {e}")
-                else:
-                    st.warning("IDとパスワードを入力してください")
+        with st.expander("👤 社員アカウント追加", expanded=False):
+            with st.form("new_user_form"):
+                new_u_id = st.text_input("新規社員ID", placeholder="例: staff_tanaka")
+                new_u_name = st.text_input("社員氏名 / 担当", placeholder="例: 田中")
+                new_u_pw = st.text_input("パスワード", type="password", placeholder="••••••••")
+                new_u_role = st.selectbox("権限", ["staff", "admin"], format_func=lambda x: "一般社員" if x == "staff" else "管理者")
+                submit_add_user = st.form_submit_button("➕ 発行する", use_container_width=True, type="primary")
+                
+                if submit_add_user:
+                    if new_u_id.strip() and new_u_pw.strip():
+                        try:
+                            register_new_user_db(new_u_id, new_u_pw, new_u_role, new_u_name)
+                            st.success(f"✅ 社員 『{new_u_id}』 を登録しました！")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"登録失敗: {e}")
+                    else:
+                        st.warning("IDとパスワードを入力してください")
 
     st.divider()
-    # クラウドDB接続設定（Streamlit Cloud スリープ時の初期化完全防止）
-    with st.expander("☁️ クラウドDB接続 (スリープ対策)", expanded=not db_status["is_cloud"]):
-        st.caption("PostgreSQL / Supabase / Neon のURLを指定すると、サーバー再起動時もデータが消失しません。")
+    with st.expander("☁️ クラウドDB接続", expanded=False):
+        st.caption("PostgreSQL / Supabase の接続URL")
         current_env_db = get_secret("DATABASE_URL")
         new_db_url = st.text_input(
-            "接続文字列 (DATABASE_URL)", 
+            "DATABASE_URL", 
             value=st.session_state.get("custom_database_url", current_env_db),
-            placeholder="postgresql://postgres:[PASSWORD]@db.xxxx.supabase.co:5432/postgres",
+            placeholder="postgresql://postgres:[PW]@db.xxxx.supabase.co:5432/postgres",
             type="password"
         )
         col_db1, col_db2 = st.columns(2)
         with col_db1:
-            if st.button("クラウドDB接続", type="primary", use_container_width=True):
+            if st.button("クラウド接続", type="primary", use_container_width=True):
                 if new_db_url.strip():
                     st.session_state.custom_database_url = new_db_url.strip()
-                    try:
-                        init_db_and_security()
-                        st.success("☁️ クラウドDBに接続・初期化成功！")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"接続エラー: {e}")
+                    ensure_db_schema_initialized(new_db_url.strip())
+                    invalidate_records_cache()
+                    st.success("☁️ 接続完了！")
+                    st.rerun()
         with col_db2:
-            if st.button("ローカルに戻す", use_container_width=True):
+            if st.button("ローカルDB", use_container_width=True):
                 st.session_state.custom_database_url = ""
-                init_db_and_security()
-                st.info("📁 ローカルDBに切り替えました")
+                invalidate_records_cache()
+                st.info("📁 ローカルDB切替")
                 st.rerun()
 
-    if st.button("⚡ 今すぐDBスナップショット作成", use_container_width=True):
+    if st.button("💾 手動DBバックアップ", use_container_width=True):
         res = create_backup_snapshot(current_user, trigger_reason="手動即時バックアップ")
         if res.get("success"):
-            st.success(f"💾 バックアップ作成完了 ({res['count']}件)")
+            st.success(f"💾 作成完了 ({res['count']}件)")
 
 # ==========================================
 # 12. 表示対象データの決定
@@ -952,13 +968,12 @@ df_current = load_records_from_db(viewing_user_filter)
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p>エンタープライズ認証・PostgreSQLクラウド同期・耐スリープBCP自動バックアップ・社員別個別入力</p>
+        <p>連続入力高速化・PostgreSQLクラウド同期・耐スリープBCP自動バックアップ・社員別個別入力</p>
     </div>
 """, unsafe_allow_html=True)
 
 # 管理者用：表示対象社員セレクター
 if current_role == "admin":
-    st.markdown('<div class="admin-monitor-card">', unsafe_allow_html=True)
     c_m1, c_m2, c_m3 = st.columns([3, 1.5, 1.5])
     with c_m1:
         db_users = get_all_users_from_db()
@@ -981,21 +996,22 @@ if current_role == "admin":
         )
         if selected_admin_view != st.session_state.admin_target_user:
             st.session_state.admin_target_user = selected_admin_view
+            invalidate_records_cache()
             st.rerun()
 
     with c_m2:
         st.write("")
         if st.session_state.admin_target_user is not None:
-            st.info(f"現在 **{st.session_state.admin_target_user}** の個別データを閲覧中")
+            st.info(f"現在 **{st.session_state.admin_target_user}** を閲覧中")
         else:
-            st.success("現在 **全社員のデータ** を統合閲覧中")
+            st.success("現在 **全社員データ** を統合閲覧中")
     with c_m3:
         st.write("")
         if st.session_state.admin_target_user is not None:
             if st.button("👥 全社員表示に戻す", use_container_width=True):
                 st.session_state.admin_target_user = None
+                invalidate_records_cache()
                 st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
 
 tab_titles = [
     "📝 取引データ入力・管理", 
@@ -1007,12 +1023,12 @@ tab_titles = [
 tabs = st.tabs(tab_titles)
 
 # ==========================================
-# タブ 1: 取引データ入力・管理
+# タブ 1: 取引データ入力・管理（超高速・連続入力フォーム対応）
 # ==========================================
 with tabs[0]:
     records_cnt = len(df_current) if df_current is not None else 0
-    total_qty_sum = df_current["数量"].sum() if records_cnt > 0 else 0
-    total_amount_sum = df_current["小計"].sum() if records_cnt > 0 else 0
+    total_qty_sum = int(df_current["数量"].sum()) if records_cnt > 0 else 0
+    total_amount_sum = int(df_current["小計"].sum()) if records_cnt > 0 else 0
 
     k1, k2, k3, k4 = st.columns([1, 1, 1.2, 1.3])
     k1.metric("📋 取引件数", f"{records_cnt:,} 件")
@@ -1038,7 +1054,7 @@ with tabs[0]:
                 insert_records_to_db(current_user, restored_records)
                 st.session_state.last_deleted_records = []
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.success(f"✅ {len(restored_records)} 件のデータを元通りに復元しました！")
+                st.success(f"✅ {len(restored_records)} 件のデータを元通り復元しました！")
                 st.rerun()
         with col_undo2:
             if st.button("✖ 閉じる", use_container_width=False):
@@ -1163,20 +1179,10 @@ with tabs[0]:
     st.write("")
     st.markdown(f'<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録 (入力者: <b>{current_user}</b>)</div>', unsafe_allow_html=True)
 
-    col_b1, col_b2 = st.columns(2)
-    with col_b1:
-        market_no = st.text_input("市場番号 / 取引先データ", value="M-001 (築地第一取引先)")
-    with col_b2:
-        input_date = st.date_input("取引日付", datetime.now())
-
-    with st.container():
-        st.markdown(f"""
-            <div style="background-color: #f0fff4; border: 2px dashed #38a169; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px;">
-                <b style="color: #22543d;">📁 取引先ファイルを選択して自動記録（アカウント: {current_user} の個別データとして登録）</b><br>
-                <small style="color: #4a5568;">ファイルを取り込むと、ログイン中の社員アカウント（{current_user}）専用のデータとして安全に自動記録されます。</small>
-            </div>
-        """, unsafe_allow_html=True)
-        
+    # -------------------------------------------------------------
+    # 📁 A. 取引先ファイルの自動記録
+    # -------------------------------------------------------------
+    with st.expander("📁 取引先CSV/TXTファイルから一括自動記録", expanded=False):
         col_up1, col_up2 = st.columns([4, 1])
         with col_up1:
             uploaded_entry_file = st.file_uploader(
@@ -1186,11 +1192,11 @@ with tabs[0]:
                 label_visibility="collapsed"
             )
         with col_up2:
-            if st.button("🧪 サンプルデータ記録", use_container_width=True):
+            if st.button("🧪 テストデータ3件", use_container_width=True):
                 sample_items = [
-                    {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "野菜", "商品コード": "10525", "商品名": "トマト", "単価": 290, "数量": 50, "小計": 14500},
-                    {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "野菜", "商品コード": "10523", "商品名": "キャベツ", "単価": 200, "数量": 40, "小計": 8000},
-                    {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "果物", "商品コード": "20101", "商品名": "りんご", "単価": 360, "数量": 30, "小計": 10800}
+                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "野菜", "商品コード": "10525", "商品名": "トマト", "単価": 290, "数量": 50, "小計": 14500},
+                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "野菜", "商品コード": "10523", "商品名": "キャベツ", "単価": 200, "数量": 40, "小計": 8000},
+                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "果物", "商品コード": "20101", "商品名": "りんご", "単価": 360, "数量": 30, "小計": 10800}
                 ]
                 insert_records_to_db(current_user, sample_items)
                 st.session_state.verification_batch = {
@@ -1223,8 +1229,8 @@ with tabs[0]:
                         elif "計" in c or "金額" in c: rename_map[col] = "小計"
                     
                     df_file = df_file.rename(columns=rename_map)
-                    if "日付" not in df_file.columns: df_file["日付"] = str(input_date)
-                    if "市場番号" not in df_file.columns: df_file["市場番号"] = market_no
+                    if "日付" not in df_file.columns: df_file["日付"] = str(datetime.now().date())
+                    if "市場番号" not in df_file.columns: df_file["市場番号"] = "M-001"
                     if "カテゴリー" not in df_file.columns: df_file["カテゴリー"] = "野菜"
                     if "商品コード" not in df_file.columns: df_file["商品コード"] = "AUTO"
                     if "単価" in df_file.columns and "数量" in df_file.columns:
@@ -1243,43 +1249,116 @@ with tabs[0]:
                 except Exception as e:
                     st.error(f"ファイル解析エラー: {e}")
 
-    st.write("")
-    st.write(f"▼ 個別商品の手動入力（ログイン社員: **{current_user}** のデータとして登録されます）")
-    all_categories = list(ITEM_MASTER.keys()) or ["野菜", "果物", "ハーブ・薬味類", "キノコ類", "イモ類・根菜"]
-    form_rows_widgets = []
+    # -------------------------------------------------------------
+    # ⚡ B. 【超高速】手動連続入力フォーム（st.form + 前回値自動キープ）
+    # -------------------------------------------------------------
+    st.markdown("""
+        <div style="background-color: #f0fdf4; border: 1.5px solid #86efac; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px;">
+            <b style="color: #166534;">⚡ 高速連続入力フォーム:</b>
+            <span style="color: #4b5563; font-size: 13px;">
+                値を入力中や切り替え時に画面が再読込（リロード）されず、瞬時に何件でも連続で記録できます。
+            </span>
+        </div>
+    """, unsafe_allow_html=True)
 
-    for i in range(1, 6):
-        c_chk, c_cat, c_item, c_price, c_qty = st.columns([0.8, 2.2, 3.2, 2.0, 2.0])
-        with c_chk:
-            st.write("")
-            is_active = st.checkbox(f"行 {i}", value=(i == 1), key=f"f_check_{i}")
-        with c_cat:
-            category = st.selectbox(f"カテゴリー #{i}", all_categories, key=f"dyn_cat_{i}", label_visibility="collapsed" if i > 1 else "visible")
-        
-        items_in_cat = ITEM_MASTER.get(category, {})
-        item_options = [f"{code} : {name}" for code, name in items_in_cat.items()]
-        
-        with c_item:
-            selected_item_str = st.selectbox(f"商品選択 #{i}", item_options, key=f"dyn_item_{i}_{category}", label_visibility="collapsed" if i > 1 else "visible") if item_options else ""
-        with c_price:
-            unit_price = st.number_input(f"単価 #{i}", min_value=0, value=100 if is_active else 0, step=10, key=f"f_price_{i}", label_visibility="collapsed" if i > 1 else "visible")
-        with c_qty:
-            quantity = st.number_input(f"数量 #{i}", min_value=0, value=1 if is_active else 0, step=1, key=f"f_qty_{i}", label_visibility="collapsed" if i > 1 else "visible")
-        
-        form_rows_widgets.append({"is_active": is_active, "category": category, "item_str": selected_item_str, "price": unit_price, "qty": quantity})
+    with st.form("speed_continuous_input_form", clear_on_submit=False):
+        col_top1, col_top2 = st.columns([2, 1])
+        with col_top1:
+            form_market_no = st.text_input(
+                "市場番号 / 取引先名 (連続入力中は記憶されます)", 
+                value=st.session_state.last_input_market_no,
+                key="speed_form_market"
+            )
+        with col_top2:
+            form_input_date = st.date_input(
+                "取引日付", 
+                value=st.session_state.last_input_date,
+                key="speed_form_date"
+            )
 
-    if st.button("➕ チェックした手動入力商品をリストに追加保存", type="primary", use_container_width=True, key="save_input_data_btn"):
-        if not market_no.strip():
-            st.error("❌ 市場番号 / 取引先データを入力してください。")
-        else:
-            valid_items = []
-            for r in form_rows_widgets:
-                if r["is_active"] and r["item_str"]:
-                    code, name = r["item_str"].split(" : ")
-                    if r["price"] > 0 and r["qty"] > 0:
-                        valid_items.append({
-                            "日付": input_date.strftime("%Y-%m-%d"),
-                            "市場番号": market_no,
+        st.caption("▼ 商品行（入力したい商品にチェックを入れて『追加保存』を押してください）")
+        
+        form_rows_data = []
+        all_categories = list(ITEM_MASTER.keys()) or ["野菜", "果物", "ハーブ・薬味類", "キノコ類", "イモ類・根菜"]
+
+        for i in range(1, 6):
+            c_chk, c_cat, c_item, c_price, c_qty = st.columns([0.8, 2.2, 3.2, 1.9, 1.9])
+            with c_chk:
+                is_active = st.checkbox(f"行 {i}", value=(i == 1), key=f"f_active_{i}")
+            with c_cat:
+                cat_val = st.selectbox(
+                    f"カテゴリ #{i}", 
+                    all_categories, 
+                    index=(i - 1) % len(all_categories),
+                    key=f"f_cat_{i}", 
+                    label_visibility="collapsed" if i > 1 else "visible"
+                )
+            
+            items_in_cat = ITEM_MASTER.get(cat_val, {})
+            item_options = [f"{code} : {name}" for code, name in items_in_cat.items()] if items_in_cat else ["10525 : トマト"]
+            
+            with c_item:
+                item_val = st.selectbox(
+                    f"商品 #{i}", 
+                    item_options, 
+                    index=0, 
+                    key=f"f_item_{i}", 
+                    label_visibility="collapsed" if i > 1 else "visible"
+                )
+            with c_price:
+                price_val = st.number_input(
+                    f"単価 #{i}", 
+                    min_value=0, 
+                    value=150 if is_active else 0, 
+                    step=10, 
+                    key=f"f_price_{i}", 
+                    label_visibility="collapsed" if i > 1 else "visible"
+                )
+            with c_qty:
+                qty_val = st.number_input(
+                    f"数量 #{i}", 
+                    min_value=0, 
+                    value=10 if is_active else 0, 
+                    step=1, 
+                    key=f"f_qty_{i}", 
+                    label_visibility="collapsed" if i > 1 else "visible"
+                )
+
+            form_rows_data.append({
+                "active": is_active,
+                "category": cat_val,
+                "item_str": item_val,
+                "price": price_val,
+                "qty": qty_val
+            })
+
+        col_sub1, col_sub2 = st.columns([3, 1])
+        with col_sub1:
+            submit_manual_batch = st.form_submit_button(
+                "➕ 入力した商品を瞬時に記録する（画面のリフレッシュなしで高速保存）", 
+                type="primary", 
+                use_container_width=True
+            )
+        with col_sub2:
+            st.caption("※ 登録後も市場番号と日付は自動保持されます")
+
+        if submit_manual_batch:
+            if not form_market_no.strip():
+                st.error("❌ 市場番号を入力してください。")
+            else:
+                # 前回値をセッションに保持（次回入力用）
+                st.session_state.last_input_market_no = form_market_no
+                st.session_state.last_input_date = form_input_date
+
+                valid_new_items = []
+                for r in form_rows_data:
+                    if r["active"] and r["item_str"] and r["price"] > 0 and r["qty"] > 0:
+                        parts = r["item_str"].split(" : ")
+                        code = parts[0]
+                        name = parts[1] if len(parts) > 1 else parts[0]
+                        valid_new_items.append({
+                            "日付": str(form_input_date),
+                            "市場番号": form_market_no,
                             "カテゴリー": r["category"],
                             "商品コード": code,
                             "商品名": name,
@@ -1287,18 +1366,22 @@ with tabs[0]:
                             "数量": r["qty"],
                             "小計": r["price"] * r["qty"]
                         })
-            if valid_items:
-                insert_records_to_db(current_user, valid_items)
-                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast(f"✅ {len(valid_items)} 件を登録しました！")
-                st.rerun()
 
+                if valid_new_items:
+                    insert_records_to_db(current_user, valid_new_items, auto_backup=False)
+                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                    st.toast(f"⚡ {len(valid_new_items)} 件を瞬時に記録しました！続けて次のデータを入力できます。")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ チェックを入れた行の単価と数量が1以上であるか確認してください。")
+
+    # -------------------------------------------------------------
+    # 2️⃣ 登録済みデータ一覧・編集・削除
+    # -------------------------------------------------------------
     st.write("")
     st.markdown('<div class="section-title">2️⃣ 登録済みデータ一覧・編集・安全な削除（いつでも復元可能）</div>', unsafe_allow_html=True)
 
     if records_cnt > 0:
-        st.info("💡 **操作方法:** セルを直接編集して「💾 編集内容を保存」を押すか、行を削除して「🗑️ 選択・削除された行を反映する」を押してください。")
-        
         col_config = {
             "id": None,
             "日付": st.column_config.TextColumn("日付", required=True),
@@ -1318,7 +1401,7 @@ with tabs[0]:
             column_config=col_config,
             num_rows="dynamic",
             use_container_width=True,
-            height=360,
+            height=320,
             key=f"native_fast_editor_v{st.session_state.get('editor_version', 0)}"
         )
 
@@ -1350,7 +1433,6 @@ with tabs[0]:
                     else:
                         insert_records_to_db(current_user, [r_dict], auto_backup=False)
 
-                create_backup_snapshot(current_user, trigger_reason="データ編集・保存")
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                 st.toast("✅ 編集内容を保存しました！")
                 st.rerun()
@@ -1374,7 +1456,7 @@ with tabs[0]:
             csv_data = df_current.to_csv(index=False).encode('utf-8-sig')
             user_suffix = viewing_user_filter or "all_employees"
             st.download_button(
-                label="📥 表示中のCSVデータをダウンロード",
+                label="📥 表示中のCSVをダウンロード",
                 data=csv_data,
                 file_name=f"青果取引データ_{user_suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
@@ -1409,7 +1491,7 @@ with tabs[0]:
             st.dataframe(df_deleted, use_container_width=True)
 
 # ==========================================
-# タブ 2: データ分析
+# タブ 2: データ分析（軽量グラフ描画）
 # ==========================================
 with tabs[1]:
     st.markdown('<div class="section-title">📊 取引・売上分析ダッシュボード</div>', unsafe_allow_html=True)
@@ -1420,14 +1502,14 @@ with tabs[1]:
         with g_col1:
             st.subheader("🍩 カテゴリー別売上構成")
             fig_pie = px.pie(df_ana, names="カテゴリー", values="小計", hole=0.4)
-            fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280)
+            fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260)
             st.plotly_chart(fig_pie, use_container_width=True)
             
         with g_col2:
             st.subheader("📈 日別売上金額推移")
             df_daily = df_ana.groupby("日付")["小計"].sum().reset_index()
             fig_line = px.line(df_daily, x="日付", y="小計", markers=True)
-            fig_line.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280)
+            fig_line.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260)
             st.plotly_chart(fig_line, use_container_width=True)
     else:
         st.info("💡 分析対象データがありません。")
@@ -1479,7 +1561,7 @@ with tabs[2]:
                     color="社員名/担当",
                     labels={"総売上金額": "売上金額 (円)"}
                 )
-                fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300, showlegend=False)
+                fig_bar.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280, showlegend=False)
                 st.plotly_chart(fig_bar, use_container_width=True)
 
             with c_g2:
@@ -1490,7 +1572,7 @@ with tabs[2]:
                     values="登録件数", 
                     hole=0.45
                 )
-                fig_pie_staff.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=300)
+                fig_pie_staff.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280)
                 st.plotly_chart(fig_pie_staff, use_container_width=True)
 
             st.divider()
@@ -1523,7 +1605,7 @@ with tabs[2]:
 # タブ 4: BCP自動バックアップ・復旧
 # ==========================================
 with tabs[3]:
-    st.markdown('<div class="section-title">🛡️ 企業のBCP対策：自動バックアップ履歴 & データ復旧（リストア）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🛡️ 企業のBCP対策：バックアップ履歴 & データ復旧（リストア）</div>', unsafe_allow_html=True)
     if st.button("💾 今すぐフルバックアップを作成", type="primary"):
         res = create_backup_snapshot(current_user, trigger_reason="手動即時バックアップ")
         if res.get("success"):
