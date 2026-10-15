@@ -7,9 +7,6 @@ import plotly.express as px
 from sqlalchemy import create_engine, text
 import io
 
-# ==========================================
-# ページ基本設定 & CSS
-# ==========================================
 st.set_page_config(
     page_title="青果卸売 在庫・取引管理 Pro",
     page_icon="🍎",
@@ -40,23 +37,11 @@ st.markdown("""
     }
     .role-badge-admin { background-color: #dc3545; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .role-badge-staff { background-color: #28a745; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
-    .login-container {
-        max-width: 440px;
-        margin: 50px auto;
-        padding: 30px;
-        background: white;
-        border-radius: 16px;
-        box-shadow: 0 10px 25px rgba(0,0,0,0.08);
-        border: 1px solid #e2e8f0;
-    }
     div[data-testid="stStatusWidget"] { visibility: hidden; display: none; }
     div[data-st-mode="running"] { opacity: 1 !important; filter: none !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 認証・セキュリティ設定
-# ==========================================
 @st.cache_data
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -70,7 +55,6 @@ DEFAULT_USERS = {
 if "user_db" not in st.session_state:
     st.session_state.user_db = DEFAULT_USERS.copy()
 
-# ★重要★ 初回アクセス時は未ログイン状態（None）にしてログイン画面を強制表示
 if "logged_in_user" not in st.session_state:
     st.session_state.logged_in_user = None
     st.session_state.user_role = None
@@ -78,21 +62,20 @@ if "logged_in_user" not in st.session_state:
 if "processed_file_hashes" not in st.session_state:
     st.session_state.processed_file_hashes = set()
 
-# 照合結果保持用ステート
 if "verification_batch" not in st.session_state:
     st.session_state.verification_batch = None
 
+# ゴミ箱（削除データ復元用リスト）
+if "deleted_records_trash" not in st.session_state:
+    st.session_state.deleted_records_trash = []
+
 MASTER_CSV_FILE = "item_master.csv"
 
-# ==========================================
-# 1. DB接続設定 & 初期化
-# ==========================================
 @st.cache_resource
 def get_db_engine():
     db_url = os.environ.get("DATABASE_URL", "sqlite:///seika_inventory.db")
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
-        
     if db_url.startswith("sqlite"):
         engine = create_engine(db_url, connect_args={"check_same_thread": False, "timeout": 15.0})
     else:
@@ -121,9 +104,6 @@ def init_db():
 
 init_db()
 
-# ==========================================
-# 2. データCRUD関数
-# ==========================================
 def load_records_from_db(user_id=None):
     with engine.connect() as conn:
         if user_id is None:
@@ -132,25 +112,18 @@ def load_records_from_db(user_id=None):
         else:
             query = text("SELECT id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal FROM records WHERE user_id = :user_id ORDER BY id ASC")
             df = pd.read_sql_query(query, conn, params={"user_id": user_id})
-    
     if not df.empty:
         df["id"] = df["id"].astype(int)
         df = df.rename(columns={
-            "id": "id",
-            "date": "日付",
-            "market_no": "市場番号",
-            "category": "カテゴリー",
-            "item_code": "商品コード",
-            "item_name": "商品名",
-            "unit_price": "単価",
-            "quantity": "数量",
-            "subtotal": "小計"
+            "id": "id", "date": "日付", "market_no": "市場番号", "category": "カテゴリー",
+            "item_code": "商品コード", "item_name": "商品名", "unit_price": "単価",
+            "quantity": "数量", "subtotal": "小計"
         })
     return df
 
 def insert_records_to_db(user_id, records_list):
     if not records_list:
-        return []
+        return
     with engine.begin() as conn:
         insert_query = text('''
             INSERT INTO records (user_id, date, market_no, category, item_code, item_name, unit_price, quantity, subtotal)
@@ -158,25 +131,14 @@ def insert_records_to_db(user_id, records_list):
         ''')
         params = []
         for r in records_list:
-            try:
-                p = int(float(r.get("単価", 0))) if pd.notnull(r.get("単価")) else 0
-            except:
-                p = 0
-            try:
-                q = int(float(r.get("数量", 0))) if pd.notnull(r.get("数量")) else 0
-            except:
-                q = 0
-                
+            try: p = int(float(r.get("単価", 0)))
+            except: p = 0
+            try: q = int(float(r.get("数量", 0)))
+            except: q = 0
             params.append({
-                "user_id": user_id,
-                "date": str(r.get("日付", "")),
-                "market_no": str(r.get("市場番号", "")),
-                "category": str(r.get("カテゴリー", "")),
-                "item_code": str(r.get("商品コード", "")),
-                "item_name": str(r.get("商品名", "")),
-                "unit_price": p,
-                "quantity": q,
-                "subtotal": p * q
+                "user_id": user_id, "date": str(r.get("日付", "")), "market_no": str(r.get("市場番号", "")),
+                "category": str(r.get("カテゴリー", "")), "item_code": str(r.get("商品コード", "")),
+                "item_name": str(r.get("商品名", "")), "unit_price": p, "quantity": q, "subtotal": p * q
             })
         conn.execute(insert_query, params)
 
@@ -194,12 +156,9 @@ def cleanup_duplicate_records(user_id):
         cleanup_query = text('''
             DELETE FROM records 
             WHERE id NOT IN (
-                SELECT MIN(id) 
-                FROM records 
-                WHERE user_id = :user_id 
+                SELECT MIN(id) FROM records WHERE user_id = :user_id 
                 GROUP BY date, market_no, category, item_code, item_name, unit_price, quantity, subtotal
-            )
-            AND user_id = :user_id
+            ) AND user_id = :user_id
         ''')
         result = conn.execute(cleanup_query, {"user_id": user_id})
         return result.rowcount
@@ -221,20 +180,12 @@ def update_single_record_in_db(record_dict):
             WHERE id = :id
         ''')
         conn.execute(query, {
-            "id": int(record_dict["id"]),
-            "date": str(record_dict.get("日付", "")),
-            "market_no": str(record_dict.get("市場番号", "")),
-            "category": str(record_dict.get("カテゴリー", "")),
-            "item_code": str(record_dict.get("商品コード", "")),
-            "item_name": str(record_dict.get("商品名", "")),
-            "unit_price": p,
-            "quantity": q,
-            "subtotal": p * q
+            "id": int(record_dict["id"]), "date": str(record_dict.get("日付", "")),
+            "market_no": str(record_dict.get("市場番号", "")), "category": str(record_dict.get("カテゴリー", "")),
+            "item_code": str(record_dict.get("商品コード", "")), "item_name": str(record_dict.get("商品名", "")),
+            "unit_price": p, "quantity": q, "subtotal": p * q
         })
 
-# ==========================================
-# 3. マスタデータ管理
-# ==========================================
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
     if not os.path.exists(MASTER_CSV_FILE):
@@ -253,21 +204,17 @@ def load_item_master_cached():
             {"category": "果物", "item_code": "20101", "item_name": "りんご"}
         ])
         default_master.to_csv(MASTER_CSV_FILE, index=False, encoding="utf-8-sig")
-    
     df_master = pd.read_csv(MASTER_CSV_FILE, dtype=str)
     master_dict = {}
     for _, row in df_master.iterrows():
         cat, code, name = str(row["category"]), str(row["item_code"]), str(row["item_name"])
-        if cat not in master_dict:
-            master_dict[cat] = {}
+        if cat not in master_dict: master_dict[cat] = {}
         master_dict[cat][code] = name
     return master_dict, df_master
 
 ITEM_MASTER, df_master_raw = load_item_master_cached()
 
-# ==========================================
-# 4. ★【新機能】ログイン画面（未ログイン時は全画面で表示）★
-# ==========================================
+# ログイン認証ゲート
 if st.session_state.logged_in_user is None:
     st.markdown("""
         <div style="text-align: center; margin-top: 30px;">
@@ -276,55 +223,45 @@ if st.session_state.logged_in_user is None:
             <p style="color: #718096; font-size: 14px;">システムへログインしてください</p>
         </div>
     """, unsafe_allow_html=True)
-
     col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
     with col_l2:
-        with st.container():
-            username_input = st.text_input("👤 ユーザーID", placeholder="admin または 社員ID")
-            password_input = st.text_input("🔒 パスワード", type="password", placeholder="••••••••")
-            
-            if st.button("ログインする", use_container_width=True, type="primary"):
-                hashed_input = hash_password(password_input)
-                user_data = st.session_state.user_db.get(username_input)
-                if user_data and user_data["pw"] == hashed_input:
-                    st.session_state.logged_in_user = username_input
-                    st.session_state.user_role = user_data["role"]
-                    st.rerun()
-                else:
-                    st.error("IDまたはパスワードが無効です")
+        username_input = st.text_input("👤 ユーザーID", placeholder="admin または 社員ID")
+        password_input = st.text_input("🔒 パスワード", type="password", placeholder="••••••••")
+        if st.button("ログインする", use_container_width=True, type="primary"):
+            hashed_input = hash_password(password_input)
+            user_data = st.session_state.user_db.get(username_input)
+            if user_data and user_data["pw"] == hashed_input:
+                st.session_state.logged_in_user = username_input
+                st.session_state.user_role = user_data["role"]
+                st.rerun()
+            else:
+                st.error("IDまたはパスワードが無効です")
+        st.write("---")
+        st.caption("テスト用クイックログイン:")
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            if st.button("👑 管理者", use_container_width=True):
+                st.session_state.logged_in_user = "admin"
+                st.session_state.user_role = "admin"
+                st.rerun()
+        with q2:
+            if st.button("👤 user1", use_container_width=True):
+                st.session_state.logged_in_user = "user1"
+                st.session_state.user_role = "staff"
+                st.rerun()
+        with q3:
+            if st.button("👤 staff_a", use_container_width=True):
+                st.session_state.logged_in_user = "staff_a"
+                st.session_state.user_role = "staff"
+                st.rerun()
+    st.stop()
 
-            st.write("")
-            st.markdown("---")
-            st.caption("テスト用クイックログイン:")
-            q1, q2, q3 = st.columns(3)
-            with q1:
-                if st.button("👑 管理者", use_container_width=True):
-                    st.session_state.logged_in_user = "admin"
-                    st.session_state.user_role = "admin"
-                    st.rerun()
-            with q2:
-                if st.button("👤 user1", use_container_width=True):
-                    st.session_state.logged_in_user = "user1"
-                    st.session_state.user_role = "staff"
-                    st.rerun()
-            with q3:
-                if st.button("👤 staff_a", use_container_width=True):
-                    st.session_state.logged_in_user = "staff_a"
-                    st.session_state.user_role = "staff"
-                    st.rerun()
-    st.stop()  # ログインするまでこれ以降のメインコンテンツは一切実行・表示しない
-
-# ログイン中のユーザー情報を取得
 current_user = st.session_state.logged_in_user
 current_role = st.session_state.user_role
 
-# ==========================================
-# 5. サイドバー
-# ==========================================
 with st.sidebar:
     st.image("https://img.icons8.com/emoji/96/000000/red-apple.png", width=50)
     st.title("青果卸売 Pro")
-    
     role_badge = '<span class="role-badge-admin">👑 管理者</span>' if current_role == "admin" else '<span class="role-badge-staff">👤 一般社員</span>'
     st.markdown(f"**{current_user}** {role_badge}", unsafe_allow_html=True)
     if st.button("ログアウト", use_container_width=True):
@@ -333,18 +270,14 @@ with st.sidebar:
         st.session_state.records_df = None
         st.session_state.verification_batch = None
         st.rerun()
-
     st.divider()
-    if st.button("🧹 増えすぎた重複データを掃除する", use_container_width=True):
+    if st.button("🧹 重複データを掃除する", use_container_width=True):
         deleted_count = cleanup_duplicate_records(current_user)
         st.session_state.records_df = load_records_from_db(current_user)
         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-        st.success(f"重複していた {deleted_count} 件のデータを削除して1件にまとめました！")
+        st.success(f"{deleted_count} 件の重複を削除しました")
         st.rerun()
 
-# ==========================================
-# 6. ユーザーデータ読み込み
-# ==========================================
 if "records_df" not in st.session_state or st.session_state.get("current_loaded_user") != current_user:
     st.session_state.records_df = load_records_from_db(current_user)
     st.session_state.current_loaded_user = current_user
@@ -352,13 +285,10 @@ if "records_df" not in st.session_state or st.session_state.get("current_loaded_
 
 df_current = st.session_state.records_df
 
-# ==========================================
-# メインコンテンツエリア
-# ==========================================
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p>リアルタイム取引登録・ファイル自動記録・データ照合・分析プラットフォーム</p>
+        <p>リアルタイム取引登録・ファイル自動記録・照合修正・データ復元プラットフォーム</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -368,9 +298,6 @@ tab_input, tab_analytics, tab_csv_import = st.tabs([
     "📥 CSV一括インポート"
 ])
 
-# ==========================================
-# タブ 1: 取引データ入力・管理 & ファイル自動記録・整合性照合
-# ==========================================
 with tab_input:
     records_cnt = len(df_current) if df_current is not None else 0
     total_qty_sum = df_current["数量"].sum() if records_cnt > 0 else 0
@@ -381,41 +308,33 @@ with tab_input:
     k2.metric("📦 総取引数量", f"{total_qty_sum:,} 個")
     k3.metric("💰 総取引金額", f"¥ {total_amount_sum:,}")
 
-    # ★【新機能】元ファイルとの整合性・完全一致照合表示パネル★
+    # 元ファイルとの自動照合・不一致検出＆下部テーブルへの自動記録修正パネル
     if st.session_state.verification_batch is not None:
         v_batch = st.session_state.verification_batch
         v_file_name = v_batch["file_name"]
         expected_df = v_batch["df"]
         
-        # 現在のDBレコードと照合
         mismatches = []
         if df_current is not None and not df_current.empty:
             for idx, exp_row in expected_df.iterrows():
-                # 商品名と日付で該当行を探す
                 match_cand = df_current[
                     (df_current["商品名"] == exp_row["商品名"]) & 
                     (df_current["日付"] == exp_row["日付"])
                 ]
                 if match_cand.empty:
                     mismatches.append({
-                        "行": idx + 1,
-                        "商品名": exp_row["商品名"],
-                        "不一致項目": "登録データなし",
-                        "元ファイルの値(正)": f"{exp_row['商品名']} (単価: {exp_row['単価']}, 数量: {exp_row['数量']})",
-                        "現在の登録値(誤)": "未登録または削除済み"
+                        "行": idx + 1, "商品名": exp_row["商品名"], "不一致項目": "データ不在",
+                        "元ファイルの値(正)": f"{exp_row['商品名']}", "現在の登録値(誤)": "削除または未検出"
                     })
                 else:
                     db_row = match_cand.iloc[-1]
-                    for col in ["単価", "数量", "小計", "市場番号", "カテゴリー"]:
+                    for col in ["単価", "数量", "小計", "市場番号"]:
                         exp_val = str(exp_row.get(col, "")).strip()
                         db_val = str(db_row.get(col, "")).strip()
                         if exp_val and db_val and exp_val != db_val:
                             mismatches.append({
-                                "行": idx + 1,
-                                "商品名": exp_row["商品名"],
-                                "不一致項目": col,
-                                "元ファイルの値(正)": exp_val,
-                                "現在の登録値(誤)": db_val
+                                "行": idx + 1, "商品名": exp_row["商品名"], "不一致項目": col,
+                                "元ファイルの値(正)": exp_val, "現在の登録値(誤)": db_val
                             })
         
         st.write("")
@@ -423,28 +342,23 @@ with tab_input:
             st.success(f"🛡️ **元ファイル照合結果: 『{v_file_name}』の全 {len(expected_df)} 件が記録データと100%完全一致しています（整合性確認済み）**")
         else:
             st.error(f"🚨 **元ファイル照合エラー: 『{v_file_name}』との間に {len(mismatches)} 箇所の不一致が検出されました**")
-            st.caption("元のファイルデータと登録データの内容が異なります。以下の差異を確認し修正してください。")
-            
             diff_df = pd.DataFrame(mismatches)
             st.dataframe(diff_df, use_container_width=True)
             
-            # ワンクリック自動修正ボタン
-            if st.button("🛠️ 元ファイルの値に一括自動修正する", type="primary"):
+            # ★修正したデータが下の一覧へ自動的に記録される仕組み★
+            if st.button("🛠️ 元ファイルの値に修正して下の一覧へ自動記録する", type="primary"):
                 insert_records_to_db(current_user, expected_df.to_dict("records"))
                 cleanup_duplicate_records(current_user)
                 st.session_state.records_df = load_records_from_db(current_user)
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast("✅ 元ファイルの内容に完全修正・同期しました！")
+                st.toast("✅ 元ファイルの値に修正し、下部の一覧へ自動記録しました！")
                 st.rerun()
 
     st.write("")
     st.markdown('<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録・照合</div>', unsafe_allow_html=True)
-
     col_b1, col_b2 = st.columns(2)
-    with col_b1:
-        market_no = st.text_input("市場番号 / 取引先データ", value="M-001 (築地第一取引先)")
-    with col_b2:
-        input_date = st.date_input("取引日付", datetime.now())
+    with col_b1: market_no = st.text_input("市場番号 / 取引先データ", value="M-001 (築地第一取引先)")
+    with col_b2: input_date = st.date_input("取引日付", datetime.now())
 
     with st.container():
         st.markdown("""
@@ -453,15 +367,9 @@ with tab_input:
                 <small style="color: #4a5568;">ファイルをアップロードすると重複せず1度だけ自動記録され、元の内容と100%一致しているか直ちに自動照合されます。</small>
             </div>
         """, unsafe_allow_html=True)
-        
         col_up1, col_up2 = st.columns([4, 1])
         with col_up1:
-            uploaded_entry_file = st.file_uploader(
-                "取引データファイルを選択", 
-                type=["csv", "txt", "tsv"], 
-                key="auto_unique_verified_uploader", 
-                label_visibility="collapsed"
-            )
+            uploaded_entry_file = st.file_uploader("取引データファイルを選択", type=["csv", "txt", "tsv"], key="auto_verified_uploader", label_visibility="collapsed")
         with col_up2:
             if st.button("🧪 サンプルデータ記録", use_container_width=True):
                 sample_items = [
@@ -470,24 +378,19 @@ with tab_input:
                     {"日付": str(input_date), "市場番号": market_no, "カテゴリー": "果物", "商品コード": "20101", "商品名": "りんご", "単価": 360, "数量": 30, "小計": 10800}
                 ]
                 insert_records_to_db(current_user, sample_items)
-                st.session_state.verification_batch = {
-                    "file_name": "サンプルデータ",
-                    "df": pd.DataFrame(sample_items)
-                }
+                st.session_state.verification_batch = {"file_name": "サンプルデータ", "df": pd.DataFrame(sample_items)}
                 st.session_state.records_df = load_records_from_db(current_user)
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast(f"✅ テストデータ 3件 を記録・照合しました！")
+                st.toast("✅ テストデータ 3件 を記録・照合しました！")
                 st.rerun()
 
         if uploaded_entry_file is not None:
             file_bytes = uploaded_entry_file.getvalue()
             file_hash = hashlib.md5(file_bytes).hexdigest()
-            
             if file_hash not in st.session_state.processed_file_hashes:
                 try:
                     st.session_state.processed_file_hashes.add(file_hash)
                     df_file = pd.read_csv(io.BytesIO(file_bytes))
-                    
                     rename_map = {}
                     for col in df_file.columns:
                         c = str(col).strip()
@@ -499,7 +402,6 @@ with tab_input:
                         elif "単価" in c: rename_map[col] = "単価"
                         elif "数" in c: rename_map[col] = "数量"
                         elif "計" in c or "金額" in c: rename_map[col] = "小計"
-                    
                     df_file = df_file.rename(columns=rename_map)
                     if "日付" not in df_file.columns: df_file["日付"] = str(input_date)
                     if "市場番号" not in df_file.columns: df_file["市場番号"] = market_no
@@ -507,81 +409,44 @@ with tab_input:
                     if "商品コード" not in df_file.columns: df_file["商品コード"] = "AUTO"
                     if "単価" in df_file.columns and "数量" in df_file.columns:
                         df_file["小計"] = df_file["単価"].fillna(0) * df_file["数量"].fillna(0)
-
-                    new_records_list = df_file.to_dict("records")
-                    if new_records_list:
-                        insert_records_to_db(current_user, new_records_list)
-                        
-                        # 照合用バッチとして元データをセッションに保持
-                        st.session_state.verification_batch = {
-                            "file_name": uploaded_entry_file.name,
-                            "df": df_file
-                        }
-                        
+                    new_records = df_file.to_dict("records")
+                    if new_records:
+                        insert_records_to_db(current_user, new_records)
+                        st.session_state.verification_batch = {"file_name": uploaded_entry_file.name, "df": df_file}
                         st.session_state.records_df = load_records_from_db(current_user)
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録・照合完了しました！")
+                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records)} 件を自動記録・照合しました！")
                         st.rerun()
                 except Exception as e:
                     st.error(f"ファイル解析エラー: {e}")
 
     st.write("")
-    st.write("▼ 個別商品の手動入力（最大5行）")
-    all_categories = list(ITEM_MASTER.keys()) or ["野菜", "果物", "ハーブ・薬味類", "キノコ類", "イモ類・根菜"]
-    form_rows_widgets = []
+    st.markdown('<div class="section-title">2️⃣ 登録済みデータ一覧・編集・削除 & 復元機能</div>', unsafe_allow_html=True)
 
-    for i in range(1, 6):
-        c_chk, c_cat, c_item, c_price, c_qty = st.columns([0.8, 2.2, 3.2, 2.0, 2.0])
-        with c_chk:
-            st.write("")
-            is_active = st.checkbox(f"行 {i}", value=(i == 1), key=f"f_check_{i}")
-        with c_cat:
-            category = st.selectbox(f"カテゴリー #{i}", all_categories, key=f"dyn_cat_{i}", label_visibility="collapsed" if i > 1 else "visible")
-        
-        items_in_cat = ITEM_MASTER.get(category, {})
-        item_options = [f"{code} : {name}" for code, name in items_in_cat.items()]
-        
-        with c_item:
-            selected_item_str = st.selectbox(f"商品選択 #{i}", item_options, key=f"dyn_item_{i}_{category}", label_visibility="collapsed" if i > 1 else "visible") if item_options else ""
-        with c_price:
-            unit_price = st.number_input(f"単価 #{i}", min_value=0, value=100 if is_active else 0, step=10, key=f"f_price_{i}", label_visibility="collapsed" if i > 1 else "visible")
-        with c_qty:
-            quantity = st.number_input(f"数量 #{i}", min_value=0, value=1 if is_active else 0, step=1, key=f"f_qty_{i}", label_visibility="collapsed" if i > 1 else "visible")
-        
-        form_rows_widgets.append({"is_active": is_active, "category": category, "item_str": selected_item_str, "price": unit_price, "qty": quantity})
-
-    if st.button("➕ チェックした手動入力商品をリストに追加保存", type="primary", use_container_width=True, key="save_input_data_btn"):
-        if not market_no.strip():
-            st.error("❌ 市場番号 / 取引先データを入力してください。")
+    # ★【新機能】削除データの元通り復元（ゴミ箱）パネル★
+    trash_count = len(st.session_state.deleted_records_trash)
+    with st.expander(f"🗑️ 削除データ一覧・元通りに復元（ゴミ箱: {trash_count} 件）", expanded=False):
+        if trash_count == 0:
+            st.caption("現在ゴミ箱は空です（削除されたデータはありません）。")
         else:
-            valid_items = []
-            for r in form_rows_widgets:
-                if r["is_active"] and r["item_str"]:
-                    code, name = r["item_str"].split(" : ")
-                    if r["price"] > 0 and r["qty"] > 0:
-                        valid_items.append({
-                            "日付": input_date.strftime("%Y-%m-%d"),
-                            "市場番号": market_no,
-                            "カテゴリー": r["category"],
-                            "商品コード": code,
-                            "商品名": name,
-                            "単価": r["price"],
-                            "数量": r["qty"],
-                            "小計": r["price"] * r["qty"]
-                        })
-            if valid_items:
-                insert_records_to_db(current_user, valid_items)
-                st.session_state.records_df = load_records_from_db(current_user)
-                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast(f"✅ {len(valid_items)} 件を登録しました！")
-                st.rerun()
-
-    st.write("")
-    st.markdown('<div class="section-title">2️⃣ 登録済みデータ一覧・編集・一括削除</div>', unsafe_allow_html=True)
+            trash_df = pd.DataFrame(st.session_state.deleted_records_trash)
+            st.dataframe(trash_df, use_container_width=True)
+            col_res1, col_res2 = st.columns([2, 1])
+            with col_res1:
+                if st.button("↩️ 削除したデータをすべて元通りに復元する", type="primary"):
+                    insert_records_to_db(current_user, st.session_state.deleted_records_trash)
+                    st.session_state.deleted_records_trash = []
+                    st.session_state.records_df = load_records_from_db(current_user)
+                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                    st.toast("✅ 削除データをすべて元通りに復元しました！")
+                    st.rerun()
+            with col_res2:
+                if st.button("ゴミ箱を完全に空にする"):
+                    st.session_state.deleted_records_trash = []
+                    st.rerun()
 
     if records_cnt > 0:
-        st.info("💡 **操作方法:** セルを直接編集して「💾 編集内容を保存」を押すか、行を削除して「🗑️ 選択・削除された行を反映する」を押してください。")
-        
+        st.info("💡 **操作方法:** セルを直接編集して「💾 編集内容を保存」を押すか、行を削除して「🗑️ 選択・削除された行を反映する」を押してください（削除後も上のゴミ箱から元通り復元可能です）。")
         edited_df = st.data_editor(
             df_current,
             column_config={
@@ -602,32 +467,27 @@ with tab_input:
         )
 
         col_save, col_del, col_dl = st.columns([2, 2.5, 2])
-        
         with col_save:
             if st.button("💾 編集内容を保存", type="primary", use_container_width=True):
                 existing_ids = set(int(i) for i in df_current["id"].dropna().tolist())
                 current_ids = set(int(i) for i in edited_df["id"].dropna().tolist() if pd.notnull(i))
                 deleted_ids = existing_ids - current_ids
-                
                 if deleted_ids:
+                    # 削除されたデータをゴミ箱に退避
+                    deleted_rows = df_current[df_current["id"].isin(deleted_ids)].to_dict("records")
+                    st.session_state.deleted_records_trash.extend(deleted_rows)
                     delete_records_by_ids(list(deleted_ids))
-                
                 for _, row in edited_df.iterrows():
                     r_dict = row.to_dict()
-                    try:
-                        p = int(float(r_dict.get("単価", 0)))
-                        q = int(float(r_dict.get("数量", 0)))
-                    except:
-                        p, q = 0, 0
-                    r_dict["単価"] = p
-                    r_dict["数量"] = q
-                    r_dict["小計"] = p * q
-                    
+                    try: p = int(float(r_dict.get("単価", 0)))
+                    except: p = 0
+                    try: q = int(float(r_dict.get("数量", 0)))
+                    except: q = 0
+                    r_dict["単価"] = p; r_dict["数量"] = q; r_dict["小計"] = p * q
                     if pd.notnull(r_dict.get("id")):
                         update_single_record_in_db(r_dict)
                     else:
                         insert_records_to_db(current_user, [r_dict])
-
                 st.session_state.records_df = load_records_from_db(current_user)
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                 st.toast("✅ 編集内容を保存しました！")
@@ -638,12 +498,14 @@ with tab_input:
                 existing_ids = set(int(i) for i in df_current["id"].dropna().tolist())
                 current_ids = set(int(i) for i in edited_df["id"].dropna().tolist() if pd.notnull(i))
                 deleted_ids = existing_ids - current_ids
-                
                 if deleted_ids:
+                    # 削除された行をゴミ箱へ退避
+                    deleted_rows = df_current[df_current["id"].isin(deleted_ids)].to_dict("records")
+                    st.session_state.deleted_records_trash.extend(deleted_rows)
                     delete_records_by_ids(list(deleted_ids))
                     st.session_state.records_df = load_records_from_db(current_user)
                     st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.toast(f"🗑️ {len(deleted_ids)} 件のデータを削除しました！")
+                    st.toast(f"🗑️ {len(deleted_ids)} 件を削除しました（上のゴミ箱から元通り復元できます）")
                     st.rerun()
                 else:
                     st.warning("⚠️ テーブル上で行を削除してから押してください。")
@@ -651,42 +513,30 @@ with tab_input:
         with col_dl:
             csv_data = df_current.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 CSVデータダウンロード",
-                data=csv_data,
+                label="📥 CSVデータダウンロード", data=csv_data,
                 file_name=f"青果取引データ_{current_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True
+                mime="text/csv", use_container_width=True
             )
     else:
-        st.info("💡 登録されたデータはありません。上のフォームから商品を追加するか、ファイルをアップロードしてください。")
+        st.info("💡 登録されたデータはありません。")
 
-# ==========================================
-# タブ 2: データ分析
-# ==========================================
 with tab_analytics:
     st.markdown('<div class="section-title">📊 取引・売上分析ダッシュボード</div>', unsafe_allow_html=True)
     df_ana = df_current.copy() if df_current is not None and not df_current.empty else pd.DataFrame()
-
     if not df_ana.empty:
         g_col1, g_col2 = st.columns(2)
         with g_col1:
             st.subheader("🍩 カテゴリー別売上構成")
             fig_pie = px.pie(df_ana, names="カテゴリー", values="小計", hole=0.4)
-            fig_pie.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280)
             st.plotly_chart(fig_pie, use_container_width=True)
-            
         with g_col2:
             st.subheader("📈 日別売上金額推移")
             df_daily = df_ana.groupby("日付")["小計"].sum().reset_index()
             fig_line = px.line(df_daily, x="日付", y="小計", markers=True)
-            fig_line.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=280)
             st.plotly_chart(fig_line, use_container_width=True)
     else:
         st.info("💡 分析対象データがありません。")
 
-# ==========================================
-# タブ 3: CSV一括インポート
-# ==========================================
 with tab_csv_import:
     st.markdown('<div class="section-title">📥 CSV一括インポート</div>', unsafe_allow_html=True)
     uploaded_file = st.file_uploader("取引データCSVを選択", type=["csv"], key="bulk_csv_uploader")
