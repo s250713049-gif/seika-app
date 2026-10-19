@@ -2042,4 +2042,4 @@ with tabs[5]:
             else:
                 st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
         except Exception as e:
-            st.error(f"ファイル解析エラー: {e}")
+            st.error(f"ファイル
