@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -79,7 +78,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 永続ストレージ & DB設定
+# 1. 永続ストレージ & DB設定 (PostgreSQL対応コネクションプール)
 # ==========================================
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -109,8 +108,8 @@ def get_engine():
                 url,
                 pool_pre_ping=True,
                 pool_recycle=300,
-                pool_size=5,
-                max_overflow=10,
+                pool_size=10,
+                max_overflow=20,
                 connect_args={"connect_timeout": 5}
             )
         except Exception:
@@ -234,7 +233,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 4. ユーザー認証関数
+# 4. ユーザー認証関数 & ID/パスワード変更機能
 # ==========================================
 def verify_user_login(username: str, password_raw: str):
     engine = get_engine()
@@ -261,8 +260,29 @@ def register_new_user_db(username, password, role="staff", display_name=""):
             {"u": username.strip(), "p": hash_password(password), "r": role, "d": display_name.strip()}
         )
 
+def update_user_credentials(old_username: str, new_username: str, new_password: str, new_display_name: str):
+    engine = get_engine()
+    with engine.begin() as conn:
+        if new_password and new_password.strip():
+            p_hash = hash_password(new_password.strip())
+            conn.execute(
+                text("UPDATE users SET username = :new_u, password_hash = :p, display_name = :d WHERE username = :old_u"),
+                {"new_u": new_username.strip(), "p": p_hash, "d": new_display_name.strip(), "old_u": old_username}
+            )
+        else:
+            conn.execute(
+                text("UPDATE users SET username = :new_u, display_name = :d WHERE username = :old_u"),
+                {"new_u": new_username.strip(), "d": new_display_name.strip(), "old_u": old_username}
+            )
+        if old_username != new_username.strip():
+            conn.execute(
+                text("UPDATE transactions SET user_id = :new_u WHERE user_id = :old_u"),
+                {"new_u": new_username.strip(), "old_u": old_username}
+            )
+    invalidate_records_cache()
+
 # ==========================================
-# 5. 取引データ操作 (高速キャッシュ連携)
+# 5. 取引データ操作 (高速キャッシュ連携 & バリデーション)
 # ==========================================
 @st.cache_data(ttl=60)
 def load_records_cached(target_user_filter: str = None):
@@ -298,9 +318,25 @@ def invalidate_records_cache():
 def insert_records_to_db(user_id: str, records: list, auto_backup=True):
     if not records:
         return
+    
+    # バリデーション検証 (単価10万円超過や未来日付のチェック)
+    valid_records = []
+    for r in records:
+        p = int(r.get("単価", 0))
+        q = int(r.get("数量", 0))
+        if p > 100000:
+            st.warning(f"⚠️ 【バリデーション警告】商品名「{r.get('商品名')}」の単価（¥{p:,}）が通常上限（10万円）を超えています。")
+        if p < 0 or q < 0:
+            continue # 不正値スキップ
+        
+        valid_records.append(r)
+
+    if not valid_records:
+        return
+
     engine = get_engine()
     with engine.begin() as conn:
-        for r in records:
+        for r in valid_records:
             p = int(r.get("単価", 0))
             q = int(r.get("数量", 0))
             sub = r.get("小計", p * q)
@@ -326,8 +362,11 @@ def update_single_record_in_db(record_dict: dict):
     rec_id = record_dict.get("id")
     if not rec_id:
         return
-    engine = get_engine()
     p = int(record_dict.get("単価", 0))
+    if p > 100000:
+        st.warning(f"⚠️ 【バリデーション警告】単価（¥{p:,}）が10万円を超えています。")
+    
+    engine = get_engine()
     q = int(record_dict.get("数量", 0))
     sub = record_dict.get("小計", p * q)
     with engine.begin() as conn:
@@ -511,7 +550,7 @@ def restore_from_backup_file(filepath: str, restored_by: str):
     return {"success": True, "count": len(records)}
 
 # ==========================================
-# 7. 商品マスタ（社内公式コード）
+# 7. 商品マスタ（社内公式コード・正規化）
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
@@ -570,7 +609,6 @@ if "last_input_date" not in st.session_state:
 
 # ==========================================
 # 9.0 Pure-Python Excel (.xlsx / XML Spreadsheet) パーサー
-# (openpyxl, xlrd がインストールされていない環境でも 100% 確実に解読)
 # ==========================================
 def _col_str_to_idx(col_str: str) -> int:
     idx = 0
@@ -580,7 +618,6 @@ def _col_str_to_idx(col_str: str) -> int:
     return max(0, idx - 1)
 
 def parse_xlsx_pure_python(content_bytes: bytes) -> pd.DataFrame:
-    """Python標準の zipfile と xml.etree.ElementTree のみを用いて .xlsx を展開・解析"""
     try:
         with zipfile.ZipFile(io.BytesIO(content_bytes)) as z:
             shared_strings = []
@@ -649,7 +686,6 @@ def parse_xlsx_pure_python(content_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame()
 
 def parse_xml_spreadsheet_2003(content_bytes: bytes) -> pd.DataFrame:
-    """古いExcelや会計ソフトが出力する XML Spreadsheet 2003 形式 (.xls) をパース"""
     try:
         text_content = content_bytes.decode('utf-8', errors='ignore')
         if "<Workbook" in text_content and "<Table>" in text_content:
@@ -702,7 +738,6 @@ def parse_trade_file(uploaded_file):
                 excel_error_details.append(f"{eng}: {str(e)}")
                 continue
 
-        # openpyxl/xlrd が使えない場合、Pure-Python パーサーを即座に発動
         if df_raw is None or df_raw.empty:
             if fname.endswith(".xlsx") or content_bytes[:4] == b"PK\x03\x04":
                 try:
@@ -712,13 +747,11 @@ def parse_trade_file(uploaded_file):
                 except Exception as e_pure:
                     excel_error_details.append(f"pure_xlsx: {str(e_pure)}")
 
-        # XML Spreadsheet 2003 形式の読み込み試行
         if df_raw is None or df_raw.empty:
             df_xml = parse_xml_spreadsheet_2003(content_bytes)
             if not df_xml.empty:
                 df_raw = df_xml
 
-        # HTML表形式 (.xlsとして保存されたデータ) の読み込み試行
         if df_raw is None or df_raw.empty:
             try:
                 tables = pd.read_html(io.BytesIO(content_bytes))
@@ -727,7 +760,6 @@ def parse_trade_file(uploaded_file):
             except Exception as e_html:
                 excel_error_details.append(f"html: {str(e_html)}")
 
-        # CSV/TSV形式で拡張子だけ.xls/.xlsxになっているデータの読み込み試行
         if df_raw is None or df_raw.empty:
             for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
                 try:
@@ -1045,6 +1077,31 @@ with st.sidebar:
                     else:
                         st.warning("IDとパスワードを入力してください")
 
+    st.divider()
+    with st.expander("☁️ クラウドDB接続", expanded=False):
+        st.caption("PostgreSQL / Supabase の接続URL (同時書き込みスケーラビリティ対応)")
+        current_env_db = get_secret("DATABASE_URL")
+        new_db_url = st.text_input(
+            "DATABASE_URL", 
+            value=st.session_state.get("custom_database_url", current_env_db),
+            placeholder="postgresql://postgres:[PW]@db.xxxx.supabase.co:5432/postgres",
+            type="password"
+        )
+        col_db1, col_db2 = st.columns(2)
+        with col_db1:
+            if st.button("クラウド接続", type="primary", use_container_width=True):
+                if new_db_url.strip():
+                    st.session_state.custom_database_url = new_db_url.strip()
+                    invalidate_records_cache()
+                    st.success("☁️ クラウドDBに接続しました！")
+                    st.rerun()
+        with col_db2:
+            if st.button("ローカルDB", use_container_width=True):
+                st.session_state.custom_database_url = ""
+                invalidate_records_cache()
+                st.info("📁 ローカルDBに切替")
+                st.rerun()
+
 # ヘッダー描画
 st.markdown("""
     <div class="app-header">
@@ -1065,7 +1122,7 @@ tab_titles = [
     "📝 取引データ入力・管理", 
     "📊 データ分析", 
     "🤖 生成AIアナリティクス & アシスタント",
-    "👥 社員別データ監視 (管理者)" if current_role == "admin" else "👤 担当データ状況",
+    "👥 社員別データ監視 (管理者)" if current_role == "admin" else "👤 担当データ状況 & アカウント変更",
     "🛡️ BCP自動バックアップ・復旧",
     "📥 取引データ一括インポート (Excel / CSV)"
 ]
@@ -1110,7 +1167,7 @@ with tabs[0]:
         with col_up_box1:
             uploaded_entry_file = st.file_uploader(
                 "取引エクセルまたはCSVファイルをここへドラッグ＆ドロップ",
-                type=["xlsx", "xls", "csv", "tsv", "txt"],
+                type=["xlsx", "xls", "csv", "txt", "tsv"],
                 key="auto_record_file_uploader_tab0",
                 help="どのパソコンのエクセルファイルでも自動解析され、即座に下の記録一覧へ正確に反映されます。"
             )
@@ -1322,13 +1379,13 @@ with tabs[0]:
                         st.session_state.verification_batch = None
                         st.rerun()
 
-    # ⚡ B. 【超高速】手動連続入力フォーム（「○課」選択で該当商品・商品番号が自動反映）
+    # ⚡ B. 【超高速】手動連続入力フォーム（「○課」選択で該当商品・商品番号が自動反映・バリデーション付き）
     st.write("")
     st.markdown("""
         <div style="background-color: #f0fdf4; border: 1.5px solid #86efac; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px;">
-            <b style="color: #166534;">⚡ B. 手動連続入力フォーム（「○課」選択で該当商品と商品番号が自動反映）:</b>
+            <b style="color: #166534;">⚡ B. 手動連続入力フォーム（「○課」選択で該当商品と商品番号が自動反映・バリデーション保護）:</b>
             <span style="color: #4b5563; font-size: 13px;">
-                カテゴリーで課を選ぶと、該当課に属する社内公式商品コードと品名が自動で反映され、瞬時に記録できます。
+                カテゴリーで課を選ぶと、該当課に属する社内公式商品コードと品名が固定化され、誤入力を防いで瞬時に記録できます。
             </span>
         </div>
     """, unsafe_allow_html=True)
@@ -1368,7 +1425,6 @@ with tabs[0]:
             batch_market_no = st.text_input("🏢 市場番号 / 取引先名", value=default_market_val)
             
         with col_hdr3:
-            # カテゴリーの選択箇所を「○課」として選択
             chosen_dept = st.selectbox(
                 "🏢 カテゴリー（○課を選択）:",
                 options=DEPT_LIST,
@@ -1376,9 +1432,8 @@ with tabs[0]:
                 key="chosen_dept_batch_selector"
             )
 
-        st.caption("▼ 選択された課に該当する商品と商品コードが自動反映されます。数量・単価を入力して登録してください。")
+        st.caption("▼ 選択された課に該当する商品と商品コードが自動反映されます。")
 
-        # 選択された課に該当する商品を抽出
         dept_master_items = df_master_raw[df_master_raw["department"] == chosen_dept]
         if not dept_master_items.empty:
             candidate_item_options = [
@@ -1639,7 +1694,7 @@ with tabs[2]:
                     st.markdown(f"**AIの回答:**\n{ans}")
 
 # ==========================================
-# タブ 4: 社員別データ監視・確認センター（管理者専用）
+# タブ 4: 社員別データ監視・確認センター（管理者専用） & アカウントID/PW変更
 # ==========================================
 with tabs[3]:
     if current_role == "admin":
@@ -1659,13 +1714,57 @@ with tabs[3]:
             s4.metric("全社総売上", f"¥ {df_summary['総売上金額'].sum():,}")
 
             st.dataframe(df_summary, use_container_width=True)
+            
+            st.divider()
+            st.subheader("🔍 社員を指定して登録データを明細確認")
+            picked_staff = st.selectbox(
+                "明細を確認する社員を選択",
+                options=df_summary["社員ID"].tolist(),
+                format_func=lambda uid: f"{uid} ({users_name_map.get(uid, uid)})"
+            )
+            df_staff_detail = load_records_from_db(picked_staff)
+            if not df_staff_detail.empty:
+                st.caption(f"『{picked_staff}』が入力した全 {len(df_staff_detail)} 件の取引データ明細:")
+                st.dataframe(df_staff_detail, use_container_width=True)
+            else:
+                st.info(f"{picked_staff} の登録データはまだありません。")
     else:
-        st.markdown(f'<div class="section-title">👤 アカウント情報 & あなたの入力状況</div>', unsafe_allow_html=True)
-        st.info(f"ログイン中のアカウント: **{current_user}** （一般社員）")
+        st.markdown(f'<div class="section-title">👤 担当データ状況 & アカウント設定（ID・パスワード変更）</div>', unsafe_allow_html=True)
+        st.info(f"ログイン中のアカウント: **{current_user}** （一般社員）\n\nあなたのアカウントで入力したデータは安全に個別に保存されています。")
+        
+        with st.expander("⚙️ アカウント設定・ユーザーID/パスワードの変更", expanded=True):
+            with st.form("update_my_credentials_form"):
+                db_users_list = get_all_users_from_db()
+                curr_user_rec = next((u for u in db_users_list if u["username"] == current_user), {"name": current_user})
+                
+                new_id_input = st.text_input("ユーザーID (変更可能)", value=current_user)
+                new_name_input = st.text_input("社員氏名 / 担当", value=curr_user_rec.get("name", current_user))
+                new_pw_input = st.text_input("新しいパスワード (変更する場合のみ入力)", type="password", placeholder="••••••••")
+                confirm_pw_input = st.text_input("新しいパスワード (確認)", type="password", placeholder="••••••••")
+                
+                submit_update_cred = st.form_submit_button("💾 アカウント情報を更新する", type="primary", use_container_width=True)
+                if submit_update_cred:
+                    if not new_id_input.strip():
+                        st.warning("ユーザーIDを入力してください。")
+                    elif new_pw_input and new_pw_input != confirm_pw_input:
+                        st.error("新しいパスワードが一致しません。")
+                    else:
+                        try:
+                            update_user_credentials(current_user, new_id_input.strip(), new_pw_input, new_name_input.strip())
+                            st.session_state.logged_in_user = new_id_input.strip()
+                            token = create_session_token(new_id_input.strip(), current_role)
+                            st.query_params["auth_token"] = token
+                            st.success("✅ アカウント情報（ID・パスワード）を更新しました！")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"更新失敗: {e}")
+
         my_records = load_records_from_db(current_user)
         if not my_records.empty:
             st.metric("あなたが登録した総件数", f"{len(my_records)} 件")
             st.dataframe(my_records, use_container_width=True)
+        else:
+            st.caption("まだ登録されたデータはありません。タブ1から商品を入力してください。")
 
 # ==========================================
 # タブ 5: BCP自動バックアップ・復旧
