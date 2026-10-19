@@ -729,8 +729,7 @@ if "last_input_date" not in st.session_state:
     st.session_state.last_input_date = datetime.now().date()
 
 # ==========================================
-# 9.0 Pure-Python Excel (.xlsx / XML Spreadsheet) パーサー
-# (openpyxl, xlrd がインストールされていない環境でも 100% 確実に解読)
+# 9.0 Pure-Python Excel (.xlsx / XML Spreadsheet) パーサー補助
 # ==========================================
 def _col_str_to_idx(col_str: str) -> int:
     idx = 0
@@ -833,7 +832,7 @@ def parse_xml_spreadsheet_2003(content_bytes: bytes) -> pd.DataFrame:
     return pd.DataFrame()
 
 # ==========================================
-# 9.1 エクセル (xlsx/xls) & CSV 取引データ共通解析エンジン
+# 9.0 拡張 Excel (.xlsx / .xls / 帳票PDF・HTML変換形式) パーサー
 # ==========================================
 def parse_trade_file(uploaded_file):
     fname = uploaded_file.name.lower()
@@ -841,6 +840,7 @@ def parse_trade_file(uploaded_file):
     df_raw = None
     excel_error_details = []
 
+    # 1. Excel形式 (.xlsx, .xls) の多段階解析
     if fname.endswith((".xlsx", ".xls")):
         engines = ["openpyxl", "xlrd"] if fname.endswith(".xlsx") else ["xlrd", "openpyxl"]
         for eng in engines:
@@ -849,53 +849,51 @@ def parse_trade_file(uploaded_file):
                 sheets_with_data = []
                 for sname, sdf in excel_dict.items():
                     if not sdf.empty:
+                        # ヘッダー行を自動検出（「伝票日付」「仕入先」「品名」などのキーワードが含まれる行を探す）
+                        header_row_idx = 0
+                        for r_idx in range(min(15, len(sdf))):
+                            row_str = " ".join(str(val) for val in sdf.iloc[r_idx].values)
+                            if any(k in row_str for k in ["伝票", "日付", "品名", "仕入先", "単価", "数量"]):
+                                header_row_idx = r_idx
+                                break
+                        if header_row_idx > 0:
+                            sdf.columns = sdf.iloc[header_row_idx].values
+                            sdf = sdf.iloc[header_row_idx + 1:].reset_index(drop=True)
+
                         col_strs = [str(c) for c in sdf.columns]
-                        if not any(k in "".join(col_strs) for k in ["市場", "取引先", "顧客", "得意先"]):
+                        if not any(k in "".join(col_strs) for k in ["市場", "取引先", "顧客", "得意先", "仕入先"]):
                             sdf["市場番号"] = sname
                         sheets_with_data.append(sdf)
                 if sheets_with_data:
                     df_raw = pd.concat(sheets_with_data, ignore_index=True)
-                else:
-                    df_raw = pd.DataFrame()
                 break
             except Exception as e:
                 excel_error_details.append(f"{eng}: {str(e)}")
                 continue
 
-        # openpyxl/xlrd が使えない場合、Pure-Python パーサーを即座に発動
-        if df_raw is None or df_raw.empty:
-            if fname.endswith(".xlsx") or content_bytes[:4] == b"PK\x03\x04":
-                try:
-                    df_pure = parse_xlsx_pure_python(content_bytes)
-                    if not df_pure.empty:
-                        df_raw = df_pure
-                except Exception as e_pure:
-                    excel_error_details.append(f"pure_xlsx: {str(e_pure)}")
-
-        # XML Spreadsheet 2003 形式の読み込み試行
-        if df_raw is None or df_raw.empty:
-            df_xml = parse_xml_spreadsheet_2003(content_bytes)
-            if not df_xml.empty:
-                df_raw = df_xml
-
-        # HTML表形式 (.xlsとして保存されたデータ) の読み込み試行
+        # 2. xlrd/openpyxl が利用できない古い.xls (OLE2コンテナ / HTML形式) の救済解析
         if df_raw is None or df_raw.empty:
             try:
+                # pandas.read_html でテーブルとして解釈
                 tables = pd.read_html(io.BytesIO(content_bytes))
                 if tables and len(tables) > 0:
-                    df_raw = tables[0]
+                    for t in tables:
+                        if len(t) > 2 and len(t.columns) >= 4:
+                            df_raw = t
+                            break
             except Exception as e_html:
-                excel_error_details.append(f"html: {str(e_html)}")
+                excel_error_details.append(f"html_parse: {str(e_html)}")
 
-        # CSV/TSV形式で拡張子だけ.xls/.xlsxになっているデータの読み込み試行
+        # 3. Pure-Python .xlsx パーサー
+        if df_raw is None or df_raw.empty and fname.endswith(".xlsx"):
+            try:
+                df_raw = parse_xlsx_pure_python(content_bytes)
+            except Exception as e_pure:
+                excel_error_details.append(f"pure_xlsx: {str(e_pure)}")
+
+        # 4. XML Spreadsheet 2003 形式
         if df_raw is None or df_raw.empty:
-            for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
-                try:
-                    df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python")
-                    if not df_raw.empty and len(df_raw.columns) > 1:
-                        break
-                except Exception:
-                    continue
+            df_raw = parse_xml_spreadsheet_2003(content_bytes)
 
         if df_raw is None or df_raw.empty:
             err_summary = "; ".join(excel_error_details[:2]) if excel_error_details else "フォーマット不整合"
@@ -904,9 +902,10 @@ def parse_trade_file(uploaded_file):
                 "💡 対処法: 本ファイルをお手元のExcelで開き、『名前を付けて保存』から『Excelブック (.xlsx)』または『CSV (カンマ区切り) (*.csv)』として保存し直してアップロードいただくと、100%確実にインポートできます。"
             )
     else:
+        # CSV / TSV / テキスト形式の読み込み
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
             try:
-                df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc)
+                df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python")
                 if not df_raw.empty:
                     break
             except Exception:
@@ -920,10 +919,11 @@ def parse_trade_file(uploaded_file):
     if df_raw is None or df_raw.empty:
         return pd.DataFrame(), []
 
+    # 列名の正規化（「仕入先名」→「市場番号」、「品名・規格」→「商品名」などに対応）
     rename_map = {}
     for col in df_raw.columns:
         c = str(col).strip()
-        if any(k in c for k in ["市場", "取引先", "顧客", "得意先", "納品先", "相手先", "会社", "荷受"]):
+        if any(k in c for k in ["市場", "取引先", "顧客", "得意先", "納品先", "相手先", "会社", "荷受", "仕入先"]):
             rename_map[col] = "市場番号"
         elif any(k in c for k in ["日付", "取引日", "売上日", "納品日", "年月日", "伝票日"]):
             rename_map[col] = "日付"
@@ -942,20 +942,21 @@ def parse_trade_file(uploaded_file):
 
     df_norm = df_raw.rename(columns=rename_map)
 
+    # 必須列のデフォルト補完 & クリーニング
     if "日付" not in df_norm.columns:
         df_norm["日付"] = str(datetime.now().date())
     else:
         df_norm["日付"] = df_norm["日付"].astype(str).str.split("T").str[0].str.split(" ").str[0]
 
     if "市場番号" not in df_norm.columns:
-        df_norm["市場番号"] = "M-001 (エクセルインポート)"
+        df_norm["市場番号"] = "M-001 (第6営業課仕入)"
     else:
-        df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001 (エクセルインポート)").astype(str).str.strip()
+        df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001 (仕入台帳)").astype(str).str.strip()
 
     if "カテゴリー" not in df_norm.columns:
-        df_norm["カテゴリー"] = "1課4課（熊谷・大宮） / 2課 / 栗原"
+        df_norm["カテゴリー"] = "5課 / 6課（川越）"
     else:
-        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("1課4課（熊谷・大宮） / 2課 / 栗原").astype(str).str.strip()
+        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("5課 / 6課（川越）").astype(str).str.strip()
 
     if "商品コード" not in df_norm.columns:
         df_norm["商品コード"] = "AUTO"
@@ -983,6 +984,10 @@ def parse_trade_file(uploaded_file):
         df_norm["小計"] = df_norm.apply(lambda r: r["小計"] if r["小計"] > 0 else (r["単価"] * r["数量"]), axis=1)
     else:
         df_norm["小計"] = df_norm["単価"] * df_norm["数量"]
+
+    # 合計行や空行、ヘッダー文字列の混入を除外
+    df_norm = df_norm[df_norm["商品名"].str.contains("小計|合計|伝票日", na=False) == False].copy()
+    df_norm = df_norm[(df_norm["単価"] > 0) | (df_norm["数量"] > 0)].reset_index(drop=True)
 
     target_cols = ["日付", "市場番号", "カテゴリー", "商品コード", "商品名", "単価", "数量", "小計"]
     df_result = df_norm[target_cols].copy()
