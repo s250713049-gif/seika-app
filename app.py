@@ -90,6 +90,7 @@ def get_secret(key: str, default: str = "") -> str:
     return default
 
 APP_SECRET_KEY = get_secret("SECRET_KEY", "seika-enterprise-secure-salt-2026-v2")
+MASTER_CSV_FILE = "item_master.csv"
 BACKUP_DIR = "db_backups"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
@@ -335,7 +336,7 @@ def create_backup_snapshot(user_id=None, trigger_reason="手動バックアッ�
         backup_path = os.path.join(BACKUP_DIR, backup_filename)
 
         backup_payload = {
-            "version": "3.2_excel_fast",
+            "version": "3.3_section_fast",
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "trigger": trigger_reason,
             "created_by": user_id or "system",
@@ -720,34 +721,58 @@ def update_single_record_in_db(record_dict):
     invalidate_records_cache()
 
 # ==========================================
-# 8. マスタデータ管理（社内公式商品コード表）
+# 8. マスタデータ管理（社内公式商品コード表 & ○課定義 完全連動）
 # ==========================================
-MASTER_CSV_FILE = "item_master.csv"
+SECTION_DEFINITIONS_PY = [
+    {"label": "1課 (熊谷・大宮)", "depts": ["1課4課（熊谷・大宮） / 2課 / 栗原", "1課4課/2課/栗原"]},
+    {"label": "2課 (栗原)", "depts": ["1課4課（熊谷・大宮） / 2課 / 栗原", "1課4課/2課/栗原"]},
+    {"label": "3課 (照井)", "depts": ["3課（照井） / 11課（相澤 史）", "3課/11課"]},
+    {"label": "4課 (熊谷・大宮)", "depts": ["1課4課（熊谷・大宮） / 2課 / 栗原", "1課4課/2課/栗原"]},
+    {"label": "5課 (小林・牧野)", "depts": ["5課12課（小林・牧野）", "5課12課"]},
+    {"label": "11課 (相澤 史)", "depts": ["3課（照井） / 11課（相澤 史）", "3課/11課"]},
+    {"label": "12課 (小林・牧野)", "depts": ["5課12課（小林・牧野）", "5課12課"]},
+    {"label": "1課4課（熊谷・大宮） / 2課 / 栗原", "depts": ["1課4課（熊谷・大宮） / 2課 / 栗原", "1課4課/2課/栗原"]},
+    {"label": "3課（照井） / 11課（相澤 史）", "depts": ["3課（照井） / 11課（相澤 史）", "3課/11課"]},
+    {"label": "5課12課（小林・牧野）", "depts": ["5課12課（小林・牧野）", "5課12課"]},
+    {"label": "全課・全部門 (すべての商品を表示)", "depts": ["ALL"]},
+]
 
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
     if os.path.exists(MASTER_CSV_FILE):
         try:
-            df_master = pd.read_csv(MASTER_CSV_FILE, encoding="utf-8-sig")
+            df_master = pd.read_csv(MASTER_CSV_FILE, encoding="utf-8-sig", dtype=str)
         except:
-            df_master = pd.read_csv(MASTER_CSV_FILE)
+            df_master = pd.read_csv(MASTER_CSV_FILE, dtype=str)
     else:
-        df_master = pd.DataFrame(columns=["category", "item_code", "item_name", "department"])
+        df_master = pd.DataFrame([
+            {"category": "1課4課/2課/栗原", "item_code": "11", "item_name": "かぶ", "department": "1課4課（熊谷・大宮） / 2課 / 栗原"},
+            {"category": "1課4課/2課/栗原", "item_code": "130", "item_name": "胡瓜", "department": "1課4課（熊谷・大宮） / 2課 / 栗原"},
+            {"category": "3課/11課", "item_code": "1", "item_name": "大根", "department": "3課（照井） / 11課（相澤 史）"},
+            {"category": "5課12課", "item_code": "501", "item_name": "りんご", "department": "5課12課（小林・牧野）"}
+        ])
 
-    dept_items_map = {}
+    departments = [
+        "1課4課（熊谷・大宮） / 2課 / 栗原",
+        "3課（照井） / 11課（相澤 史）",
+        "5課12課（小林・牧野）"
+    ]
+    
+    dept_items_map = {d: [] for d in departments}
     item_flat_list = []
-    departments = df_master["department"].dropna().unique().tolist() if not df_master.empty else []
     lookup_by_pair = {}
 
     for _, row in df_master.iterrows():
-        code = str(row["item_code"]).strip()
-        name = str(row["item_name"]).strip()
-        dept = str(row["department"]).strip() if pd.notnull(row["department"]) else "一般"
-        display_str = f"{code} : {name}"
+        dept = str(row.get("department", "一般野菜")).strip()
+        code = str(row.get("item_code", "")).strip()
+        name = str(row.get("item_name", "")).strip()
+        
+        display_str = f"[{code}] {name}"
         if dept not in dept_items_map:
             dept_items_map[dept] = []
         dept_items_map[dept].append({"code": code, "name": name, "display": display_str, "dept": dept})
         item_flat_list.append(f"{display_str} ({dept})")
+        lookup_by_pair[f"{code} : {name}"] = dept
         lookup_by_pair[display_str] = dept
 
     return dept_items_map, df_master, item_flat_list, departments, lookup_by_pair
@@ -792,17 +817,10 @@ if "last_input_date" not in st.session_state:
 # 9.1 エクセル (xlsx/xls) & CSV 取引データ共通解析エンジン
 # ==========================================
 def parse_trade_file(uploaded_file):
-    """
-    どのパソコンからアップロードされたファイルでも（.xlsx, .xls, .csv, .tsv, .txt）
-    青果管理システムの統一フォーマット:
-    [日付, 市場番号, カテゴリー, 商品コード, 商品名, 単価, 数量, 小計]
-    の DataFrame と、抽出された取引先リストを返す。
-    """
     fname = uploaded_file.name.lower()
     df_raw = None
 
     if fname.endswith((".xlsx", ".xls")):
-        # Excelファイルの読み込み (全シートまたは先頭シート)
         excel_dict = pd.read_excel(uploaded_file, sheet_name=None)
         sheets_with_data = []
         for sname, sdf in excel_dict.items():
@@ -816,7 +834,6 @@ def parse_trade_file(uploaded_file):
         else:
             df_raw = pd.DataFrame()
     else:
-        # CSVファイルの読み込み (エンコーディング自動判定)
         content_bytes = uploaded_file.getvalue()
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
             try:
@@ -830,7 +847,6 @@ def parse_trade_file(uploaded_file):
     if df_raw.empty:
         return pd.DataFrame(), []
 
-    # 列名の正規化マッピング（日本語の各種表記ゆれを吸収）
     rename_map = {}
     for col in df_raw.columns:
         c = str(col).strip()
@@ -853,7 +869,6 @@ def parse_trade_file(uploaded_file):
 
     df_norm = df_raw.rename(columns=rename_map)
 
-    # 必須列の初期値補完
     if "日付" not in df_norm.columns:
         df_norm["日付"] = str(datetime.now().date())
     else:
@@ -879,7 +894,6 @@ def parse_trade_file(uploaded_file):
     else:
         df_norm["商品名"] = df_norm["商品名"].fillna("品名未指定").astype(str).str.strip()
 
-    # 単価・数量・小計の数値クレンジング
     def clean_num(val, default=0):
         try:
             if pd.isnull(val): return default
@@ -899,8 +913,6 @@ def parse_trade_file(uploaded_file):
 
     target_cols = ["日付", "市場番号", "カテゴリー", "商品コード", "商品名", "単価", "数量", "小計"]
     df_result = df_norm[target_cols].copy()
-
-    # 取引先の抽出
     extracted = [str(s).strip() for s in df_norm["市場番号"].dropna().unique().tolist() if str(s).strip() and str(s).strip() != "nan"]
 
     return df_result, extracted
@@ -1141,7 +1153,7 @@ tab_titles = [
 tabs = st.tabs(tab_titles)
 
 # ==========================================
-# タブ 1: 取引データ入力・管理（超高速・連続入力フォーム対応）
+# タブ 1: 取引データ入力・管理（○課セレクター・自動連動対応）
 # ==========================================
 with tabs[0]:
     records_cnt = len(df_current) if df_current is not None else 0
@@ -1304,7 +1316,7 @@ with tabs[0]:
         st.markdown("""
             <div style="font-size: 0.85rem; color: #4b5563; margin-bottom: 8px;">
                 💡 <b>どのパソコンのブラウザからでもエクセルファイル（.xlsx / .xls）やCSVファイルを選択できます。</b><br>
-                読み込んだエクセルデータは下の記録一覧へ同じ形式で自動記録され、ファイル内の取引先名が手動入力の選択肢に自動追加されます。
+                読み込んだエクセルデータは下の記録一覧へ同じ形式で自動記録され、ファイル内の取引先名が手動入力の候補リストに自動追加されます。
             </div>
         """, unsafe_allow_html=True)
         col_up1, col_up2 = st.columns([4, 1.2])
@@ -1318,9 +1330,9 @@ with tabs[0]:
         with col_up2:
             if st.button("🧪 テストデータ3件", use_container_width=True):
                 sample_items = [
-                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "1課（熊谷）", "商品コード": "150", "商品名": "トマト", "単価": 290, "数量": 50, "小計": 14500},
-                    {"日付": str(datetime.now().date()), "市場番号": "M-002 (大田市場取引先)", "カテゴリー": "3課（照井）", "商品コード": "42", "商品名": "キャベツ", "単価": 200, "数量": 40, "小計": 8000},
-                    {"日付": str(datetime.now().date()), "市場番号": "M-003 (横浜南部青果)", "カテゴリー": "5課", "商品コード": "519", "商品名": "富士りんご", "単価": 360, "数量": 30, "小計": 10800}
+                    {"日付": str(datetime.now().date()), "市場番号": "M-001 (築地第一取引先)", "カテゴリー": "1課 (熊谷・大宮)", "商品コード": "150", "商品名": "トマト", "単価": 290, "数量": 50, "小計": 14500},
+                    {"日付": str(datetime.now().date()), "市場番号": "M-002 (大田市場取引先)", "カテゴリー": "3課 (照井)", "商品コード": "42", "商品名": "キャベツ", "単価": 200, "数量": 40, "小計": 8000},
+                    {"日付": str(datetime.now().date()), "市場番号": "M-003 (横浜南部青果)", "カテゴリー": "5課 (小林・牧野)", "商品コード": "519", "商品名": "富士りんご", "単価": 360, "数量": 30, "小計": 10800}
                 ]
                 insert_records_to_db(current_user, sample_items)
                 st.session_state.verification_batch = {
@@ -1391,13 +1403,13 @@ with tabs[0]:
         st.dataframe(display_quick_df, use_container_width=True, height=220)
 
     # -------------------------------------------------------------
-    # ⚡ B. 【超高速】手動連続入力フォーム（エクセル取引先セレクター対応）
+    # ⚡ B. 【超高速】手動連続入力フォーム（○課カテゴリー連動・自動反映）
     # -------------------------------------------------------------
     st.markdown("""
         <div style="background-color: #f0fdf4; border: 1.5px solid #86efac; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px;">
-            <b style="color: #166534;">⚡ 高速連続入力フォーム (読み込み取引先連携・課別商品コード対応):</b>
+            <b style="color: #166534;">⚡ 高速手動連続入力フォーム (○課カテゴリー選択 & 商品・商品番号自動反映):</b>
             <span style="color: #4b5563; font-size: 13px;">
-                エクセルから抽出された取引先を選択または直接入力し、連続でサクサク入力・保存できます。
+                担当課（○課）を選択すると該当する商品と商品番号が自動反映されます。エクセルからの取引先も選択・保持されます。
             </span>
         </div>
     """, unsafe_allow_html=True)
@@ -1430,22 +1442,33 @@ with tabs[0]:
         st.write("")
         st.caption(f"※ エクセル等から抽出された取引先: **{len(combined_suppliers)} 件** 利用可能")
 
+    # 【重要改修】カテゴリーの選択箇所を「○課」とし、該当する商品と商品番号を自動反映
     c_d1, c_d2 = st.columns([2.5, 1.5])
     with c_d1:
         chosen_dept = st.selectbox(
-            "🏢 担当課・部門で選択肢を絞り込み:",
-            options=["全課・全部門 (すべての商品を表示)"] + DEPT_LIST,
+            "🏢 担当課 (○課) を選択 (課を選ぶと該当する商品と商品番号が自動反映されます):",
+            options=[sec["label"] for sec in SECTION_DEFINITIONS_PY],
             key="active_form_dept_choice"
         )
     with c_d2:
         st.write("")
-        st.caption("※ 部署を選ぶと下の選択肢がその課の商品に絞られます")
+        st.caption("※ ○課を選ぶと、該当する商品と商品番号が下の選択肢に自動反映されます")
 
-    if chosen_dept == "全課・全部門 (すべての商品を表示)":
+    selected_sec_def = next((s for s in SECTION_DEFINITIONS_PY if s["label"] == chosen_dept), None)
+    if not selected_sec_def or "ALL" in selected_sec_def["depts"]:
         candidate_item_options = ITEM_FLAT_LIST
     else:
-        dept_items = ITEM_DEPT_MAP.get(chosen_dept, [])
-        candidate_item_options = [f"{item['code']} : {item['name']}" for item in dept_items]
+        matched_items = []
+        for d in selected_sec_def["depts"]:
+            matched_items.extend(ITEM_DEPT_MAP.get(d, []))
+        seen = set()
+        dedup_items = []
+        for item in matched_items:
+            key = (item["code"], item["name"])
+            if key not in seen:
+                seen.add(key)
+                dedup_items.append(item)
+        candidate_item_options = [f"[{item['code']}] {item['name']}" for item in dedup_items]
 
     with st.form("speed_continuous_input_form", clear_on_submit=False):
         col_top1, col_top2 = st.columns([2, 1])
@@ -1462,7 +1485,7 @@ with tabs[0]:
                 key="speed_form_date"
             )
 
-        st.caption("▼ 商品行（入力したい商品にチェックを入れて『追加保存』を押してください）")
+        st.caption("▼ 商品行（選択された課の商品と商品番号が自動反映されます。入力したい行にチェックを入れて『追加保存』を押してください）")
         
         form_rows_data = []
 
@@ -1474,7 +1497,7 @@ with tabs[0]:
             with c_item:
                 default_idx = min(i - 1, len(candidate_item_options) - 1) if candidate_item_options else 0
                 item_val = st.selectbox(
-                    f"商品選択 [コード : 品名] #{i}", 
+                    f"該当商品 [商品番号 : 品名] #{i}", 
                     candidate_item_options, 
                     index=default_idx, 
                     key=f"f_item_{i}_{chosen_dept}", 
@@ -1527,16 +1550,23 @@ with tabs[0]:
                 for r in form_rows_data:
                     if r["active"] and r["item_str"] and r["price"] > 0 and r["qty"] > 0:
                         raw_str = r["item_str"]
-                        parts = raw_str.split(" : ")
-                        code = parts[0].strip()
-                        name_and_dept = parts[1].strip() if len(parts) > 1 else parts[0].strip()
+                        if raw_str.startswith("[") and "]" in raw_str:
+                            code = raw_str.split("]")[0].lstrip("[").strip()
+                            name_and_dept = raw_str.split("]")[1].strip()
+                        elif " : " in raw_str:
+                            parts = raw_str.split(" : ")
+                            code = parts[0].strip()
+                            name_and_dept = parts[1].strip() if len(parts) > 1 else parts[0].strip()
+                        else:
+                            code = ""
+                            name_and_dept = raw_str.strip()
                         
                         if " (" in name_and_dept:
                             name = name_and_dept.split(" (")[0].strip()
                             dept_part = name_and_dept.split(" (")[1].rstrip(")")
                         else:
                             name = name_and_dept
-                            dept_part = chosen_dept if chosen_dept != "全課・全部門 (すべての商品を表示)" else ITEM_LOOKUP_MAP.get(f"{code} : {name}", "1課4課/2課/栗原")
+                            dept_part = chosen_dept if "全課" not in chosen_dept else ITEM_LOOKUP_MAP.get(f"{code} : {name}", "1課4課/2課/栗原")
 
                         valid_new_items.append({
                             "日付": str(form_input_date),
@@ -1568,7 +1598,7 @@ with tabs[0]:
             "id": None,
             "日付": st.column_config.TextColumn("日付", required=True),
             "市場番号": st.column_config.TextColumn("市場番号", required=True),
-            "カテゴリー": st.column_config.TextColumn("カテゴリー"),
+            "カテゴリー": st.column_config.TextColumn("カテゴリー (○課)"),
             "商品コード": st.column_config.TextColumn("商品コード"),
             "商品名": st.column_config.TextColumn("商品名"),
             "単価": st.column_config.NumberColumn("単価 (円)", min_value=0, format="¥%d"),
