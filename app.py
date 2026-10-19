@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -517,6 +516,55 @@ def restore_from_backup_file(filepath: str, restored_by: str):
 # ==========================================
 CATEGORY_TXT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_master.txt")
 
+# ---- category_master.txt の内容をアプリ内に格納（外部ファイルが無い場合の標準データ）----
+CATEGORY_MASTER_DEFAULT_TEXT = r'''# ==============================================================================
+# category_master.txt  ―  青果卸売 カテゴリー（課）・商品・商品番号マスタ
+# ==============================================================================
+# 置き場所 : app.py と同じフォルダ（文字コードは UTF-8）
+# 書式     : 課 | カテゴリーコード | カテゴリー名 | 商品コード(商品番号) | 商品名
+# 区切り   : 「|」（タブ・カンマも可）  ／  「#」で始まる行はコメント
+#
+# 使い方:
+#   ・商品を増やすときは、このファイルの末尾に1行足して保存するだけです。
+#     アプリは更新を自動検知して再読込します（画面右上メニューの Rerun でも可）。
+#   ・「課」の欄は、アプリの課リストと完全に同じ文字でなくても構いません。
+#     「1課」「7課」「加工食品」など、課番号／課名が一致すれば自動で紐づきます。
+#   ・item_master.csv がある場合は、そちらの内容も合わせて読み込みます（重複は自動除去）。
+#
+# アプリの課リスト（課の選択肢）:
+#   1課4課（熊谷・大宮） / 2課 / 栗原
+#   3課（照井） / 11課（相澤 史）
+#   5課 / 6課（川越）
+#   7課（促成野菜・ハーブ）
+#   8課（果実・柑橘・高級フルーツ）
+#   加工食品 / 仙都食苑
+# ==============================================================================
+
+# ---- 1課4課（熊谷・大宮） / 2課 / 栗原 ----
+1課4課（熊谷・大宮） / 2課 / 栗原|01|果菜類|319|トマト
+1課4課（熊谷・大宮） / 2課 / 栗原|01|果菜類|320|ミニトマト
+1課4課（熊谷・大宮） / 2課 / 栗原|03|根菜類|101|大根
+1課4課（熊谷・大宮） / 2課 / 栗原|03|根菜類|11|かぶ
+
+# ---- 3課（照井） / 11課（相澤 史） ----
+3課（照井） / 11課（相澤 史）|02|葉茎菜類|201|キャベツ
+3課（照井） / 11課（相澤 史）|02|葉茎菜類|205|レタス
+
+# ---- 5課 / 6課（川越） ----
+# 5課 / 6課（川越）|カテゴリーコード|カテゴリー名|商品コード|商品名
+
+# ---- 7課（促成野菜・ハーブ） ----
+# 7課（促成野菜・ハーブ）|カテゴリーコード|カテゴリー名|商品コード|商品名
+
+# ---- 8課（果実・柑橘・高級フルーツ） ----
+# 8課（果実・柑橘・高級フルーツ）|カテゴリーコード|カテゴリー名|商品コード|商品名
+
+# ---- 加工食品 / 仙都食苑 ----
+# 加工食品 / 仙都食苑|カテゴリーコード|カテゴリー名|商品コード|商品名
+
+# （上の「#」付きの行は書式見本です。実際の商品コードに書き換えて、先頭の「# 」を外してください）
+'''
+
 MASTER_COLS = ["category_code", "category_name", "department", "item_code", "item_name"]
 
 BASE_DEPT_LIST = [
@@ -568,16 +616,23 @@ def _file_mtime(path: str) -> float:
 
 def _read_category_txt(path: str) -> pd.DataFrame:
     """category_master.txt（課|カテゴリーコード|カテゴリー名|商品コード|商品名）を読み込む"""
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=MASTER_COLS)
     raw = None
-    for enc in ("utf-8-sig", "utf-8", "cp932"):
+    if not os.path.exists(path):
+        # 外部ファイルが無い場合: アプリ内に格納した標準データを使用し、編集用に category_master.txt を自動生成
+        raw = CATEGORY_MASTER_DEFAULT_TEXT
         try:
-            with open(path, "r", encoding=enc) as f:
-                raw = f.read()
-            break
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(CATEGORY_MASTER_DEFAULT_TEXT)
         except Exception:
-            continue
+            pass
+    else:
+        for enc in ("utf-8-sig", "utf-8", "cp932"):
+            try:
+                with open(path, "r", encoding=enc) as f:
+                    raw = f.read()
+                break
+            except Exception:
+                continue
     if raw is None:
         return pd.DataFrame(columns=MASTER_COLS)
 
