@@ -78,7 +78,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 永続ストレージ & DB設定 (PostgreSQL対応コネクションプール)
+# 1. 永続ストレージ & DB設定 (PostgreSQL対応)
 # ==========================================
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -233,7 +233,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 4. ユーザー認証関数 & ID/パスワード変更機能
+# 4. ユーザー認証 & ID/パスワード変更関数
 # ==========================================
 def verify_user_login(username: str, password_raw: str):
     engine = get_engine()
@@ -319,16 +319,15 @@ def insert_records_to_db(user_id: str, records: list, auto_backup=True):
     if not records:
         return
     
-    # バリデーション検証 (単価10万円超過や未来日付のチェック)
+    # 【堅牢性バリデーション】単価が10万円を超える極端な入力値に対する警告
     valid_records = []
     for r in records:
         p = int(r.get("単価", 0))
         q = int(r.get("数量", 0))
         if p > 100000:
-            st.warning(f"⚠️ 【バリデーション警告】商品名「{r.get('商品名')}」の単価（¥{p:,}）が通常上限（10万円）を超えています。")
+            st.warning(f"⚠️ 【バリデーション警告】商品名「{r.get('商品名')}」の単価（¥{p:,}）が想定上限（10万円）を超えています。入力内容をご確認ください。")
         if p < 0 or q < 0:
-            continue # 不正値スキップ
-        
+            continue
         valid_records.append(r)
 
     if not valid_records:
@@ -365,7 +364,7 @@ def update_single_record_in_db(record_dict: dict):
     p = int(record_dict.get("単価", 0))
     if p > 100000:
         st.warning(f"⚠️ 【バリデーション警告】単価（¥{p:,}）が10万円を超えています。")
-    
+        
     engine = get_engine()
     q = int(record_dict.get("数量", 0))
     sub = record_dict.get("小計", p * q)
@@ -550,7 +549,7 @@ def restore_from_backup_file(filepath: str, restored_by: str):
     return {"success": True, "count": len(records)}
 
 # ==========================================
-# 7. 商品マスタ（社内公式コード・正規化）
+# 7. 商品マスタ（社内公式コード）
 # ==========================================
 @st.cache_data(ttl=3600)
 def load_item_master_cached():
@@ -1079,7 +1078,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("☁️ クラウドDB接続", expanded=False):
-        st.caption("PostgreSQL / Supabase の接続URL (同時書き込みスケーラビリティ対応)")
+        st.caption("PostgreSQL / Supabase の接続URL (排他制御・同時書き込み対応)")
         current_env_db = get_secret("DATABASE_URL")
         new_db_url = st.text_input(
             "DATABASE_URL", 
@@ -1093,13 +1092,13 @@ with st.sidebar:
                 if new_db_url.strip():
                     st.session_state.custom_database_url = new_db_url.strip()
                     invalidate_records_cache()
-                    st.success("☁️ クラウドDBに接続しました！")
+                    st.success("☁️ 接続完了！")
                     st.rerun()
         with col_db2:
             if st.button("ローカルDB", use_container_width=True):
                 st.session_state.custom_database_url = ""
                 invalidate_records_cache()
-                st.info("📁 ローカルDBに切替")
+                st.info("📁 ローカルDB切替")
                 st.rerun()
 
 # ヘッダー描画
@@ -1379,13 +1378,13 @@ with tabs[0]:
                         st.session_state.verification_batch = None
                         st.rerun()
 
-    # ⚡ B. 【超高速】手動連続入力フォーム（「○課」選択で該当商品・商品番号が自動反映・バリデーション付き）
+    # ⚡ B. 【超高速】手動連続入力フォーム（「○課」選択で該当商品・商品番号が自動反映）
     st.write("")
     st.markdown("""
         <div style="background-color: #f0fdf4; border: 1.5px solid #86efac; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px;">
             <b style="color: #166534;">⚡ B. 手動連続入力フォーム（「○課」選択で該当商品と商品番号が自動反映・バリデーション保護）:</b>
             <span style="color: #4b5563; font-size: 13px;">
-                カテゴリーで課を選ぶと、該当課に属する社内公式商品コードと品名が固定化され、誤入力を防いで瞬時に記録できます。
+                カテゴリーで課を選ぶと、該当課に属する社内公式商品コードと品名が自動で反映され、瞬時に記録できます。
             </span>
         </div>
     """, unsafe_allow_html=True)
@@ -1425,6 +1424,7 @@ with tabs[0]:
             batch_market_no = st.text_input("🏢 市場番号 / 取引先名", value=default_market_val)
             
         with col_hdr3:
+            # カテゴリーの選択箇所を「○課」として選択
             chosen_dept = st.selectbox(
                 "🏢 カテゴリー（○課を選択）:",
                 options=DEPT_LIST,
@@ -1432,8 +1432,9 @@ with tabs[0]:
                 key="chosen_dept_batch_selector"
             )
 
-        st.caption("▼ 選択された課に該当する商品と商品コードが自動反映されます。")
+        st.caption("▼ 選択された課に該当する商品と商品コードが自動反映されます。数量・単価を入力して登録してください。")
 
+        # 選択された課に該当する商品を抽出
         dept_master_items = df_master_raw[df_master_raw["department"] == chosen_dept]
         if not dept_master_items.empty:
             candidate_item_options = [
