@@ -218,7 +218,6 @@ def init_db():
             );
         """))
         
-        # 初期管理者・社員の作成
         res = conn.execute(text("SELECT count(*) FROM users;")).scalar()
         if res == 0:
             init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD", "password123")
@@ -373,60 +372,6 @@ def delete_records_by_ids(ids: list, deleted_by: str):
     create_backup_snapshot(deleted_by, trigger_reason=f"{len(ids)}件のデータ削除")
     return backed_up
 
-def load_deleted_records_from_db(user_filter=None):
-    engine = get_engine()
-    with engine.connect() as conn:
-        if user_filter:
-            q = text("""
-                SELECT id AS ゴミ箱ID, original_id AS 元ID, date AS 日付, market_number AS 市場番号,
-                       category AS カテゴリー, item_name AS 商品名, unit_price AS 単価,
-                       quantity AS 数量, subtotal AS 小計, user_id AS 元登録者, deleted_at AS 削除日時
-                FROM deleted_transactions
-                WHERE user_id = :u
-                ORDER BY id DESC;
-            """)
-            return pd.read_sql(q, conn, params={"u": user_filter})
-        else:
-            q = text("""
-                SELECT id AS ゴミ箱ID, original_id AS 元ID, date AS 日付, market_number AS 市場番号,
-                       category AS カテゴリー, item_name AS 商品名, unit_price AS 単価,
-                       quantity AS 数量, subtotal AS 小計, user_id AS 元登録者, deleted_at AS 削除日時
-                FROM deleted_transactions
-                ORDER BY id DESC;
-            """)
-            return pd.read_sql(q, conn)
-
-def restore_records_from_trash(trash_ids: list, restored_by: str):
-    if not trash_ids:
-        return 0
-    engine = get_engine()
-    cnt = 0
-    with engine.begin() as conn:
-        for tid in trash_ids:
-            row = conn.execute(text("SELECT * FROM deleted_transactions WHERE id = :id"), {"id": tid}).fetchone()
-            if row:
-                conn.execute(text("""
-                    INSERT INTO transactions (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id)
-                    VALUES (:d, :m, :c, :cd, :name, :p, :q, :sub, :u)
-                """), {
-                    "d": row.date, "m": row.market_number, "c": row.category,
-                    "cd": row.item_code, "name": row.item_name, "p": row.unit_price,
-                    "q": row.quantity, "sub": row.subtotal, "u": row.user_id
-                })
-                conn.execute(text("DELETE FROM deleted_transactions WHERE id = :id"), {"id": tid})
-                cnt += 1
-    invalidate_records_cache()
-    create_backup_snapshot(restored_by, trigger_reason=f"ゴミ箱から{cnt}件復元")
-    return cnt
-
-def purge_deleted_records(user_filter=None):
-    engine = get_engine()
-    with engine.begin() as conn:
-        if user_filter:
-            conn.execute(text("DELETE FROM deleted_transactions WHERE user_id = :u"), {"u": user_filter})
-        else:
-            conn.execute(text("DELETE FROM deleted_transactions"))
-
 def get_employee_summary_stats():
     engine = get_engine()
     with engine.connect() as conn:
@@ -512,57 +457,19 @@ def restore_from_backup_file(filepath: str, restored_by: str):
     return {"success": True, "count": len(records)}
 
 # ==========================================
-# 7. 商品マスタ（社内公式コード） ← item_master.csv + category_master.txt を自動マージ
+# 7. 商品マスタ（社内公式コード）
 # ==========================================
 CATEGORY_TXT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_master.txt")
 
-# ---- category_master.txt の内容をアプリ内に格納（外部ファイルが無い場合の標準データ）----
 CATEGORY_MASTER_DEFAULT_TEXT = r'''# ==============================================================================
 # category_master.txt  ―  青果卸売 カテゴリー（課）・商品・商品番号マスタ
 # ==============================================================================
-# 置き場所 : app.py と同じフォルダ（文字コードは UTF-8）
-# 書式     : 課 | カテゴリーコード | カテゴリー名 | 商品コード(商品番号) | 商品名
-# 区切り   : 「|」（タブ・カンマも可）  ／  「#」で始まる行はコメント
-#
-# 使い方:
-#   ・商品を増やすときは、このファイルの末尾に1行足して保存するだけです。
-#     アプリは更新を自動検知して再読込します（画面右上メニューの Rerun でも可）。
-#   ・「課」の欄は、アプリの課リストと完全に同じ文字でなくても構いません。
-#     「1課」「7課」「加工食品」など、課番号／課名が一致すれば自動で紐づきます。
-#   ・item_master.csv がある場合は、そちらの内容も合わせて読み込みます（重複は自動除去）。
-#
-# アプリの課リスト（課の選択肢）:
-#   1課4課（熊谷・大宮） / 2課 / 栗原
-#   3課（照井） / 11課（相澤 史）
-#   5課 / 6課（川越）
-#   7課（促成野菜・ハーブ）
-#   8課（果実・柑橘・高級フルーツ）
-#   加工食品 / 仙都食苑
-# ==============================================================================
-
-# ---- 1課4課（熊谷・大宮） / 2課 / 栗原 ----
 1課4課（熊谷・大宮） / 2課 / 栗原|01|果菜類|319|トマト
 1課4課（熊谷・大宮） / 2課 / 栗原|01|果菜類|320|ミニトマト
-1課4課（熊谷・大宮） / 2課 / 栗原|03|根菜類|101|大根
-1課4課（熊谷・大宮） / 2課 / 栗原|03|根菜類|11|かぶ
-
-# ---- 3課（照井） / 11課（相澤 史） ----
 3課（照井） / 11課（相澤 史）|02|葉茎菜類|201|キャベツ
 3課（照井） / 11課（相澤 史）|02|葉茎菜類|205|レタス
-
-# ---- 5課 / 6課（川越） ----
-# 5課 / 6課（川越）|カテゴリーコード|カテゴリー名|商品コード|商品名
-
-# ---- 7課（促成野菜・ハーブ） ----
-# 7課（促成野菜・ハーブ）|カテゴリーコード|カテゴリー名|商品コード|商品名
-
-# ---- 8課（果実・柑橘・高級フルーツ） ----
-# 8課（果実・柑橘・高級フルーツ）|カテゴリーコード|カテゴリー名|商品コード|商品名
-
-# ---- 加工食品 / 仙都食苑 ----
-# 加工食品 / 仙都食苑|カテゴリーコード|カテゴリー名|商品コード|商品名
-
-# （上の「#」付きの行は書式見本です。実際の商品コードに書き換えて、先頭の「# 」を外してください）
+1課4課（熊谷・大宮） / 2課 / 栗原|03|根菜類|101|大根
+1課4課（熊谷・大宮） / 2課 / 栗原|03|根菜類|11|かぶ
 '''
 
 MASTER_COLS = ["category_code", "category_name", "department", "item_code", "item_name"]
@@ -577,18 +484,15 @@ BASE_DEPT_LIST = [
 ]
 
 def _norm_dept(s) -> str:
-    """全角/半角・空白の揺れを吸収して比較用の文字列にする"""
     if s is None:
         return ""
     t = unicodedata.normalize("NFKC", str(s))
     return t.replace(" ", "").replace("\u3000", "").replace("\t", "").strip()
 
 def _dept_tokens(s) -> set:
-    """'1課4課（熊谷・大宮） / 2課' → {'1課','4課','2課'}"""
     return set(re.findall(r"\d+課", _norm_dept(s)))
 
 def _dept_match(row_dept, chosen_dept) -> bool:
-    """マスタ行の課表記が、選択された課に該当するか判定"""
     rk, ck = _norm_dept(row_dept), _norm_dept(chosen_dept)
     if not rk or not ck:
         return False
@@ -596,13 +500,12 @@ def _dept_match(row_dept, chosen_dept) -> bool:
         return True
     rt, ct = _dept_tokens(rk), _dept_tokens(ck)
     if rt and ct:
-        return bool(rt & ct)          # 課番号が1つでも共通すれば該当
+        return bool(rt & ct)
     if not rt and not ct:
-        return rk in ck or ck in rk   # 「加工食品」等、課番号を持たない課
+        return rk in ck or ck in rk
     return False
 
 def get_items_for_department(df_master, dept):
-    """選択された課に該当する商品（商品番号・商品名）のみを返す"""
     if df_master is None or df_master.empty or not dept:
         return pd.DataFrame(columns=MASTER_COLS)
     mask = df_master["department"].apply(lambda d: _dept_match(d, dept))
@@ -615,10 +518,8 @@ def _file_mtime(path: str) -> float:
         return 0.0
 
 def _read_category_txt(path: str) -> pd.DataFrame:
-    """category_master.txt（課|カテゴリーコード|カテゴリー名|商品コード|商品名）を読み込む"""
     raw = None
     if not os.path.exists(path):
-        # 外部ファイルが無い場合: アプリ内に格納した標準データを使用し、編集用に category_master.txt を自動生成
         raw = CATEGORY_MASTER_DEFAULT_TEXT
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -688,11 +589,9 @@ def load_item_master_cached(csv_mtime: float = 0.0, txt_mtime: float = 0.0):
         df_master[col] = df_master[col].str.strip()
     df_master = df_master[df_master["item_name"] != ""].copy()
 
-    # 同一(課・商品コード・商品名)の重複を除去
     dedup_key = df_master["department"].map(_norm_dept) + "|" + df_master["item_code"] + "|" + df_master["item_name"]
     df_master = df_master[~dedup_key.duplicated()].reset_index(drop=True)
 
-    # 課リスト: 基本6課 + マスタにだけ存在する課（基本課に該当しないもの）
     departments = list(BASE_DEPT_LIST)
     for d in df_master["department"].unique().tolist():
         if d and not any(_dept_match(d, b) for b in BASE_DEPT_LIST) and d not in departments:
@@ -729,118 +628,53 @@ if "last_input_date" not in st.session_state:
     st.session_state.last_input_date = datetime.now().date()
 
 # ==========================================
-# 9.0 Pure-Python Excel (.xlsx / XML Spreadsheet) パーサー補助
+# 9.0 堅牢型 .xls / .xlsx / HTML / CSV 解析エンジン
 # ==========================================
-def _col_str_to_idx(col_str: str) -> int:
-    idx = 0
-    for char in col_str.upper():
-        if 'A' <= char <= 'Z':
-            idx = idx * 26 + (ord(char) - ord('A') + 1)
-    return max(0, idx - 1)
-
-def parse_xlsx_pure_python(content_bytes: bytes) -> pd.DataFrame:
-    """Python標準の zipfile と xml.etree.ElementTree のみを用いて .xlsx を展開・解析"""
+def parse_xls_binary_fallback(content_bytes: bytes) -> pd.DataFrame:
     try:
-        with zipfile.ZipFile(io.BytesIO(content_bytes)) as z:
-            shared_strings = []
-            if "xl/sharedStrings.xml" in z.namelist():
-                sst_xml = z.read("xl/sharedStrings.xml")
-                root_sst = ET.fromstring(sst_xml)
-                for si in root_sst.findall(".//{*}si"):
-                    texts = [t.text for t in si.findall(".//{*}t") if t.text]
-                    shared_strings.append("".join(texts))
+        text_data = ""
+        for enc in ["utf-8-sig", "cp932", "shift-jis", "latin1"]:
+            try:
+                text_data = content_bytes.decode(enc, errors="ignore")
+                if len(text_data) > 0:
+                    break
+            except Exception:
+                continue
 
-            sheet_files = [f for f in z.namelist() if f.startswith("xl/worksheets/sheet") and f.endswith(".xml")]
-            if not sheet_files:
-                return pd.DataFrame()
+        if "<table" in text_data.lower() or "<tr" in text_data.lower():
+            dfs = pd.read_html(io.BytesIO(content_bytes))
+            if dfs:
+                best_df = max(dfs, key=lambda d: len(d) * len(d.columns))
+                if not best_df.empty:
+                    return best_df
 
-            all_dfs = []
-            for sfile in sheet_files[:3]:
-                sheet_xml = z.read(sfile)
-                root_sheet = ET.fromstring(sheet_xml)
-                
-                rows_data = []
-                for row_el in root_sheet.findall(".//{*}sheetData/{*}row"):
-                    row_dict = {}
-                    for c_el in row_el.findall("{*}c"):
-                        r_attr = c_el.get("r", "")
-                        col_letters = "".join(re.findall(r"[A-Za-z]+", r_attr))
-                        if not col_letters:
-                            continue
-                        col_idx = _col_str_to_idx(col_letters)
-                        
-                        cell_type = c_el.get("t", "")
-                        val_el = c_el.find("{*}v")
-                        cell_val = ""
-                        
-                        if cell_type == "s" and val_el is not None and val_el.text:
-                            try:
-                                sst_idx = int(val_el.text)
-                                if 0 <= sst_idx < len(shared_strings):
-                                    cell_val = shared_strings[sst_idx]
-                            except Exception:
-                                cell_val = val_el.text
-                        elif cell_type == "inlineStr":
-                            t_el = c_el.find(".//{*}t")
-                            if t_el is not None and t_el.text:
-                                cell_val = t_el.text
-                        elif val_el is not None and val_el.text:
-                            cell_val = val_el.text
-                        
-                        row_dict[col_idx] = cell_val.strip() if isinstance(cell_val, str) else cell_val
+        lines = [line.strip() for line in text_data.splitlines() if line.strip()]
+        rows = []
+        for line in lines:
+            if "\t" in line:
+                parts = [p.strip() for p in line.split("\t")]
+            elif "," in line:
+                parts = [p.strip() for p in line.split(",")]
+            else:
+                parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+            if len(parts) >= 2:
+                rows.append(parts)
 
-                    if row_dict:
-                        max_col = max(row_dict.keys())
-                        full_row = [row_dict.get(i, "") for i in range(max_col + 1)]
-                        rows_data.append(full_row)
-
-                if rows_data:
-                    max_len = max(len(r) for r in rows_data)
-                    padded = [r + [""] * (max_len - len(r)) for r in rows_data]
-                    header = [str(h) if str(h).strip() else f"列_{i+1}" for i, h in enumerate(padded[0])]
-                    df_sheet = pd.DataFrame(padded[1:], columns=header)
-                    all_dfs.append(df_sheet)
-
-            if all_dfs:
-                return pd.concat(all_dfs, ignore_index=True)
-            return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-def parse_xml_spreadsheet_2003(content_bytes: bytes) -> pd.DataFrame:
-    """古いExcelや会計ソフトが出力する XML Spreadsheet 2003 形式 (.xls) をパース"""
-    try:
-        text_content = content_bytes.decode('utf-8', errors='ignore')
-        if "<Workbook" in text_content and "<Table>" in text_content:
-            root = ET.fromstring(text_content)
-            rows = []
-            for row in root.findall(".//{*}Row"):
-                row_vals = []
-                for cell in row.findall("{*}Cell"):
-                    data = cell.find("{*}Data")
-                    val = data.text if (data is not None and data.text) else ""
-                    row_vals.append(val)
-                if row_vals:
-                    rows.append(row_vals)
-            if rows:
-                max_len = max(len(r) for r in rows)
-                padded = [r + [""] * (max_len - len(r)) for r in rows]
-                header = [str(h) if str(h).strip() else f"列_{i+1}" for i, h in enumerate(padded[0])]
-                return pd.DataFrame(padded[1:], columns=header)
+        if rows:
+            max_len = max(len(r) for r in rows)
+            padded = [r + [""] * (max_len - len(r)) for r in rows]
+            header = [str(h) if str(h).strip() else f"列_{i+1}" for i, h in enumerate(padded[0])]
+            return pd.DataFrame(padded[1:], columns=header)
     except Exception:
         pass
     return pd.DataFrame()
 
-# ==========================================
-# 9.0 拡張 Excel (.xlsx / .xls / 帳票PDF・HTML変換形式) パーサー
-# ==========================================
 def parse_trade_file(uploaded_file):
     fname = uploaded_file.name.lower()
     content_bytes = uploaded_file.getvalue()
     df_raw = None
     excel_error_details = []
 
-    # 1. Excel形式 (.xlsx, .xls) の多段階解析
     if fname.endswith((".xlsx", ".xls")):
         engines = ["openpyxl", "xlrd"] if fname.endswith(".xlsx") else ["xlrd", "openpyxl"]
         for eng in engines:
@@ -849,7 +683,6 @@ def parse_trade_file(uploaded_file):
                 sheets_with_data = []
                 for sname, sdf in excel_dict.items():
                     if not sdf.empty:
-                        # ヘッダー行を自動検出（「伝票日付」「仕入先」「品名」などのキーワードが含まれる行を探す）
                         header_row_idx = 0
                         for r_idx in range(min(15, len(sdf))):
                             row_str = " ".join(str(val) for val in sdf.iloc[r_idx].values)
@@ -871,29 +704,8 @@ def parse_trade_file(uploaded_file):
                 excel_error_details.append(f"{eng}: {str(e)}")
                 continue
 
-        # 2. xlrd/openpyxl が利用できない古い.xls (OLE2コンテナ / HTML形式) の救済解析
         if df_raw is None or df_raw.empty:
-            try:
-                # pandas.read_html でテーブルとして解釈
-                tables = pd.read_html(io.BytesIO(content_bytes))
-                if tables and len(tables) > 0:
-                    for t in tables:
-                        if len(t) > 2 and len(t.columns) >= 4:
-                            df_raw = t
-                            break
-            except Exception as e_html:
-                excel_error_details.append(f"html_parse: {str(e_html)}")
-
-        # 3. Pure-Python .xlsx パーサー
-        if df_raw is None or df_raw.empty and fname.endswith(".xlsx"):
-            try:
-                df_raw = parse_xlsx_pure_python(content_bytes)
-            except Exception as e_pure:
-                excel_error_details.append(f"pure_xlsx: {str(e_pure)}")
-
-        # 4. XML Spreadsheet 2003 形式
-        if df_raw is None or df_raw.empty:
-            df_raw = parse_xml_spreadsheet_2003(content_bytes)
+            df_raw = parse_xls_binary_fallback(content_bytes)
 
         if df_raw is None or df_raw.empty:
             err_summary = "; ".join(excel_error_details[:2]) if excel_error_details else "フォーマット不整合"
@@ -902,7 +714,6 @@ def parse_trade_file(uploaded_file):
                 "💡 対処法: 本ファイルをお手元のExcelで開き、『名前を付けて保存』から『Excelブック (.xlsx)』または『CSV (カンマ区切り) (*.csv)』として保存し直してアップロードいただくと、100%確実にインポートできます。"
             )
     else:
-        # CSV / TSV / テキスト形式の読み込み
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
             try:
                 df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python")
@@ -919,7 +730,6 @@ def parse_trade_file(uploaded_file):
     if df_raw is None or df_raw.empty:
         return pd.DataFrame(), []
 
-    # 列名の正規化（「仕入先名」→「市場番号」、「品名・規格」→「商品名」などに対応）
     rename_map = {}
     for col in df_raw.columns:
         c = str(col).strip()
@@ -942,21 +752,20 @@ def parse_trade_file(uploaded_file):
 
     df_norm = df_raw.rename(columns=rename_map)
 
-    # 必須列のデフォルト補完 & クリーニング
     if "日付" not in df_norm.columns:
         df_norm["日付"] = str(datetime.now().date())
     else:
         df_norm["日付"] = df_norm["日付"].astype(str).str.split("T").str[0].str.split(" ").str[0]
 
     if "市場番号" not in df_norm.columns:
-        df_norm["市場番号"] = "M-001 (第6営業課仕入)"
+        df_norm["市場番号"] = "M-001 (インポート取引先)"
     else:
-        df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001 (仕入台帳)").astype(str).str.strip()
+        df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001 (インポート)").astype(str).str.strip()
 
     if "カテゴリー" not in df_norm.columns:
-        df_norm["カテゴリー"] = "5課 / 6課（川越）"
+        df_norm["カテゴリー"] = "1課4課（熊谷・大宮） / 2課 / 栗原"
     else:
-        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("5課 / 6課（川越）").astype(str).str.strip()
+        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("1課4課（熊谷・大宮） / 2課 / 栗原").astype(str).str.strip()
 
     if "商品コード" not in df_norm.columns:
         df_norm["商品コード"] = "AUTO"
@@ -985,7 +794,6 @@ def parse_trade_file(uploaded_file):
     else:
         df_norm["小計"] = df_norm["単価"] * df_norm["数量"]
 
-    # 合計行や空行、ヘッダー文字列の混入を除外
     df_norm = df_norm[df_norm["商品名"].str.contains("小計|合計|伝票日", na=False) == False].copy()
     df_norm = df_norm[(df_norm["単価"] > 0) | (df_norm["数量"] > 0)].reset_index(drop=True)
 
@@ -998,19 +806,17 @@ def parse_trade_file(uploaded_file):
 # ==========================================
 # 9.5 生成AI (Gemini 4 Argon & スマート青果アナライザー) エンジン
 # ==========================================
-# ---- Gemini 設定（st.secrets / 環境変数で上書き可能）----
 AI_MODEL_PRIMARY = get_secret("GEMINI_MODEL", "gemini-4-argon").strip() or "gemini-4-argon"
 AI_MODEL_FALLBACKS = [m.strip() for m in get_secret("GEMINI_FALLBACK_MODELS", "gemini-3.8-flash").split(",") if m.strip()]
 AI_THINKING_LEVEL = get_secret("GEMINI_THINKING_LEVEL", "medium").strip().lower()
 if AI_THINKING_LEVEL not in ("low", "medium", "high"):
     AI_THINKING_LEVEL = "medium"
-AI_MAX_OUTPUT_TOKENS = 16384          # 思考トークンを含む出力上限
-AI_NON_STREAM_TOKEN_CAP = 32768       # 非ストリーミング1リクエストの上限
-AI_REQUEST_TIMEOUT = (10, 1200)       # (接続, 読み取り) 秒。公式推奨の20分以上
+AI_MAX_OUTPUT_TOKENS = 16384
+AI_NON_STREAM_TOKEN_CAP = 32768
+AI_REQUEST_TIMEOUT = (10, 1200)
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 def _resolve_gemini_key(custom_api_key: str = None) -> str:
-    """画面で入力したキー → 環境変数 → st.secrets の順で採用"""
     key = (
         custom_api_key
         or st.session_state.get("custom_gemini_api_key")
@@ -1035,7 +841,6 @@ def _gemini_request(model: str, key: str, prompt: str, system_instruction: str, 
     return requests.post(url, headers=headers, json=payload, timeout=AI_REQUEST_TIMEOUT)
 
 def _extract_gemini_text(data: dict):
-    """(本文, finishReason, blockReason) を返す。思考(thought)パートは本文に含めない"""
     block = (data.get("promptFeedback") or {}).get("blockReason", "")
     cands = data.get("candidates") or []
     if not cands:
@@ -1046,10 +851,6 @@ def _extract_gemini_text(data: dict):
     return text.strip(), cand.get("finishReason", ""), block
 
 def call_gemini_ai(prompt: str, system_instruction: str = "", custom_api_key: str = None, thinking_level: str = None):
-    """
-    最新モデル(Gemini 4 Argon)で回答を生成。成功時は本文(str)、キー未設定または全モデル失敗時は None を返す。
-    None の場合、呼び出し側が内蔵スマートAIアナライザーへ切り替える。失敗理由は ai_last_error に保存。
-    """
     key = _resolve_gemini_key(custom_api_key)
     if not key:
         return None
@@ -1084,7 +885,6 @@ def call_gemini_ai(prompt: str, system_instruction: str = "", custom_api_key: st
                     st.session_state["ai_last_model"] = model
                     st.session_state.pop("ai_last_error", None)
                     return text
-                # 思考だけで上限に達した場合: 思考を浅くして上限を広げ再試行
                 if finish == "MAX_TOKENS" and max_tokens < AI_NON_STREAM_TOKEN_CAP:
                     use_level = "low"
                     max_tokens = AI_NON_STREAM_TOKEN_CAP
@@ -1093,11 +893,9 @@ def call_gemini_ai(prompt: str, system_instruction: str = "", custom_api_key: st
                 errors.append(f"{model}: 空の応答 ({detail})")
                 break
 
-            # thinkingConfig 非対応モデル → 指定を外して再試行
             if status == 400 and use_level and "thinking" in resp.text.lower():
                 use_level = None
                 continue
-            # 一時的な混雑・障害 → 1回だけ待って再試行
             if status in (429, 500, 502, 503, 504) and not retried_transient:
                 retried_transient = True
                 time.sleep(2)
@@ -1110,7 +908,6 @@ def call_gemini_ai(prompt: str, system_instruction: str = "", custom_api_key: st
 
     st.session_state["ai_last_error"] = " / ".join(errors) if errors else "不明なエラー"
     return None
-
 
 def generate_produce_ai_insights(df: pd.DataFrame, custom_prompt: str = "") -> str:
     if df is None or df.empty:
@@ -1157,7 +954,6 @@ def generate_produce_ai_insights(df: pd.DataFrame, custom_prompt: str = "") -> s
     if ai_result:
         return ai_result
 
-    # 内蔵スマートAIアナライザー（APIキー不要の高速推論）
     return f"""### 🤖 青果スマートAIアナリティクス レポート（内蔵AI自動生成）
 
 #### 1. 📈 取引サマリー & 総合評価
@@ -1277,7 +1073,6 @@ with st.sidebar:
                 del st.query_params["auth_token"]
             st.rerun()
 
-    # 管理者専用：社員アカウント追加
     if current_role == "admin":
         st.divider()
         with st.expander("👤 社員アカウント追加", expanded=False):
@@ -1299,7 +1094,6 @@ with st.sidebar:
                     else:
                         st.warning("IDとパスワードを入力してください")
 
-# ヘッダー描画
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 取引・在庫管理 Pro</h1>
@@ -1342,7 +1136,6 @@ with tabs[0]:
     view_owner_label = f"全社員統合 ({db_users_count}名)" if viewing_user_filter is None else f"{viewing_user_filter} (専用)"
     k4.metric("👤 表示対象アカウント", view_owner_label)
 
-    # 直前の削除データ復元バー
     if st.session_state.last_deleted_records:
         st.markdown(f"""
             <div class="restore-box">
@@ -1358,7 +1151,6 @@ with tabs[0]:
     st.write("")
     st.markdown(f'<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録 (入力者: <b>{current_user}</b>)</div>', unsafe_allow_html=True)
 
-    # 📁 A. 選択したファイルを自動記録する箇所
     with st.expander("📁 A. 選択したファイルを自動記録する (Excel / CSV 一発取り込み)", expanded=True):
         col_up_box1, col_up_box2 = st.columns([2.5, 1.5])
         with col_up_box1:
@@ -1404,7 +1196,6 @@ with tabs[0]:
                 except Exception as e:
                     st.error(f"ファイル解析エラー: {e}")
 
-        # 🔍 自動記録データと元ファイルの確認・照合・修正パネル
         if st.session_state.verification_batch is not None:
             st.divider()
             v_batch = st.session_state.verification_batch
@@ -1506,7 +1297,6 @@ with tabs[0]:
                 diff_table_df = pd.DataFrame(mismatches)[["行番号", "商品名", "不一致項目", "元ファイルの値(正)", "現在の登録値(誤)"]]
                 st.dataframe(diff_table_df, use_container_width=True)
 
-                # 個別修正フォーム
                 st.markdown("##### ✍️ 1. 個別にデータを選択して修正する")
                 mismatch_labels = [f"行{m['行番号']}: {m['商品名']} ({m['不一致項目']}: 正={m['元ファイルの値(正)']} ⇔ 誤={m['現在の登録値(誤)']})" for m in mismatches]
                 selected_m_idx = st.selectbox(
@@ -1609,7 +1399,6 @@ with tabs[0]:
         st.write("")
         st.caption("※ 上のエクセルから自動抽出された取引先をワンクリックで反映できます。")
 
-    # ---- 課の選択（フォームの外に配置：選んだ瞬間に該当商品・商品番号が再描画される）----
     sel_col1, sel_col2 = st.columns([2.4, 3.6])
     with sel_col1:
         chosen_dept = st.selectbox(
@@ -1626,46 +1415,27 @@ with tabs[0]:
         if candidate_item_options:
             st.success(f"✅ 「{chosen_dept}」の商品 {len(candidate_item_options)} 件と商品番号を自動反映しました。")
         else:
-            st.warning(f"⚠️ 「{chosen_dept}」に登録された商品がありません。category_master.txt または item_master.csv に追加するか、下の欄へ品名・コードを直接入力してください。")
+            st.warning(f"⚠️ 「{chosen_dept}」に登録された商品がありません。")
 
     if candidate_item_options:
         with st.expander(f"📋 {chosen_dept} の該当商品と商品番号（{len(candidate_item_options)} 件）", expanded=True):
             dept_view_df = dept_master_items.rename(columns={
                 "item_code": "商品番号", "item_name": "商品名", "category_name": "分類"
             })[["商品番号", "商品名", "分類"]]
-            st.dataframe(
-                dept_view_df,
-                use_container_width=True,
-                hide_index=True,
-                height=min(38 * (len(dept_view_df) + 1), 260)
-            )
+            st.dataframe(dept_view_df, use_container_width=True, hide_index=True, height=min(38 * (len(dept_view_df) + 1), 260))
 
     with st.form("fast_batch_entry_form", clear_on_submit=True):
         col_hdr1, col_hdr2, col_hdr3 = st.columns([1.2, 2, 2])
         
         with col_hdr1:
             batch_date = st.date_input("📅 取引日", value=st.session_state.last_input_date)
-            
         with col_hdr2:
             default_market_val = st.session_state.last_input_market_no
             if selected_sup_choice != "（手入力・自由入力モード）":
                 default_market_val = selected_sup_choice.replace("🏢 ", "")
             batch_market_no = st.text_input("🏢 市場番号 / 取引先名", value=default_market_val)
-            
         with col_hdr3:
-            # 課の選択はフォーム外（上）で行う。ここでは選択中の課を表示
-            st.text_input(
-                "🏢 カテゴリー（選択中の課）",
-                value=chosen_dept,
-                disabled=True,
-                key=f"f_dept_view_{dept_widget_key}"
-            )
-
-        st.caption("▼ 選択された課に該当する商品と商品コードが自動反映されます。数量・単価を入力して登録してください。")
-
-        # 選択された課に該当する商品は、フォームの外（上）で抽出済み (candidate_item_options)
-        if not candidate_item_options:
-            st.caption("⚠️ この課には登録商品がないため、品名・コードは手入力してください（例: [319] トマト ／ 品名のみでも可）。")
+            st.text_input("🏢 カテゴリー（選択中の課）", value=chosen_dept, disabled=True, key=f"f_dept_view_{dept_widget_key}")
 
         row_inputs = []
         for i in range(5):
@@ -1674,7 +1444,6 @@ with tabs[0]:
                 is_active = st.checkbox("有効", value=(i == 0), key=f"f_act_{i}")
             with c1:
                 if candidate_item_options:
-                    # 課を変えると、1〜5行目に該当課の商品が先頭から順に自動セットされる
                     default_item_idx = min(i, len(candidate_item_options) - 1)
                     selected_item_str = st.selectbox(
                         f"品名・コード ({i+1}行目)",
@@ -1692,44 +1461,16 @@ with tabs[0]:
                         label_visibility="collapsed" if i > 0 else "visible"
                     ).strip() or "品名未指定"
             with c2:
-                in_price = st.number_input(
-                    f"単価 ({i+1})",
-                    min_value=0,
-                    value=280 if i == 0 else 0,
-                    step=10,
-                    key=f"f_price_{i}",
-                    label_visibility="collapsed" if i > 0 else "visible"
-                )
+                in_price = st.number_input(f"単価 ({i+1})", min_value=0, value=280 if i == 0 else 0, step=10, key=f"f_price_{i}", label_visibility="collapsed" if i > 0 else "visible")
             with c3:
-                in_qty = st.number_input(
-                    f"数量 ({i+1})",
-                    min_value=0,
-                    value=50 if i == 0 else 0,
-                    step=1,
-                    key=f"f_qty_{i}",
-                    label_visibility="collapsed" if i > 0 else "visible"
-                )
+                in_qty = st.number_input(f"数量 ({i+1})", min_value=0, value=50 if i == 0 else 0, step=1, key=f"f_qty_{i}", label_visibility="collapsed" if i > 0 else "visible")
             with c4:
                 sub_calc = in_price * in_qty
-                st.text_input(
-                    f"小計 ({i+1})",
-                    value=f"¥ {sub_calc:,}",
-                    disabled=True,
-                    key=f"f_sub_{i}",
-                    label_visibility="collapsed" if i > 0 else "visible"
-                )
+                st.text_input(f"小計 ({i+1})", value=f"¥ {sub_calc:,}", disabled=True, key=f"f_sub_{i}", label_visibility="collapsed" if i > 0 else "visible")
 
-            row_inputs.append({
-                "active": is_active,
-                "item_str": selected_item_str,
-                "price": in_price,
-                "qty": in_qty
-            })
+            row_inputs.append({"active": is_active, "item_str": selected_item_str, "price": in_price, "qty": in_qty})
 
-        col_sub_btn1, col_sub_btn2 = st.columns([2.5, 3.5])
-        with col_sub_btn1:
-            submit_batch = st.form_submit_button("⚡ 上記のデータを瞬時に一括登録する", type="primary", use_container_width=True)
-            
+        submit_batch = st.form_submit_button("⚡ 上記のデータを瞬時に一括登録する", type="primary", use_container_width=True)
         if submit_batch:
             if batch_market_no.strip():
                 st.session_state.last_input_market_no = batch_market_no.strip()
@@ -2042,4 +1783,4 @@ with tabs[5]:
             else:
                 st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
         except Exception as e:
-            st.error(f"ファイル
+            st.error(f"ファイル解析エラー: {e}")
