@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -14,6 +15,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 import re
 import requests
+import time
+import unicodedata
 
 # ==========================================
 # ページ基本設定 & セキュリティヘッダーCSS (高速描画対応)
@@ -78,7 +81,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 永続ストレージ & DB設定 (PostgreSQL対応)
+# 1. 永続ストレージ & DB設定
 # ==========================================
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -108,8 +111,8 @@ def get_engine():
                 url,
                 pool_pre_ping=True,
                 pool_recycle=300,
-                pool_size=10,
-                max_overflow=20,
+                pool_size=5,
+                max_overflow=10,
                 connect_args={"connect_timeout": 5}
             )
         except Exception:
@@ -233,7 +236,7 @@ def init_db():
 init_db()
 
 # ==========================================
-# 4. ユーザー認証 & ID/パスワード変更関数
+# 4. ユーザー認証関数
 # ==========================================
 def verify_user_login(username: str, password_raw: str):
     engine = get_engine()
@@ -260,29 +263,8 @@ def register_new_user_db(username, password, role="staff", display_name=""):
             {"u": username.strip(), "p": hash_password(password), "r": role, "d": display_name.strip()}
         )
 
-def update_user_credentials(old_username: str, new_username: str, new_password: str, new_display_name: str):
-    engine = get_engine()
-    with engine.begin() as conn:
-        if new_password and new_password.strip():
-            p_hash = hash_password(new_password.strip())
-            conn.execute(
-                text("UPDATE users SET username = :new_u, password_hash = :p, display_name = :d WHERE username = :old_u"),
-                {"new_u": new_username.strip(), "p": p_hash, "d": new_display_name.strip(), "old_u": old_username}
-            )
-        else:
-            conn.execute(
-                text("UPDATE users SET username = :new_u, display_name = :d WHERE username = :old_u"),
-                {"new_u": new_username.strip(), "d": new_display_name.strip(), "old_u": old_username}
-            )
-        if old_username != new_username.strip():
-            conn.execute(
-                text("UPDATE transactions SET user_id = :new_u WHERE user_id = :old_u"),
-                {"new_u": new_username.strip(), "old_u": old_username}
-            )
-    invalidate_records_cache()
-
 # ==========================================
-# 5. 取引データ操作 (高速キャッシュ連携 & バリデーション)
+# 5. 取引データ操作 (高速キャッシュ連携)
 # ==========================================
 @st.cache_data(ttl=60)
 def load_records_cached(target_user_filter: str = None):
@@ -318,24 +300,9 @@ def invalidate_records_cache():
 def insert_records_to_db(user_id: str, records: list, auto_backup=True):
     if not records:
         return
-    
-    # 【堅牢性バリデーション】単価が10万円を超える極端な入力値に対する警告
-    valid_records = []
-    for r in records:
-        p = int(r.get("単価", 0))
-        q = int(r.get("数量", 0))
-        if p > 100000:
-            st.warning(f"⚠️ 【バリデーション警告】商品名「{r.get('商品名')}」の単価（¥{p:,}）が想定上限（10万円）を超えています。入力内容をご確認ください。")
-        if p < 0 or q < 0:
-            continue
-        valid_records.append(r)
-
-    if not valid_records:
-        return
-
     engine = get_engine()
     with engine.begin() as conn:
-        for r in valid_records:
+        for r in records:
             p = int(r.get("単価", 0))
             q = int(r.get("数量", 0))
             sub = r.get("小計", p * q)
@@ -361,11 +328,8 @@ def update_single_record_in_db(record_dict: dict):
     rec_id = record_dict.get("id")
     if not rec_id:
         return
-    p = int(record_dict.get("単価", 0))
-    if p > 100000:
-        st.warning(f"⚠️ 【バリデーション警告】単価（¥{p:,}）が10万円を超えています。")
-        
     engine = get_engine()
+    p = int(record_dict.get("単価", 0))
     q = int(record_dict.get("数量", 0))
     sub = record_dict.get("小計", p * q)
     with engine.begin() as conn:
@@ -549,35 +513,138 @@ def restore_from_backup_file(filepath: str, restored_by: str):
     return {"success": True, "count": len(records)}
 
 # ==========================================
-# 7. 商品マスタ（社内公式コード）
+# 7. 商品マスタ（社内公式コード） ← item_master.csv + category_master.txt を自動マージ
 # ==========================================
-@st.cache_data(ttl=3600)
-def load_item_master_cached():
-    if os.path.exists(MASTER_CSV_FILE):
+CATEGORY_TXT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "category_master.txt")
+
+MASTER_COLS = ["category_code", "category_name", "department", "item_code", "item_name"]
+
+BASE_DEPT_LIST = [
+    "1課4課（熊谷・大宮） / 2課 / 栗原",
+    "3課（照井） / 11課（相澤 史）",
+    "5課 / 6課（川越）",
+    "7課（促成野菜・ハーブ）",
+    "8課（果実・柑橘・高級フルーツ）",
+    "加工食品 / 仙都食苑"
+]
+
+def _norm_dept(s) -> str:
+    """全角/半角・空白の揺れを吸収して比較用の文字列にする"""
+    if s is None:
+        return ""
+    t = unicodedata.normalize("NFKC", str(s))
+    return t.replace(" ", "").replace("\u3000", "").replace("\t", "").strip()
+
+def _dept_tokens(s) -> set:
+    """'1課4課（熊谷・大宮） / 2課' → {'1課','4課','2課'}"""
+    return set(re.findall(r"\d+課", _norm_dept(s)))
+
+def _dept_match(row_dept, chosen_dept) -> bool:
+    """マスタ行の課表記が、選択された課に該当するか判定"""
+    rk, ck = _norm_dept(row_dept), _norm_dept(chosen_dept)
+    if not rk or not ck:
+        return False
+    if rk == ck:
+        return True
+    rt, ct = _dept_tokens(rk), _dept_tokens(ck)
+    if rt and ct:
+        return bool(rt & ct)          # 課番号が1つでも共通すれば該当
+    if not rt and not ct:
+        return rk in ck or ck in rk   # 「加工食品」等、課番号を持たない課
+    return False
+
+def get_items_for_department(df_master, dept):
+    """選択された課に該当する商品（商品番号・商品名）のみを返す"""
+    if df_master is None or df_master.empty or not dept:
+        return pd.DataFrame(columns=MASTER_COLS)
+    mask = df_master["department"].apply(lambda d: _dept_match(d, dept))
+    return df_master[mask].reset_index(drop=True)
+
+def _file_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+def _read_category_txt(path: str) -> pd.DataFrame:
+    """category_master.txt（課|カテゴリーコード|カテゴリー名|商品コード|商品名）を読み込む"""
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=MASTER_COLS)
+    raw = None
+    for enc in ("utf-8-sig", "utf-8", "cp932"):
         try:
-            df_master = pd.read_csv(MASTER_CSV_FILE, dtype=str)
+            with open(path, "r", encoding=enc) as f:
+                raw = f.read()
+            break
         except Exception:
-            df_master = pd.DataFrame(columns=["category_code", "category_name", "department", "item_code", "item_name"])
-    else:
-        df_master = pd.DataFrame([
+            continue
+    if raw is None:
+        return pd.DataFrame(columns=MASTER_COLS)
+
+    rows = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        s = s.replace("｜", "|")
+        sep = "|" if "|" in s else ("\t" if "\t" in s else ",")
+        cols = [c.strip() for c in s.split(sep)]
+        if len(cols) < 5:
+            continue
+        dept, ccode, cname, icode, iname = cols[:5]
+        if not iname or icode in ("商品コード", "item_code"):
+            continue
+        rows.append({
+            "category_code": ccode, "category_name": cname, "department": dept,
+            "item_code": icode, "item_name": iname
+        })
+    return pd.DataFrame(rows, columns=MASTER_COLS)
+
+@st.cache_data(ttl=3600)
+def load_item_master_cached(csv_mtime: float = 0.0, txt_mtime: float = 0.0):
+    frames = []
+    if os.path.exists(MASTER_CSV_FILE):
+        for enc in ("utf-8-sig", "utf-8", "cp932"):
+            try:
+                frames.append(pd.read_csv(MASTER_CSV_FILE, dtype=str, encoding=enc))
+                break
+            except Exception:
+                continue
+    txt_df = _read_category_txt(CATEGORY_TXT_FILE)
+    if not txt_df.empty:
+        frames.append(txt_df)
+
+    if not frames:
+        frames.append(pd.DataFrame([
             {"category_code": "01", "category_name": "果菜類", "department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "319", "item_name": "トマト"},
             {"category_code": "01", "category_name": "果菜類", "department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "320", "item_name": "ミニトマト"},
             {"category_code": "02", "category_name": "葉茎菜類", "department": "3課（照井） / 11課（相澤 史）", "item_code": "201", "item_name": "キャベツ"},
             {"category_code": "02", "category_name": "葉茎菜類", "department": "3課（照井） / 11課（相澤 史）", "item_code": "205", "item_name": "レタス"},
             {"category_code": "03", "category_name": "根菜類", "department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "101", "item_name": "大根"},
             {"category_code": "03", "category_name": "根菜類", "department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "11", "item_name": "かぶ"}
-        ])
-    departments = [
-        "1課4課（熊谷・大宮） / 2課 / 栗原",
-        "3課（照井） / 11課（相澤 史）",
-        "5課 / 6課（川越）",
-        "7課（促成野菜・ハーブ）",
-        "8課（果実・柑橘・高級フルーツ）",
-        "加工食品 / 仙都食苑"
-    ]
+        ]))
+
+    df_master = pd.concat(frames, ignore_index=True, sort=False)
+    for col in MASTER_COLS:
+        if col not in df_master.columns:
+            df_master[col] = ""
+    df_master = df_master[MASTER_COLS].fillna("").astype(str)
+    for col in MASTER_COLS:
+        df_master[col] = df_master[col].str.strip()
+    df_master = df_master[df_master["item_name"] != ""].copy()
+
+    # 同一(課・商品コード・商品名)の重複を除去
+    dedup_key = df_master["department"].map(_norm_dept) + "|" + df_master["item_code"] + "|" + df_master["item_name"]
+    df_master = df_master[~dedup_key.duplicated()].reset_index(drop=True)
+
+    # 課リスト: 基本6課 + マスタにだけ存在する課（基本課に該当しないもの）
+    departments = list(BASE_DEPT_LIST)
+    for d in df_master["department"].unique().tolist():
+        if d and not any(_dept_match(d, b) for b in BASE_DEPT_LIST) and d not in departments:
+            departments.append(d)
     return df_master, departments
 
-df_master_raw, DEPT_LIST = load_item_master_cached()
+df_master_raw, DEPT_LIST = load_item_master_cached(_file_mtime(MASTER_CSV_FILE), _file_mtime(CATEGORY_TXT_FILE))
 
 # ==========================================
 # 8. セッション状態の初期化
@@ -608,6 +675,7 @@ if "last_input_date" not in st.session_state:
 
 # ==========================================
 # 9.0 Pure-Python Excel (.xlsx / XML Spreadsheet) パーサー
+# (openpyxl, xlrd がインストールされていない環境でも 100% 確実に解読)
 # ==========================================
 def _col_str_to_idx(col_str: str) -> int:
     idx = 0
@@ -617,6 +685,7 @@ def _col_str_to_idx(col_str: str) -> int:
     return max(0, idx - 1)
 
 def parse_xlsx_pure_python(content_bytes: bytes) -> pd.DataFrame:
+    """Python標準の zipfile と xml.etree.ElementTree のみを用いて .xlsx を展開・解析"""
     try:
         with zipfile.ZipFile(io.BytesIO(content_bytes)) as z:
             shared_strings = []
@@ -685,6 +754,7 @@ def parse_xlsx_pure_python(content_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame()
 
 def parse_xml_spreadsheet_2003(content_bytes: bytes) -> pd.DataFrame:
+    """古いExcelや会計ソフトが出力する XML Spreadsheet 2003 形式 (.xls) をパース"""
     try:
         text_content = content_bytes.decode('utf-8', errors='ignore')
         if "<Workbook" in text_content and "<Table>" in text_content:
@@ -737,6 +807,7 @@ def parse_trade_file(uploaded_file):
                 excel_error_details.append(f"{eng}: {str(e)}")
                 continue
 
+        # openpyxl/xlrd が使えない場合、Pure-Python パーサーを即座に発動
         if df_raw is None or df_raw.empty:
             if fname.endswith(".xlsx") or content_bytes[:4] == b"PK\x03\x04":
                 try:
@@ -746,11 +817,13 @@ def parse_trade_file(uploaded_file):
                 except Exception as e_pure:
                     excel_error_details.append(f"pure_xlsx: {str(e_pure)}")
 
+        # XML Spreadsheet 2003 形式の読み込み試行
         if df_raw is None or df_raw.empty:
             df_xml = parse_xml_spreadsheet_2003(content_bytes)
             if not df_xml.empty:
                 df_raw = df_xml
 
+        # HTML表形式 (.xlsとして保存されたデータ) の読み込み試行
         if df_raw is None or df_raw.empty:
             try:
                 tables = pd.read_html(io.BytesIO(content_bytes))
@@ -759,6 +832,7 @@ def parse_trade_file(uploaded_file):
             except Exception as e_html:
                 excel_error_details.append(f"html: {str(e_html)}")
 
+        # CSV/TSV形式で拡張子だけ.xls/.xlsxになっているデータの読み込み試行
         if df_raw is None or df_raw.empty:
             for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
                 try:
@@ -862,33 +936,121 @@ def parse_trade_file(uploaded_file):
     return df_result, extracted
 
 # ==========================================
-# 9.5 生成AI (Gemini 2.5 Flash & スマート青果アナライザー) エンジン
+# 9.5 生成AI (Gemini 4 Argon & スマート青果アナライザー) エンジン
 # ==========================================
-def call_gemini_ai(prompt: str, system_instruction: str = "", custom_api_key: str = None) -> str:
-    key = custom_api_key or os.environ.get("GEMINI_API_KEY") or get_secret("GEMINI_API_KEY", "")
-    if key and key.strip():
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key.strip()}"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048}
-            }
-            if system_instruction:
-                payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts:
-                        return parts[0].get("text", "")
-            else:
-                return f"⚠️ Gemini API呼び出しエラー: {resp.text[:200]}"
-        except Exception as e:
-            return f"⚠️ Gemini API通信エラー: {e}"
+# ---- Gemini 設定（st.secrets / 環境変数で上書き可能）----
+AI_MODEL_PRIMARY = get_secret("GEMINI_MODEL", "gemini-4-argon").strip() or "gemini-4-argon"
+AI_MODEL_FALLBACKS = [m.strip() for m in get_secret("GEMINI_FALLBACK_MODELS", "gemini-3.8-flash").split(",") if m.strip()]
+AI_THINKING_LEVEL = get_secret("GEMINI_THINKING_LEVEL", "medium").strip().lower()
+if AI_THINKING_LEVEL not in ("low", "medium", "high"):
+    AI_THINKING_LEVEL = "medium"
+AI_MAX_OUTPUT_TOKENS = 16384          # 思考トークンを含む出力上限
+AI_NON_STREAM_TOKEN_CAP = 32768       # 非ストリーミング1リクエストの上限
+AI_REQUEST_TIMEOUT = (10, 1200)       # (接続, 読み取り) 秒。公式推奨の20分以上
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+def _resolve_gemini_key(custom_api_key: str = None) -> str:
+    """画面で入力したキー → 環境変数 → st.secrets の順で採用"""
+    key = (
+        custom_api_key
+        or st.session_state.get("custom_gemini_api_key")
+        or os.environ.get("GEMINI_API_KEY")
+        or get_secret("GEMINI_API_KEY", "")
+        or ""
+    )
+    return str(key).strip()
+
+def _gemini_request(model: str, key: str, prompt: str, system_instruction: str, thinking_level, max_tokens: int):
+    url = f"{GEMINI_API_BASE}/{model}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+    gen_cfg = {"maxOutputTokens": int(max_tokens)}
+    if thinking_level:
+        gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_level}
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": gen_cfg,
+    }
+    if system_instruction:
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+    return requests.post(url, headers=headers, json=payload, timeout=AI_REQUEST_TIMEOUT)
+
+def _extract_gemini_text(data: dict):
+    """(本文, finishReason, blockReason) を返す。思考(thought)パートは本文に含めない"""
+    block = (data.get("promptFeedback") or {}).get("blockReason", "")
+    cands = data.get("candidates") or []
+    if not cands:
+        return "", "", block
+    cand = cands[0] or {}
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if p.get("text") and not p.get("thought"))
+    return text.strip(), cand.get("finishReason", ""), block
+
+def call_gemini_ai(prompt: str, system_instruction: str = "", custom_api_key: str = None, thinking_level: str = None):
+    """
+    最新モデル(Gemini 4 Argon)で回答を生成。成功時は本文(str)、キー未設定または全モデル失敗時は None を返す。
+    None の場合、呼び出し側が内蔵スマートAIアナライザーへ切り替える。失敗理由は ai_last_error に保存。
+    """
+    key = _resolve_gemini_key(custom_api_key)
+    if not key:
+        return None
+
+    level = thinking_level or st.session_state.get("ai_thinking_level") or AI_THINKING_LEVEL
+    if level not in ("low", "medium", "high"):
+        level = "medium"
+
+    models = [AI_MODEL_PRIMARY] + [m for m in AI_MODEL_FALLBACKS if m != AI_MODEL_PRIMARY]
+    errors = []
+
+    for model in models:
+        use_level = level
+        max_tokens = AI_MAX_OUTPUT_TOKENS
+        retried_transient = False
+        for _attempt in range(4):
+            try:
+                resp = _gemini_request(model, key, prompt, system_instruction, use_level, max_tokens)
+            except requests.RequestException as e:
+                errors.append(f"{model}: 通信エラー ({type(e).__name__})")
+                break
+
+            status = resp.status_code
+            if status == 200:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    errors.append(f"{model}: 応答の解析に失敗")
+                    break
+                text, finish, block = _extract_gemini_text(data)
+                if text:
+                    st.session_state["ai_last_model"] = model
+                    st.session_state.pop("ai_last_error", None)
+                    return text
+                # 思考だけで上限に達した場合: 思考を浅くして上限を広げ再試行
+                if finish == "MAX_TOKENS" and max_tokens < AI_NON_STREAM_TOKEN_CAP:
+                    use_level = "low"
+                    max_tokens = AI_NON_STREAM_TOKEN_CAP
+                    continue
+                detail = f"finishReason={finish or '不明'}" + (f", blockReason={block}" if block else "")
+                errors.append(f"{model}: 空の応答 ({detail})")
+                break
+
+            # thinkingConfig 非対応モデル → 指定を外して再試行
+            if status == 400 and use_level and "thinking" in resp.text.lower():
+                use_level = None
+                continue
+            # 一時的な混雑・障害 → 1回だけ待って再試行
+            if status in (429, 500, 502, 503, 504) and not retried_transient:
+                retried_transient = True
+                time.sleep(2)
+                continue
+
+            errors.append(f"{model}: HTTP {status} {resp.text[:160]}")
+            break
+        else:
+            errors.append(f"{model}: 再試行上限に到達")
+
+    st.session_state["ai_last_error"] = " / ".join(errors) if errors else "不明なエラー"
     return None
+
 
 def generate_produce_ai_insights(df: pd.DataFrame, custom_prompt: str = "") -> str:
     if df is None or df.empty:
@@ -1041,6 +1203,7 @@ with st.sidebar:
     with col_btn1:
         if st.button("🔄 最新更新", use_container_width=True):
             invalidate_records_cache()
+            load_item_master_cached.clear()
             st.rerun()
     with col_btn2:
         if st.button("ログアウト", use_container_width=True):
@@ -1076,36 +1239,11 @@ with st.sidebar:
                     else:
                         st.warning("IDとパスワードを入力してください")
 
-    st.divider()
-    with st.expander("☁️ クラウドDB接続", expanded=False):
-        st.caption("PostgreSQL / Supabase の接続URL (排他制御・同時書き込み対応)")
-        current_env_db = get_secret("DATABASE_URL")
-        new_db_url = st.text_input(
-            "DATABASE_URL", 
-            value=st.session_state.get("custom_database_url", current_env_db),
-            placeholder="postgresql://postgres:[PW]@db.xxxx.supabase.co:5432/postgres",
-            type="password"
-        )
-        col_db1, col_db2 = st.columns(2)
-        with col_db1:
-            if st.button("クラウド接続", type="primary", use_container_width=True):
-                if new_db_url.strip():
-                    st.session_state.custom_database_url = new_db_url.strip()
-                    invalidate_records_cache()
-                    st.success("☁️ 接続完了！")
-                    st.rerun()
-        with col_db2:
-            if st.button("ローカルDB", use_container_width=True):
-                st.session_state.custom_database_url = ""
-                invalidate_records_cache()
-                st.info("📁 ローカルDB切替")
-                st.rerun()
-
 # ヘッダー描画
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 取引・在庫管理 Pro</h1>
-        <p>エクセル自動照合・不一致一括修正 ＆ 生成AI（Gemini 2.5 Flash / スマート青果アナライザー）搭載</p>
+        <p>エクセル自動照合・不一致一括修正 ＆ 生成AI（Gemini 4 Argon / スマート青果アナライザー）搭載</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -1121,7 +1259,7 @@ tab_titles = [
     "📝 取引データ入力・管理", 
     "📊 データ分析", 
     "🤖 生成AIアナリティクス & アシスタント",
-    "👥 社員別データ監視 (管理者)" if current_role == "admin" else "👤 担当データ状況 & アカウント変更",
+    "👥 社員別データ監視 (管理者)" if current_role == "admin" else "👤 担当データ状況",
     "🛡️ BCP自動バックアップ・復旧",
     "📥 取引データ一括インポート (Excel / CSV)"
 ]
@@ -1166,7 +1304,7 @@ with tabs[0]:
         with col_up_box1:
             uploaded_entry_file = st.file_uploader(
                 "取引エクセルまたはCSVファイルをここへドラッグ＆ドロップ",
-                type=["xlsx", "xls", "csv", "txt", "tsv"],
+                type=["xlsx", "xls", "csv", "tsv", "txt"],
                 key="auto_record_file_uploader_tab0",
                 help="どのパソコンのエクセルファイルでも自動解析され、即座に下の記録一覧へ正確に反映されます。"
             )
@@ -1382,7 +1520,7 @@ with tabs[0]:
     st.write("")
     st.markdown("""
         <div style="background-color: #f0fdf4; border: 1.5px solid #86efac; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px;">
-            <b style="color: #166534;">⚡ B. 手動連続入力フォーム（「○課」選択で該当商品と商品番号が自動反映・バリデーション保護）:</b>
+            <b style="color: #166534;">⚡ B. 手動連続入力フォーム（「○課」選択で該当商品と商品番号が自動反映）:</b>
             <span style="color: #4b5563; font-size: 13px;">
                 カテゴリーで課を選ぶと、該当課に属する社内公式商品コードと品名が自動で反映され、瞬時に記録できます。
             </span>
@@ -1411,6 +1549,37 @@ with tabs[0]:
         st.write("")
         st.caption("※ 上のエクセルから自動抽出された取引先をワンクリックで反映できます。")
 
+    # ---- 課の選択（フォームの外に配置：選んだ瞬間に該当商品・商品番号が再描画される）----
+    sel_col1, sel_col2 = st.columns([2.4, 3.6])
+    with sel_col1:
+        chosen_dept = st.selectbox(
+            "🏢 カテゴリー（○課を選択）:",
+            options=DEPT_LIST,
+            index=0,
+            key="chosen_dept_batch_selector"
+        )
+    dept_master_items = get_items_for_department(df_master_raw, chosen_dept)
+    candidate_item_options = [f"[{r['item_code']}] {r['item_name']}" for _, r in dept_master_items.iterrows()]
+    dept_widget_key = hashlib.md5(chosen_dept.encode("utf-8")).hexdigest()[:8]
+    with sel_col2:
+        st.write("")
+        if candidate_item_options:
+            st.success(f"✅ 「{chosen_dept}」の商品 {len(candidate_item_options)} 件と商品番号を自動反映しました。")
+        else:
+            st.warning(f"⚠️ 「{chosen_dept}」に登録された商品がありません。category_master.txt または item_master.csv に追加するか、下の欄へ品名・コードを直接入力してください。")
+
+    if candidate_item_options:
+        with st.expander(f"📋 {chosen_dept} の該当商品と商品番号（{len(candidate_item_options)} 件）", expanded=True):
+            dept_view_df = dept_master_items.rename(columns={
+                "item_code": "商品番号", "item_name": "商品名", "category_name": "分類"
+            })[["商品番号", "商品名", "分類"]]
+            st.dataframe(
+                dept_view_df,
+                use_container_width=True,
+                hide_index=True,
+                height=min(38 * (len(dept_view_df) + 1), 260)
+            )
+
     with st.form("fast_batch_entry_form", clear_on_submit=True):
         col_hdr1, col_hdr2, col_hdr3 = st.columns([1.2, 2, 2])
         
@@ -1424,24 +1593,19 @@ with tabs[0]:
             batch_market_no = st.text_input("🏢 市場番号 / 取引先名", value=default_market_val)
             
         with col_hdr3:
-            # カテゴリーの選択箇所を「○課」として選択
-            chosen_dept = st.selectbox(
-                "🏢 カテゴリー（○課を選択）:",
-                options=DEPT_LIST,
-                index=0,
-                key="chosen_dept_batch_selector"
+            # 課の選択はフォーム外（上）で行う。ここでは選択中の課を表示
+            st.text_input(
+                "🏢 カテゴリー（選択中の課）",
+                value=chosen_dept,
+                disabled=True,
+                key=f"f_dept_view_{dept_widget_key}"
             )
 
         st.caption("▼ 選択された課に該当する商品と商品コードが自動反映されます。数量・単価を入力して登録してください。")
 
-        # 選択された課に該当する商品を抽出
-        dept_master_items = df_master_raw[df_master_raw["department"] == chosen_dept]
-        if not dept_master_items.empty:
-            candidate_item_options = [
-                f"[{r['item_code']}] {r['item_name']}" for _, r in dept_master_items.iterrows()
-            ]
-        else:
-            candidate_item_options = [f"[{r['item_code']}] {r['item_name']}" for _, r in df_master_raw.iterrows()]
+        # 選択された課に該当する商品は、フォームの外（上）で抽出済み (candidate_item_options)
+        if not candidate_item_options:
+            st.caption("⚠️ この課には登録商品がないため、品名・コードは手入力してください（例: [319] トマト ／ 品名のみでも可）。")
 
         row_inputs = []
         for i in range(5):
@@ -1449,14 +1613,24 @@ with tabs[0]:
             with c0:
                 is_active = st.checkbox("有効", value=(i == 0), key=f"f_act_{i}")
             with c1:
-                default_item_idx = min(i, len(candidate_item_options) - 1)
-                selected_item_str = st.selectbox(
-                    f"品名・コード ({i+1}行目)",
-                    candidate_item_options,
-                    index=default_item_idx,
-                    key=f"f_item_{i}",
-                    label_visibility="collapsed" if i > 0 else "visible"
-                )
+                if candidate_item_options:
+                    # 課を変えると、1〜5行目に該当課の商品が先頭から順に自動セットされる
+                    default_item_idx = min(i, len(candidate_item_options) - 1)
+                    selected_item_str = st.selectbox(
+                        f"品名・コード ({i+1}行目)",
+                        candidate_item_options,
+                        index=default_item_idx,
+                        key=f"f_item_{dept_widget_key}_{i}",
+                        label_visibility="collapsed" if i > 0 else "visible"
+                    )
+                else:
+                    selected_item_str = st.text_input(
+                        f"品名・コード ({i+1}行目)",
+                        value="",
+                        placeholder="例: [319] トマト",
+                        key=f"f_item_free_{dept_widget_key}_{i}",
+                        label_visibility="collapsed" if i > 0 else "visible"
+                    ).strip() or "品名未指定"
             with c2:
                 in_price = st.number_input(
                     f"単価 ({i+1})",
@@ -1627,13 +1801,17 @@ with tabs[1]:
 # タブ 3: 生成AIアナリティクス & アシスタント
 # ==========================================
 with tabs[2]:
-    st.markdown('<div class="section-title">🤖 生成AI青果アナリティクス & 経営アシスタント (Gemini 2.5 Flash 連携)</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">🤖 生成AI青果アナリティクス & 経営アシスタント ({AI_MODEL_PRIMARY} 連携)</div>', unsafe_allow_html=True)
     
     has_api_key = bool(os.environ.get("GEMINI_API_KEY") or get_secret("GEMINI_API_KEY", "") or st.session_state.get("custom_gemini_api_key", ""))
     col_ai_stat1, col_ai_stat2 = st.columns([3, 1.5])
     with col_ai_stat1:
         if has_api_key:
-            st.success("🟢 **Google Gemini 2.5 Flash API 連携中**: 超高速・高精度な生成AIモデルによる市場分析が有効です。")
+            _used_model = st.session_state.get("ai_last_model")
+            _used_label = f"（直近の応答モデル: {_used_model}）" if _used_model else ""
+            st.success(f"🟢 **Google {AI_MODEL_PRIMARY} 連携中**: Google最上位クラスの生成AIによる高精度な市場分析が有効です。{_used_label}")
+            if st.session_state.get("ai_last_error"):
+                st.warning("⚠️ 直近のAI呼び出しに失敗したため、内蔵アナライザーで代替しました: " + str(st.session_state["ai_last_error"]))
         else:
             st.info("💡 **内蔵スマート青果AIアナライザー (高速ローカル推論モード)**: APIキー不要で、即座に本格的な青果取引診断レポートを作成できます。")
     with col_ai_stat2:
@@ -1642,11 +1820,20 @@ with tabs[2]:
                 "Google AI Studio API Key",
                 value=st.session_state.get("custom_gemini_api_key", ""),
                 type="password",
-                help="Google AI Studioで取得したAPIキーを入力すると、Gemini 2.5 Flashが直接回答します。"
+                help=f"Google AI Studioで取得したAPIキーを入力すると、{AI_MODEL_PRIMARY}が直接回答します（{AI_MODEL_PRIMARY}は有料プランのキーが必要です）。"
+            )
+            _level_opts = ["low", "medium", "high"]
+            _cur_level = st.session_state.get("ai_thinking_level", AI_THINKING_LEVEL)
+            new_level = st.selectbox(
+                "思考レベル (高いほど高精度・低速)",
+                _level_opts,
+                index=_level_opts.index(_cur_level) if _cur_level in _level_opts else 1,
+                key="ai_thinking_level_selector"
             )
             if st.button("設定を保存", key="save_gemini_key_btn", type="primary"):
                 st.session_state.custom_gemini_api_key = new_key.strip()
-                st.toast("✅ Gemini APIキーを更新しました！")
+                st.session_state.ai_thinking_level = new_level
+                st.toast("✅ Gemini設定を更新しました！")
                 st.rerun()
 
     st.write("")
@@ -1695,7 +1882,7 @@ with tabs[2]:
                     st.markdown(f"**AIの回答:**\n{ans}")
 
 # ==========================================
-# タブ 4: 社員別データ監視・確認センター（管理者専用） & アカウントID/PW変更
+# タブ 4: 社員別データ監視・確認センター（管理者専用）
 # ==========================================
 with tabs[3]:
     if current_role == "admin":
@@ -1715,57 +1902,13 @@ with tabs[3]:
             s4.metric("全社総売上", f"¥ {df_summary['総売上金額'].sum():,}")
 
             st.dataframe(df_summary, use_container_width=True)
-            
-            st.divider()
-            st.subheader("🔍 社員を指定して登録データを明細確認")
-            picked_staff = st.selectbox(
-                "明細を確認する社員を選択",
-                options=df_summary["社員ID"].tolist(),
-                format_func=lambda uid: f"{uid} ({users_name_map.get(uid, uid)})"
-            )
-            df_staff_detail = load_records_from_db(picked_staff)
-            if not df_staff_detail.empty:
-                st.caption(f"『{picked_staff}』が入力した全 {len(df_staff_detail)} 件の取引データ明細:")
-                st.dataframe(df_staff_detail, use_container_width=True)
-            else:
-                st.info(f"{picked_staff} の登録データはまだありません。")
     else:
-        st.markdown(f'<div class="section-title">👤 担当データ状況 & アカウント設定（ID・パスワード変更）</div>', unsafe_allow_html=True)
-        st.info(f"ログイン中のアカウント: **{current_user}** （一般社員）\n\nあなたのアカウントで入力したデータは安全に個別に保存されています。")
-        
-        with st.expander("⚙️ アカウント設定・ユーザーID/パスワードの変更", expanded=True):
-            with st.form("update_my_credentials_form"):
-                db_users_list = get_all_users_from_db()
-                curr_user_rec = next((u for u in db_users_list if u["username"] == current_user), {"name": current_user})
-                
-                new_id_input = st.text_input("ユーザーID (変更可能)", value=current_user)
-                new_name_input = st.text_input("社員氏名 / 担当", value=curr_user_rec.get("name", current_user))
-                new_pw_input = st.text_input("新しいパスワード (変更する場合のみ入力)", type="password", placeholder="••••••••")
-                confirm_pw_input = st.text_input("新しいパスワード (確認)", type="password", placeholder="••••••••")
-                
-                submit_update_cred = st.form_submit_button("💾 アカウント情報を更新する", type="primary", use_container_width=True)
-                if submit_update_cred:
-                    if not new_id_input.strip():
-                        st.warning("ユーザーIDを入力してください。")
-                    elif new_pw_input and new_pw_input != confirm_pw_input:
-                        st.error("新しいパスワードが一致しません。")
-                    else:
-                        try:
-                            update_user_credentials(current_user, new_id_input.strip(), new_pw_input, new_name_input.strip())
-                            st.session_state.logged_in_user = new_id_input.strip()
-                            token = create_session_token(new_id_input.strip(), current_role)
-                            st.query_params["auth_token"] = token
-                            st.success("✅ アカウント情報（ID・パスワード）を更新しました！")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"更新失敗: {e}")
-
+        st.markdown(f'<div class="section-title">👤 アカウント情報 & あなたの入力状況</div>', unsafe_allow_html=True)
+        st.info(f"ログイン中のアカウント: **{current_user}** （一般社員）")
         my_records = load_records_from_db(current_user)
         if not my_records.empty:
             st.metric("あなたが登録した総件数", f"{len(my_records)} 件")
             st.dataframe(my_records, use_container_width=True)
-        else:
-            st.caption("まだ登録されたデータはありません。タブ1から商品を入力してください。")
 
 # ==========================================
 # タブ 5: BCP自動バックアップ・復旧
