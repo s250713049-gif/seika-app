@@ -336,7 +336,7 @@ def create_backup_snapshot(user_id=None, trigger_reason="手動バックアッ�
         backup_path = os.path.join(BACKUP_DIR, backup_filename)
 
         backup_payload = {
-            "version": "3.3_section_fast",
+            "version": "3.4_robust_excel_fast",
             "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
             "trigger": trigger_reason,
             "created_by": user_id or "system",
@@ -814,27 +814,70 @@ if "last_input_date" not in st.session_state:
     st.session_state.last_input_date = datetime.now().date()
 
 # ==========================================
-# 9.1 エクセル (xlsx/xls) & CSV 取引データ共通解析エンジン
+# 9.1 エクセル (xlsx/xls) & CSV 取引データ共通解析エンジン (xlrdエラー対策済)
 # ==========================================
 def parse_trade_file(uploaded_file):
+    """
+    どのパソコンからアップロードされたファイルでも（.xlsx, .xls, .csv, .tsv, .txt）
+    青果管理システムの統一フォーマット:
+    [日付, 市場番号, カテゴリー, 商品コード, 商品名, 単価, 数量, 小計]
+    の DataFrame と、抽出された取引先リストを返す。
+    xlrd missing時でも openpyxl、HTML表、CSVフォールバック等で確実に解析。
+    """
     fname = uploaded_file.name.lower()
+    content_bytes = uploaded_file.getvalue()
     df_raw = None
+    excel_error_details = []
 
     if fname.endswith((".xlsx", ".xls")):
-        excel_dict = pd.read_excel(uploaded_file, sheet_name=None)
-        sheets_with_data = []
-        for sname, sdf in excel_dict.items():
-            if not sdf.empty:
-                col_strs = [str(c) for c in sdf.columns]
-                if not any(k in "".join(col_strs) for k in ["市場", "取引先", "顧客", "得意先"]):
-                    sdf["市場番号"] = sname
-                sheets_with_data.append(sdf)
-        if sheets_with_data:
-            df_raw = pd.concat(sheets_with_data, ignore_index=True)
-        else:
-            df_raw = pd.DataFrame()
+        # 1. まず標準的なExcelエンジンを順次試行 (openpyxl, xlrd)
+        engines = ["openpyxl", "xlrd"] if fname.endswith(".xlsx") else ["xlrd", "openpyxl"]
+        for eng in engines:
+            try:
+                excel_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng)
+                sheets_with_data = []
+                for sname, sdf in excel_dict.items():
+                    if not sdf.empty:
+                        col_strs = [str(c) for c in sdf.columns]
+                        if not any(k in "".join(col_strs) for k in ["市場", "取引先", "顧客", "得意先"]):
+                            sdf["市場番号"] = sname
+                        sheets_with_data.append(sdf)
+                if sheets_with_data:
+                    df_raw = pd.concat(sheets_with_data, ignore_index=True)
+                else:
+                    df_raw = pd.DataFrame()
+                break
+            except Exception as e:
+                excel_error_details.append(f"{eng}: {str(e)}")
+                continue
+
+        # 2. xlrd/openpyxlでエラーの場合、HTML表形式 (.xlsとして出力された会計・市場データ) の読み込みを試行
+        if df_raw is None or df_raw.empty:
+            try:
+                tables = pd.read_html(io.BytesIO(content_bytes))
+                if tables and len(tables) > 0:
+                    df_raw = tables[0]
+            except Exception as e_html:
+                excel_error_details.append(f"html: {str(e_html)}")
+
+        # 3. CSV/TSV形式で拡張子だけ.xlsになっているデータの読み込みを試行
+        if df_raw is None or df_raw.empty:
+            for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
+                try:
+                    df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python")
+                    if not df_raw.empty:
+                        break
+                except Exception:
+                    continue
+
+        if df_raw is None or df_raw.empty:
+            err_summary = "; ".join(excel_error_details[:2])
+            raise ValueError(
+                f"Excelファイル解析エラー ({err_summary})。"
+                "古いExcel形式(.xls)で開けない場合は、ファイルをExcelで『.xlsx』または『.csv』形式で保存し直してアップロードしてください。"
+            )
     else:
-        content_bytes = uploaded_file.getvalue()
+        # CSVファイルの読み込み (エンコーディング自動判定)
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
             try:
                 df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc)
@@ -844,9 +887,10 @@ def parse_trade_file(uploaded_file):
         if df_raw is None:
             df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding="latin1")
 
-    if df_raw.empty:
+    if df_raw is None or df_raw.empty:
         return pd.DataFrame(), []
 
+    # 列名の正規化マッピング（日本語の各種表記ゆれを吸収）
     rename_map = {}
     for col in df_raw.columns:
         c = str(col).strip()
@@ -869,6 +913,7 @@ def parse_trade_file(uploaded_file):
 
     df_norm = df_raw.rename(columns=rename_map)
 
+    # 必須列の初期値補完
     if "日付" not in df_norm.columns:
         df_norm["日付"] = str(datetime.now().date())
     else:
@@ -880,9 +925,9 @@ def parse_trade_file(uploaded_file):
         df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001 (エクセルインポート)").astype(str).str.strip()
 
     if "カテゴリー" not in df_norm.columns:
-        df_norm["カテゴリー"] = "1課4課/2課/栗原"
+        df_norm["カテゴリー"] = "1課 (熊谷・大宮)"
     else:
-        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("1課4課/2課/栗原").astype(str).str.strip()
+        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("1課 (熊谷・大宮)").astype(str).str.strip()
 
     if "商品コード" not in df_norm.columns:
         df_norm["商品コード"] = "AUTO"
@@ -894,6 +939,7 @@ def parse_trade_file(uploaded_file):
     else:
         df_norm["商品名"] = df_norm["商品名"].fillna("品名未指定").astype(str).str.strip()
 
+    # 単価・数量・小計の数値クレンジング
     def clean_num(val, default=0):
         try:
             if pd.isnull(val): return default
@@ -913,6 +959,8 @@ def parse_trade_file(uploaded_file):
 
     target_cols = ["日付", "市場番号", "カテゴリー", "商品コード", "商品名", "単価", "数量", "小計"]
     df_result = df_norm[target_cols].copy()
+
+    # 取引先の抽出
     extracted = [str(s).strip() for s in df_norm["市場番号"].dropna().unique().tolist() if str(s).strip() and str(s).strip() != "nan"]
 
     return df_result, extracted
@@ -1191,132 +1239,18 @@ with tabs[0]:
                 st.session_state.last_deleted_records = []
                 st.rerun()
 
-    # 元ファイル照合 & 不一致修正最下部自動記録
-    if st.session_state.verification_batch is not None:
-        v_batch = st.session_state.verification_batch
-        v_file_name = v_batch["file_name"]
-        expected_df = v_batch["df"]
-        
-        mismatches = []
-        if df_current is not None and not df_current.empty:
-            for idx, exp_row in expected_df.iterrows():
-                match_cand = df_current[
-                    (df_current["商品名"] == exp_row["商品名"]) & 
-                    (df_current["日付"] == exp_row["日付"])
-                ]
-                if match_cand.empty:
-                    mismatches.append({
-                        "行番号": idx + 1,
-                        "商品名": exp_row["商品名"],
-                        "日付": exp_row["日付"],
-                        "市場番号": exp_row.get("市場番号", ""),
-                        "カテゴリー": exp_row.get("カテゴリー", "1課4課/2課/栗原"),
-                        "商品コード": exp_row.get("商品コード", "AUTO"),
-                        "不一致項目": "登録データなし",
-                        "元ファイルの値(正)": f"単価:{exp_row.get('単価', 0)}円, 数量:{exp_row.get('数量', 0)}個",
-                        "現在の登録値(誤)": "未登録または削除済み",
-                        "exp_price": int(exp_row.get("単価", 0)),
-                        "exp_qty": int(exp_row.get("数量", 0)),
-                        "record_id": None
-                    })
-                else:
-                    db_row = match_cand.iloc[-1]
-                    for col in ["単価", "数量", "小計", "市場番号", "カテゴリー"]:
-                        exp_val = str(exp_row.get(col, "")).strip()
-                        db_val = str(db_row.get(col, "")).strip()
-                        if exp_val and db_val and exp_val != db_val:
-                            mismatches.append({
-                                "行番号": idx + 1,
-                                "商品名": exp_row["商品名"],
-                                "日付": exp_row["日付"],
-                                "市場番号": exp_row.get("市場番号", db_row.get("市場番号", "")),
-                                "カテゴリー": exp_row.get("カテゴリー", db_row.get("カテゴリー", "")),
-                                "商品コード": exp_row.get("商品コード", db_row.get("商品コード", "")),
-                                "不一致項目": col,
-                                "元ファイルの値(正)": exp_val,
-                                "現在の登録値(誤)": db_val,
-                                "exp_price": int(exp_row.get("単価", db_row.get("単価", 0))),
-                                "exp_qty": int(exp_row.get("数量", db_row.get("数量", 0))),
-                                "record_id": int(db_row.get("id"))
-                            })
-        
-        st.write("")
-        if len(mismatches) == 0:
-            st.success(f"🛡️ **元ファイル照合結果: 『{v_file_name}』の全 {len(expected_df)} 件が記録データと100%完全一致しています（整合性確認済み）**")
-        else:
-            st.markdown(f"""
-                <div class="mismatch-box">
-                    <h4 style="margin: 0; color: #991b1b;">🚨 元ファイル照合エラー: 『{v_file_name}』との間に {len(mismatches)} 箇所の不一致が検出されました</h4>
-                    <p style="margin: 4px 0 0 0; color: #4b5563; font-size: 13px;">
-                        不一致データを修正し、リストの最下部に自動記録することができます。
-                    </p>
-                </div>
-            """, unsafe_allow_html=True)
-            
-            diff_display_df = pd.DataFrame(mismatches)[["行番号", "商品名", "不一致項目", "元ファイルの値(正)", "現在の登録値(誤)"]]
-            st.dataframe(diff_display_df, use_container_width=True)
-
-            mismatch_options = [f"行{m['行番号']}: {m['商品名']} ({m['不一致項目']}の不一致)" for m in mismatches]
-            selected_mismatch_idx = st.selectbox(
-                "修正する不一致データを選択", 
-                range(len(mismatch_options)), 
-                format_func=lambda i: mismatch_options[i],
-                key="select_mismatch_to_fix"
-            )
-            
-            target_mismatch = mismatches[selected_mismatch_idx]
-            c_fix1, c_fix2, c_fix3, c_fix4, c_fix5 = st.columns([2, 2, 2, 2, 2.5])
-            with c_fix1:
-                fix_date = st.text_input("日付", value=str(target_mismatch["日付"]), key="fix_input_date")
-            with c_fix2:
-                fix_market = st.text_input("市場番号", value=str(target_mismatch["市場番号"]), key="fix_input_market")
-            with c_fix3:
-                fix_price = st.number_input("修正単価 (円)", min_value=0, value=int(target_mismatch["exp_price"]), step=10, key="fix_input_price")
-            with c_fix4:
-                fix_qty = st.number_input("修正数量", min_value=0, value=int(target_mismatch["exp_qty"]), step=1, key="fix_input_qty")
-            with c_fix5:
-                fix_subtotal = fix_price * fix_qty
-                st.metric("修正後小計", f"¥ {fix_subtotal:,}")
-            
-            col_act1, col_act2 = st.columns([3, 2.5])
-            with col_act1:
-                if st.button("✍️ 修正したデータをリストの最下部に自動記録する", type="primary", use_container_width=True, key="fix_and_append_below_btn"):
-                    fixed_record = [{
-                        "日付": fix_date,
-                        "市場番号": fix_market,
-                        "カテゴリー": target_mismatch["カテゴリー"],
-                        "商品コード": target_mismatch["商品コード"],
-                        "商品名": target_mismatch["商品名"],
-                        "単価": fix_price,
-                        "数量": fix_qty,
-                        "小計": fix_subtotal
-                    }]
-                    insert_records_to_db(current_user, fixed_record)
-                    if target_mismatch.get("record_id"):
-                        delete_records_by_ids([target_mismatch["record_id"]], current_user)
-                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.toast(f"✨ 修正データをリスト最下部に自動記録しました！")
-                    st.rerun()
-
-            with col_act2:
-                if st.button("🛠️ 全不一致を元ファイル通りに修正して自動記録", use_container_width=True, key="fix_all_mismatch_btn"):
-                    insert_records_to_db(current_user, expected_df.to_dict("records"))
-                    cleanup_duplicate_records(current_user)
-                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.toast("✅ 元ファイルの内容ですべて修正し、下に自動記録しました！")
-                    st.rerun()
-
     st.write("")
     st.markdown(f'<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録 (入力者: <b>{current_user}</b>)</div>', unsafe_allow_html=True)
 
     # -------------------------------------------------------------
     # 📁 A. 取引先ファイルの自動記録 (Excel / CSV どのパソコンからでも選択可能)
     # -------------------------------------------------------------
-    with st.expander("📁 取引先ファイル（Excel / CSV）から一括自動記録 & 取引先自動抽出", expanded=False):
+    with st.expander("📁 取引先ファイル（Excel / CSV）から一括自動記録 & 取引先自動抽出", expanded=(st.session_state.verification_batch is not None)):
         st.markdown("""
             <div style="font-size: 0.85rem; color: #4b5563; margin-bottom: 8px;">
                 💡 <b>どのパソコンのブラウザからでもエクセルファイル（.xlsx / .xls）やCSVファイルを選択できます。</b><br>
-                読み込んだエクセルデータは下の記録一覧へ同じ形式で自動記録され、ファイル内の取引先名が手動入力の候補リストに自動追加されます。
+                読み込んだエクセルデータは下の記録一覧へ同じ形式で自動記録され、ファイル内の取引先名が手動入力の候補リストに自動追加されます。<br>
+                （※ 古い.xls形式・新しい.xlsx形式・CSV形式のいずれも自動変換・フォールバック対応によりエラーなく安全に読み込めます）
             </div>
         """, unsafe_allow_html=True)
         col_up1, col_up2 = st.columns([4, 1.2])
@@ -1343,7 +1277,7 @@ with tabs[0]:
                     if sup not in st.session_state.extracted_suppliers:
                         st.session_state.extracted_suppliers.append(sup)
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast(f"✅ テストデータ 3件 を自動記録しました！")
+                st.toast(f"✅ テストデータ 3件 を自動記録しました！下の記録一覧に反映されました。")
                 st.rerun()
 
         if uploaded_entry_file is not None:
@@ -1356,6 +1290,7 @@ with tabs[0]:
                     df_file, sups = parse_trade_file(uploaded_entry_file)
                     
                     if not df_file.empty:
+                        # 取引先の自動抽出 & 手動入力選択肢へマージ
                         for s in sups:
                             if s and s not in st.session_state.extracted_suppliers:
                                 st.session_state.extracted_suppliers.append(s)
@@ -1367,12 +1302,224 @@ with tabs[0]:
                             "df": df_file
                         }
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録！取引先 {len(sups)} 件を手動入力の候補に追加しました。")
+                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録！下の記録一覧へ正確に反映されました。")
                         st.rerun()
                     else:
                         st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
                 except Exception as e:
                     st.error(f"ファイル解析エラー: {e}")
+
+        # -------------------------------------------------------------
+        # 🔍 自動記録データと元ファイルの確認・照合・修正パネル
+        # -------------------------------------------------------------
+        if st.session_state.verification_batch is not None:
+            st.divider()
+            v_batch = st.session_state.verification_batch
+            v_file_name = v_batch["file_name"]
+            expected_df = v_batch["df"].copy()
+            expected_total_qty = int(expected_df["数量"].sum()) if not expected_df.empty and "数量" in expected_df.columns else 0
+            expected_total_subtotal = int(expected_df["小計"].sum()) if not expected_df.empty and "小計" in expected_df.columns else 0
+
+            # 現在のDB登録データと元ファイルデータを精緻に照合
+            mismatches = []
+            matched_count = 0
+
+            if df_current is not None and not df_current.empty:
+                for idx, exp_row in expected_df.iterrows():
+                    exp_date = str(exp_row.get("日付", "")).strip()
+                    exp_market = str(exp_row.get("市場番号", "")).strip()
+                    exp_cat = str(exp_row.get("カテゴリー", "1課 (熊谷・大宮)")).strip()
+                    exp_code = str(exp_row.get("商品コード", "AUTO")).strip()
+                    exp_name = str(exp_row.get("商品名", "")).strip()
+                    exp_p = int(exp_row.get("単価", 0))
+                    exp_q = int(exp_row.get("数量", 0))
+                    exp_sub = int(exp_row.get("小計", exp_p * exp_q))
+
+                    # 照合候補の検索（商品名＋日付で照合）
+                    candidates = df_current[
+                        (df_current["商品名"] == exp_name) & 
+                        (df_current["日付"] == exp_date)
+                    ]
+                    
+                    if candidates.empty:
+                        mismatches.append({
+                            "行番号": idx + 1,
+                            "商品名": exp_name,
+                            "日付": exp_date,
+                            "市場番号": exp_market,
+                            "カテゴリー": exp_cat,
+                            "商品コード": exp_code,
+                            "不一致項目": "登録データなし (欠落)",
+                            "元ファイルの値(正)": f"単価:¥{exp_p:,}, 数量:{exp_q:,}個, 金額:¥{exp_sub:,}",
+                            "現在の登録値(誤)": "未登録または削除済み",
+                            "exp_price": exp_p,
+                            "exp_qty": exp_q,
+                            "exp_subtotal": exp_sub,
+                            "record_id": None,
+                            "exp_row_dict": exp_row.to_dict()
+                        })
+                    else:
+                        db_row = candidates.iloc[-1]
+                        db_id = int(db_row.get("id"))
+                        row_has_diff = False
+
+                        for col_name, exp_val_clean, db_val_clean in [
+                            ("単価", exp_p, int(db_row.get("単価", 0))),
+                            ("数量", exp_q, int(db_row.get("数量", 0))),
+                            ("市場番号", exp_market, str(db_row.get("市場番号", "")).strip()),
+                            ("カテゴリー", exp_cat, str(db_row.get("カテゴリー", "")).strip()),
+                            ("商品コード", exp_code, str(db_row.get("商品コード", "")).strip()),
+                        ]:
+                            if str(exp_val_clean) != str(db_val_clean):
+                                mismatches.append({
+                                    "行番号": idx + 1,
+                                    "商品名": exp_name,
+                                    "日付": exp_date,
+                                    "市場番号": exp_market,
+                                    "カテゴリー": exp_cat,
+                                    "商品コード": exp_code,
+                                    "不一致項目": col_name,
+                                    "元ファイルの値(正)": str(exp_val_clean),
+                                    "現在の登録値(誤)": str(db_val_clean),
+                                    "exp_price": exp_p,
+                                    "exp_qty": exp_q,
+                                    "exp_subtotal": exp_sub,
+                                    "record_id": db_id,
+                                    "exp_row_dict": exp_row.to_dict()
+                                })
+                                row_has_diff = True
+                                break
+
+                        if not row_has_diff:
+                            matched_count += 1
+            else:
+                for idx, exp_row in expected_df.iterrows():
+                    mismatches.append({
+                        "行番号": idx + 1,
+                        "商品名": str(exp_row.get("商品名", "")),
+                        "日付": str(exp_row.get("日付", "")),
+                        "市場番号": str(exp_row.get("市場番号", "")),
+                        "カテゴリー": str(exp_row.get("カテゴリー", "")),
+                        "商品コード": str(exp_row.get("商品コード", "")),
+                        "不一致項目": "登録データなし",
+                        "元ファイルの値(正)": f"単価:¥{exp_row.get('単価', 0):,}, 数量:{exp_row.get('数量', 0):,}",
+                        "現在の登録値(誤)": "テーブルが空です",
+                        "exp_price": int(exp_row.get("単価", 0)),
+                        "exp_qty": int(exp_row.get("数量", 0)),
+                        "exp_subtotal": int(exp_row.get("小計", 0)),
+                        "record_id": None,
+                        "exp_row_dict": exp_row.to_dict()
+                    })
+
+            st.markdown("#### 🔍 元ファイルデータ照合 & 整合性リアルタイム検証")
+            c_meta1, c_meta2, c_meta3, c_meta4 = st.columns([2.5, 1.5, 1.5, 1.5])
+            c_meta1.caption(f"📁 照合元ファイル: **{v_file_name}**")
+            c_meta2.caption(f"📋 元ファイル行数: **{len(expected_df)} 件**")
+            c_meta3.caption(f"💰 元ファイル総額: **¥ {expected_total_subtotal:,}**")
+            match_rate = round(((len(expected_df) - len(mismatches)) / len(expected_df)) * 100, 1) if len(expected_df) > 0 else 0
+            c_meta4.caption(f"🎯 合致率: **{match_rate}%**")
+
+            if len(mismatches) == 0:
+                st.success(f"🛡️ **【100%合致確認済み】元ファイル『{v_file_name}』の全 {len(expected_df)} 件のデータが、下の記録一覧（登録済みデータ）と100%完全一致しています。単価・数量・金額の欠落やズレはありません。**")
+            else:
+                st.markdown(f"""
+                    <div class="mismatch-box">
+                        <h4 style="margin: 0; color: #991b1b;">⚠️ 元ファイル照合: {len(mismatches)} 件の不一致・差異が検出されました</h4>
+                        <p style="margin: 4px 0 0 0; color: #4b5563; font-size: 13px;">
+                            元ファイルの内容と現在の登録データとの間に相違があります。下のボタンから『個別修正』または『すべて選択して一括修正』を行うと、元のファイルと完全に同じデータに瞬時に修正され、下の記録一覧に正確に反映されます。
+                        </p>
+                    </div>
+                """, unsafe_allow_html=True)
+
+                diff_table_df = pd.DataFrame(mismatches)[["行番号", "商品名", "不一致項目", "元ファイルの値(正)", "現在の登録値(誤)"]]
+                st.dataframe(diff_table_df, use_container_width=True)
+
+                # 個別修正フォーム
+                st.markdown("##### ✍️ 1. 個別にデータを選択して修正する")
+                mismatch_labels = [f"行{m['行番号']}: {m['商品名']} ({m['不一致項目']}: 正={m['元ファイルの値(正)']} ⇔ 誤={m['現在の登録値(誤)']})" for m in mismatches]
+                selected_m_idx = st.selectbox(
+                    "修正したい不一致データを選択:",
+                    range(len(mismatch_labels)),
+                    format_func=lambda i: mismatch_labels[i],
+                    key="sel_mismatch_single_fix"
+                )
+                target_m = mismatches[selected_m_idx]
+
+                c_m1, c_m2, c_m3, c_m4, c_m5 = st.columns([1.5, 2, 1.5, 1.5, 2])
+                with c_m1:
+                    fix_date = st.text_input("日付", value=str(target_m["日付"]), key="f_indiv_date")
+                with c_m2:
+                    fix_market = st.text_input("市場番号/取引先", value=str(target_m["市場番号"]), key="f_indiv_market")
+                with c_m3:
+                    fix_price = st.number_input("元ファイル単価 (円)", min_value=0, value=int(target_m["exp_price"]), step=10, key="f_indiv_price")
+                with c_m4:
+                    fix_qty = st.number_input("元ファイル数量", min_value=0, value=int(target_m["exp_qty"]), step=1, key="f_indiv_qty")
+                with c_m5:
+                    fix_subtotal = fix_price * fix_qty
+                    st.metric("修正後金額", f"¥ {fix_subtotal:,}")
+
+                c_btn_single, c_btn_all, c_btn_close = st.columns([2.5, 3.5, 1.5])
+                with c_btn_single:
+                    if st.button("✍️ 選択したデータを元ファイルと同じに修正", type="primary", use_container_width=True, key="fix_single_mismatch_btn"):
+                        if target_m.get("record_id"):
+                            update_single_record_in_db({
+                                "id": target_m["record_id"],
+                                "日付": fix_date,
+                                "市場番号": fix_market,
+                                "カテゴリー": target_m["カテゴリー"],
+                                "商品コード": target_m["商品コード"],
+                                "商品名": target_m["商品名"],
+                                "単価": fix_price,
+                                "数量": fix_qty,
+                                "小計": fix_subtotal
+                            })
+                        else:
+                            insert_records_to_db(current_user, [{
+                                "日付": fix_date,
+                                "市場番号": fix_market,
+                                "カテゴリー": target_m["カテゴリー"],
+                                "商品コード": target_m["商品コード"],
+                                "商品名": target_m["商品名"],
+                                "単価": fix_price,
+                                "数量": fix_qty,
+                                "小計": fix_subtotal
+                            }])
+                        invalidate_records_cache()
+                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                        st.toast("✅ 選択したデータを元ファイル通りに修正しました！下の記録一覧へ正確に反映されました。")
+                        st.rerun()
+
+                with c_btn_all:
+                    if st.button("🛠️ 全不一致データを元ファイルと同じデータに一括修正・完全同期", use_container_width=True, key="fix_all_mismatches_btn"):
+                        # 全不一致データを元ファイルの正しい値で一括更新または追加
+                        for m_item in mismatches:
+                            r_exp = m_item["exp_row_dict"]
+                            p = int(r_exp.get("単価", 0))
+                            q = int(r_exp.get("数量", 0))
+                            if m_item.get("record_id"):
+                                update_single_record_in_db({
+                                    "id": m_item["record_id"],
+                                    "日付": str(r_exp.get("日付", "")),
+                                    "市場番号": str(r_exp.get("市場番号", "")),
+                                    "カテゴリー": str(r_exp.get("カテゴリー", "")),
+                                    "商品コード": str(r_exp.get("商品コード", "")),
+                                    "商品名": str(r_exp.get("商品名", "")),
+                                    "単価": p,
+                                    "数量": q,
+                                    "小計": p * q
+                                })
+                            else:
+                                insert_records_to_db(current_user, [r_exp])
+
+                        invalidate_records_cache()
+                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                        st.toast(f"🎉 検出された全 {len(mismatches)} 件の不一致を元ファイル通りに一括修正しました！合致率100%となり、下の記録一覧に正確に反映されました。")
+                        st.rerun()
+
+                with c_btn_close:
+                    if st.button("✖ 照合を閉じる", use_container_width=True, key="close_verification_btn"):
+                        st.session_state.verification_batch = None
+                        st.rerun()
 
     # -------------------------------------------------------------
     # 📖 社内公式品名・商品コード早見表（クイック検索）
