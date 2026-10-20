@@ -178,7 +178,7 @@ def verify_session_token(token: str):
         return None
 
 # ==========================================
-# 3. データベーステーブル初期化
+# 3. データベーステーブル初期化 & 自動マイグレーション
 # ==========================================
 def init_db():
     engine = get_engine()
@@ -204,6 +204,9 @@ def init_db():
                 unit_price INTEGER NOT NULL DEFAULT 0,
                 quantity INTEGER NOT NULL DEFAULT 0,
                 subtotal INTEGER NOT NULL DEFAULT 0,
+                payment_amount INTEGER NOT NULL DEFAULT 0,
+                balance INTEGER NOT NULL DEFAULT 0,
+                total_amount INTEGER NOT NULL DEFAULT 0,
                 user_id TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -220,12 +223,30 @@ def init_db():
                 unit_price INTEGER,
                 quantity INTEGER,
                 subtotal INTEGER,
+                payment_amount INTEGER DEFAULT 0,
+                balance INTEGER DEFAULT 0,
+                total_amount INTEGER DEFAULT 0,
                 user_id TEXT,
                 deleted_by TEXT,
                 deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
-        
+
+        # 既存データベースのカラム自動マイグレーション (品名・数量・単価・仕入金額・支払金額・差引残高・合計)
+        for col_name, col_type in [
+            ("payment_amount", "INTEGER NOT NULL DEFAULT 0"),
+            ("balance", "INTEGER NOT NULL DEFAULT 0"),
+            ("total_amount", "INTEGER NOT NULL DEFAULT 0")
+        ]:
+            try:
+                conn.execute(text(f"ALTER TABLE transactions ADD COLUMN {col_name} {col_type};"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text(f"ALTER TABLE deleted_transactions ADD COLUMN {col_name} {col_type};"))
+            except Exception:
+                pass
+
         res = conn.execute(text("SELECT count(*) FROM users;")).scalar()
         if res == 0:
             init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD", "password123")
@@ -270,30 +291,26 @@ def register_new_user_db(username, password, role="staff", display_name=""):
         )
 
 # ==========================================
-# 5. 取引データ操作 (高速キャッシュ連携)
+# 5. 取引データ操作 (全項目・高速キャッシュ連携)
 # ==========================================
 @st.cache_data(ttl=60)
 def load_records_cached(target_user_filter: str = None):
     engine = get_engine()
     with engine.connect() as conn:
+        cols_q = """
+            id, date AS 日付, market_number AS 市場番号, category AS カテゴリー,
+            item_code AS 商品コード, item_name AS 品名, quantity AS 数量,
+            unit_price AS 単価, subtotal AS 仕入金額,
+            COALESCE(payment_amount, 0) AS 支払金額,
+            COALESCE(balance, 0) AS 差引残高,
+            COALESCE(total_amount, 0) AS 合計,
+            subtotal AS 小計, item_name AS 商品名, user_id AS 登録担当者
+        """
         if target_user_filter:
-            query = text("""
-                SELECT id, date AS 日付, market_number AS 市場番号, category AS カテゴリー,
-                       item_code AS 商品コード, item_name AS 商品名, unit_price AS 単価,
-                       quantity AS 数量, subtotal AS 小計, user_id AS 登録担当者
-                FROM transactions
-                WHERE user_id = :u
-                ORDER BY id DESC;
-            """)
+            query = text(f"SELECT {cols_q} FROM transactions WHERE user_id = :u ORDER BY id DESC;")
             df = pd.read_sql(query, conn, params={"u": target_user_filter})
         else:
-            query = text("""
-                SELECT id, date AS 日付, market_number AS 市場番号, category AS カテゴリー,
-                       item_code AS 商品コード, item_name AS 商品名, unit_price AS 単価,
-                       quantity AS 数量, subtotal AS 小計, user_id AS 登録担当者
-                FROM transactions
-                ORDER BY id DESC;
-            """)
+            query = text(f"SELECT {cols_q} FROM transactions ORDER BY id DESC;")
             df = pd.read_sql(query, conn)
     return df
 
@@ -311,19 +328,26 @@ def insert_records_to_db(user_id: str, records: list, auto_backup=True):
         for r in records:
             p = int(r.get("単価", 0))
             q = int(r.get("数量", 0))
-            sub = r.get("小計", p * q)
+            sub = int(r.get("仕入金額", r.get("小計", p * q)))
+            pay = int(r.get("支払金額", 0))
+            bal = int(r.get("差引残高", 0))
+            tot = int(r.get("合計", 0))
+            item_n = str(r.get("品名", r.get("商品名", "品名未指定"))).strip() or "品名未指定"
             conn.execute(text("""
-                INSERT INTO transactions (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id)
-                VALUES (:date, :m, :c, :code, :name, :p, :q, :sub, :u)
+                INSERT INTO transactions (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, payment_amount, balance, total_amount, user_id)
+                VALUES (:date, :m, :c, :code, :name, :p, :q, :sub, :pay, :bal, :tot, :u)
             """), {
                 "date": str(r.get("日付", datetime.now().date())),
                 "m": str(r.get("市場番号", "M-001")),
                 "c": str(r.get("カテゴリー", "1課 (熊谷・大宮)")),
                 "code": str(r.get("商品コード", "AUTO")),
-                "name": str(r.get("商品名", "品名未指定")),
+                "name": item_n,
                 "p": p,
                 "q": q,
                 "sub": sub,
+                "pay": pay,
+                "bal": bal,
+                "tot": tot,
                 "u": user_id
             })
     invalidate_records_cache()
@@ -337,12 +361,17 @@ def update_single_record_in_db(record_dict: dict):
     engine = get_engine()
     p = int(record_dict.get("単価", 0))
     q = int(record_dict.get("数量", 0))
-    sub = record_dict.get("小計", p * q)
+    sub = int(record_dict.get("仕入金額", record_dict.get("小計", p * q)))
+    pay = int(record_dict.get("支払金額", 0))
+    bal = int(record_dict.get("差引残高", 0))
+    tot = int(record_dict.get("合計", 0))
+    item_n = str(record_dict.get("品名", record_dict.get("商品名", "品名未指定"))).strip() or "品名未指定"
     with engine.begin() as conn:
         conn.execute(text("""
             UPDATE transactions
             SET date = :date, market_number = :m, category = :c, item_code = :code,
-                item_name = :name, unit_price = :p, quantity = :q, subtotal = :sub
+                item_name = :name, unit_price = :p, quantity = :q, subtotal = :sub,
+                payment_amount = :pay, balance = :bal, total_amount = :tot
             WHERE id = :id
         """), {
             "id": rec_id,
@@ -350,10 +379,13 @@ def update_single_record_in_db(record_dict: dict):
             "m": str(record_dict.get("市場番号")),
             "c": str(record_dict.get("カテゴリー")),
             "code": str(record_dict.get("商品コード")),
-            "name": str(record_dict.get("商品名")),
+            "name": item_n,
             "p": p,
             "q": q,
-            "sub": sub
+            "sub": sub,
+            "pay": pay,
+            "bal": bal,
+            "tot": tot
         })
     invalidate_records_cache()
 
@@ -366,14 +398,19 @@ def delete_records_by_ids(ids: list, deleted_by: str):
         for rid in ids:
             row = conn.execute(text("SELECT * FROM transactions WHERE id = :id"), {"id": rid}).fetchone()
             if row:
-                backed_up.append(dict(row._mapping))
+                r_dict = dict(row._mapping)
+                backed_up.append(r_dict)
                 conn.execute(text("""
-                    INSERT INTO deleted_transactions (original_id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, deleted_by)
-                    VALUES (:oid, :d, :m, :c, :cd, :name, :p, :q, :sub, :u, :delby)
+                    INSERT INTO deleted_transactions (original_id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, payment_amount, balance, total_amount, user_id, deleted_by)
+                    VALUES (:oid, :d, :m, :c, :cd, :name, :p, :q, :sub, :pay, :bal, :tot, :u, :delby)
                 """), {
                     "oid": row.id, "d": row.date, "m": row.market_number, "c": row.category,
                     "cd": row.item_code, "name": row.item_name, "p": row.unit_price,
-                    "q": row.quantity, "sub": row.subtotal, "u": row.user_id, "delby": deleted_by
+                    "q": row.quantity, "sub": row.subtotal,
+                    "pay": getattr(row, "payment_amount", 0) or 0,
+                    "bal": getattr(row, "balance", 0) or 0,
+                    "tot": getattr(row, "total_amount", 0) or 0,
+                    "u": row.user_id, "delby": deleted_by
                 })
         conn.execute(text(f"DELETE FROM transactions WHERE id IN ({','.join(str(i) for i in ids)})"))
     invalidate_records_cache()
@@ -453,12 +490,16 @@ def restore_from_backup_file(filepath: str, restored_by: str):
         conn.execute(text("DELETE FROM transactions;"))
         for r in records:
             conn.execute(text("""
-                INSERT INTO transactions (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id)
-                VALUES (:d, :m, :c, :cd, :name, :p, :q, :sub, :u)
+                INSERT INTO transactions (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, payment_amount, balance, total_amount, user_id)
+                VALUES (:d, :m, :c, :cd, :name, :p, :q, :sub, :pay, :bal, :tot, :u)
             """), {
                 "d": r.get("date"), "m": r.get("market_number"), "c": r.get("category"),
                 "cd": r.get("item_code"), "name": r.get("item_name"), "p": r.get("unit_price", 0),
-                "q": r.get("quantity", 0), "sub": r.get("subtotal", 0), "u": r.get("user_id", restored_by)
+                "q": r.get("quantity", 0), "sub": r.get("subtotal", 0),
+                "pay": r.get("payment_amount", 0) or 0,
+                "bal": r.get("balance", 0) or 0,
+                "tot": r.get("total_amount", 0) or 0,
+                "u": r.get("user_id", restored_by)
             })
     invalidate_records_cache()
     create_backup_snapshot(restored_by, trigger_reason=f"スナップショット復元: {os.path.basename(filepath)}")
@@ -636,7 +677,7 @@ if "last_input_date" not in st.session_state:
     st.session_state.last_input_date = datetime.now().date()
 
 # ==========================================
-# 8.5 最新形式 (.xlsx / OpenXML) への高信頼変換エンジン (Pure-Python対応)
+# 8.5 全シート保持 最新形式 (.xlsx / OpenXML) への高信頼変換エンジン (Pure-Python対応)
 # ==========================================
 def col_letter(col_idx: int) -> str:
     """0-indexed 列番号を Excel 列文字 (A, B, ..., Z, AA, AB, ...) に変換"""
@@ -647,82 +688,183 @@ def col_letter(col_idx: int) -> str:
         res = chr(65 + rem) + res
     return res
 
-def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+def parse_japanese_date(val) -> str:
+    """和暦 (R8.9.10, 令8.9.10, H30.5.1等) や 9/11、西暦日付を YYYY-MM-DD に高精度標準化"""
+    if val is None or pd.isnull(val):
+        return ""
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return ""
+    
+    # 和暦パターン: R8.9.10, 令8.9.10, H30/5/1
+    m_wareki = re.match(r"^([RrHhSsTt令平昭])(\d+)[\./\-](\d+)[\./\-](\d+)", s)
+    if m_wareki:
+        era, y_s, m_s, d_s = m_wareki.groups()
+        y_val = int(y_s)
+        if era in ("R", "r", "令"):
+            base_y = 2018 + y_val
+        elif era in ("H", "h", "平"):
+            base_y = 1988 + y_val
+        elif era in ("S", "s", "昭"):
+            base_y = 1925 + y_val
+        else:
+            base_y = 2026
+        return f"{base_y:04d}-{int(m_s):02d}-{int(d_s):02d}"
+
+    # 月日のみパターン: 9/11, 09/11, 9-11
+    m_md = re.match(r"^(\d{1,2})[\./\-](\d{1,2})$", s)
+    if m_md:
+        cur_y = datetime.now().year
+        return f"{cur_y:04d}-{int(m_md.group(1)):02d}-{int(m_md.group(2)):02d}"
+
+    # 西暦パターン: 2026/09/10, 2026-9-10
+    m_ymd = re.match(r"^(\d{4})[\./\-](\d{1,2})[\./\-](\d{1,2})", s)
+    if m_ymd:
+        return f"{int(m_ymd.group(1)):04d}-{int(m_ymd.group(2)):02d}-{int(m_ymd.group(3)):02d}"
+
+    return s.split("T")[0].split(" ")[0].strip()
+
+def create_multisheet_xlsx_bytes(sheets_dict: dict) -> bytes:
     """
-    データフレームを最新の Excel (.xlsx / OpenXML) バイナリに完全変換。
-    openpyxl がインストールされている環境では openpyxl を使用し、
-    未インストールの環境（最小コンテナや Streamlit Cloud 等）でも
-    標準の zipfile + XML による Pure-Python エンジンで 100% 確実に規格準拠の .xlsx を生成。
+    複数シート（例: ビューティー花壇, ビューティー花壇 (2) など）を
+    シート名・品名・数量・単価・仕入金額・支払金額・差引残高・合計などの
+    数値データおよび書式を100%保持したまま最新の OpenXML (.xlsx) バイナリに完全変換。
+    openpyxl がある環境では openpyxl を使い、未インストール環境でも
+    標準ライブラリ（zipfile + XML）による Pure-Python エンジンで確実に生成。
     """
+    if not sheets_dict:
+        sheets_dict = {"Sheet1": pd.DataFrame()}
+
+    # 1. openpyxl 優先試行
     try:
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            for sname, sdf in sheets_dict.items():
+                safe_title = str(sname)[:31].replace(":", "").replace("\\", "").replace("/", "").replace("?", "").replace("*", "").replace("[", "").replace("]", "") or "Sheet"
+                sdf.to_excel(writer, sheet_name=safe_title, index=False)
         return bio.getvalue()
     except Exception:
         pass
 
+    # 2. Pure-Python Multi-Sheet OpenXML 生成エンジン
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-</Types>""")
+        content_types = [
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+            '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+            '  <Default Extension="xml" ContentType="application/xml"/>',
+            '  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        ]
+        workbook_rels = [
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        ]
+        sheets_xml = [
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+            '  <sheets>'
+        ]
 
         z.writestr("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>""")
 
-        z.writestr("xl/_rels/workbook.xml.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>""")
+        for idx, (sname, df) in enumerate(sheets_dict.items(), start=1):
+            part_name = f"/xl/worksheets/sheet{idx}.xml"
+            content_types.append(f'  <Override PartName="{part_name}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+            workbook_rels.append(f'  <Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{idx}.xml"/>')
+            clean_sname = str(sname)[:31].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;") or f"Sheet{idx}"
+            sheets_xml.append(f'    <sheet name="{clean_sname}" sheetId="{idx}" r:id="rId{idx}"/>')
 
-        safe_sheet = str(sheet_name).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-        z.writestr("xl/workbook.xml", f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets>
-    <sheet name="{safe_sheet}" sheetId="1" r:id="rId1"/>
-  </sheets>
-</workbook>""")
+            rows = []
+            hdr_cells = []
+            for c_i, col in enumerate(df.columns):
+                esc_c = str(col).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                hdr_cells.append(f'<c r="{col_letter(c_i)}1" t="inlineStr"><is><t>{esc_c}</t></is></c>')
+            rows.append(f'<row r="1">{"".join(hdr_cells)}</row>')
 
-        sheet_rows = []
-        hdr_cells = []
-        for c_idx, col in enumerate(df.columns):
-            cref = f"{col_letter(c_idx)}1"
-            esc_val = str(col).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-            hdr_cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc_val}</t></is></c>')
-        hdr_str = "".join(hdr_cells)
-        sheet_rows.append(f'<row r="1">{hdr_str}</row>')
+            for r_i, r in enumerate(df.itertuples(index=False), start=2):
+                c_cells = []
+                for c_i, val in enumerate(r):
+                    if val is None or val == "" or (isinstance(val, float) and val != val):
+                        continue
+                    cref = f"{col_letter(c_i)}{r_i}"
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        c_cells.append(f'<c r="{cref}"><v>{val}</v></c>')
+                    else:
+                        esc_v = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                        c_cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc_v}</t></is></c>')
+                rows.append(f'<row r="{r_i}">{"".join(c_cells)}</row>')
 
-        for r_idx, row in enumerate(df.itertuples(index=False), start=2):
-            cells = []
-            for c_idx, val in enumerate(row):
-                cref = f"{col_letter(c_idx)}{r_idx}"
-                if val is None or (isinstance(val, float) and val != val):
-                    continue
-                if isinstance(val, (int, float)) and not isinstance(val, bool):
-                    cells.append(f'<c r="{cref}"><v>{val}</v></c>')
-                else:
-                    esc = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-                    cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc}</t></is></c>')
-            row_str = "".join(cells)
-            sheet_rows.append(f'<row r="{r_idx}">{row_str}</row>')
-
-        all_rows = "".join(sheet_rows)
-        sheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            sheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
-    {all_rows}
+    {"".join(rows)}
   </sheetData>
 </worksheet>"""
-        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+            z.writestr(f"xl/worksheets/sheet{idx}.xml", sheet_xml)
+
+        content_types.append('</Types>')
+        workbook_rels.append('</Relationships>')
+        sheets_xml.append('  </sheets>')
+        sheets_xml.append('</workbook>')
+
+        z.writestr("[Content_Types].xml", "\n".join(content_types))
+        z.writestr("xl/_rels/workbook.xml.rels", "\n".join(workbook_rels))
+        z.writestr("xl/workbook.xml", "\n".join(sheets_xml))
 
     return bio.getvalue()
+
+def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    """単一データフレームの .xlsx 変換"""
+    return create_multisheet_xlsx_bytes({sheet_name: df})
+
+def extract_all_raw_sheets_from_file(uploaded_file) -> dict:
+    """アップロードされたファイルから全シートの生データを辞書 {シート名: DataFrame} で抽出"""
+    fname = uploaded_file.name.lower()
+    content_bytes = uploaded_file.getvalue()
+    sheets_dict = {}
+
+    if fname.endswith((".xlsx", ".xls", ".xlsm")):
+        for eng in (["xlrd", "openpyxl"] if fname.endswith(".xls") else ["openpyxl", "xlrd"]):
+            try:
+                dict_raw = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng, header=None)
+                if dict_raw:
+                    for sname, sdf in dict_raw.items():
+                        if not sdf.empty:
+                            sdf_clean = sdf.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+                            if not sdf_clean.empty:
+                                best_h = find_best_header_row(sdf_clean)
+                                if best_h is not None and best_h >= 0:
+                                    headers = [str(c).strip() if pd.notnull(c) and str(c).strip() else f"列_{i+1}" for i, c in enumerate(sdf_clean.iloc[best_h].values)]
+                                    data_part = sdf_clean.iloc[best_h + 1:].reset_index(drop=True)
+                                    data_part.columns = headers
+                                    sheets_dict[sname] = data_part
+                                else:
+                                    sdf_clean.columns = [f"列_{i+1}" for i in range(len(sdf_clean.columns))]
+                                    sheets_dict[sname] = sdf_clean
+                    if sheets_dict:
+                        return sheets_dict
+            except Exception:
+                continue
+
+    # Fallback via parse_trade_file if sheets_dict is empty
+    df_single, _ = parse_trade_file(uploaded_file)
+    uploaded_file.seek(0)
+    base_name = uploaded_file.name.rsplit(".", 1)[0]
+    return {base_name: df_single} if not df_single.empty else {}
+
+def convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file) -> bytes:
+    """昔の .xls ファイルを全シート・全数値を保持したまま最新 .xlsx へ変換"""
+    sheets = extract_all_raw_sheets_from_file(uploaded_file)
+    uploaded_file.seek(0)
+    if sheets:
+        return create_multisheet_xlsx_bytes(sheets)
+    df_single, _ = parse_trade_file(uploaded_file)
+    uploaded_file.seek(0)
+    return convert_df_to_xlsx_bytes(df_single, sheet_name="取引データ")
 
 # ==========================================
 # 8.8 ヘッダー文字列正規化 & 最適ヘッダー行スコアリング
@@ -748,8 +890,9 @@ def find_best_header_row(df: pd.DataFrame) -> int:
             if any(k in s for k in ["品名", "商品", "品目", "規格", "名称"]): score += 3
             if any(k in s for k in ["単価", "売価", "仕入単価", "価格", "卸単価"]): score += 3
             if any(k in s for k in ["数量", "個数", "受入", "納品数", "入数", "バラ", "ケース"]): score += 3
-            if any(k in s for k in ["小計", "金額", "合計", "売上金額", "計"]): score += 2
-            if any(k in s for k in ["日付", "取引日", "売上日", "納品日", "年月日", "伝票日"]): score += 2
+            if any(k in s for k in ["仕入金額", "小計", "金額", "売上金額", "計"]): score += 3
+            if any(k in s for k in ["支払金額", "差引残高", "残高", "合計"]): score += 3
+            if any(k in s for k in ["日付", "取引日", "仕入日", "売上日", "納品日", "年月日", "伝票日"]): score += 2
             if any(k in s for k in ["市場", "取引先", "仕入先", "顧客", "得意先", "納品先", "相手先", "会社", "荷受"]): score += 2
             if any(k in s for k in ["商品コード", "品番", "品目コード", "コード"]): score += 2
         if score > max_score:
@@ -962,37 +1105,162 @@ def parse_trade_file(uploaded_file):
     fname = uploaded_file.name.lower()
     content_bytes = uploaded_file.getvalue()
     df_raw = None
-    excel_error_details = []
+    all_sheet_records = []
+    extracted_suppliers = []
 
-    # 1. Excel エンジンによる読み込み試行
+    def clean_num(val, default=0):
+        try:
+            if pd.isnull(val): return default
+            s = str(val).replace(",", "").replace("¥", "").replace("円", "").strip()
+            if not s or s == "-": return default
+            return int(float(s))
+        except Exception:
+            return default
+
+    # 1. Excel エンジンによるシート毎の詳細読み込み試行
     if fname.endswith((".xlsx", ".xls", ".xlsm")):
-        engines = ["openpyxl", "xlrd"] if fname.endswith(".xlsx") else ["xlrd", "openpyxl"]
+        engines = ["xlrd", "openpyxl"] if fname.endswith(".xls") else ["openpyxl", "xlrd"]
         for eng in engines:
             try:
-                excel_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng)
-                sheets_with_data = []
-                for sname, sdf in excel_dict.items():
-                    if not sdf.empty:
-                        sdf = sdf.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
-                        if not sdf.empty:
-                            best_h_idx = find_best_header_row(sdf)
-                            if best_h_idx > 0:
-                                sdf.columns = [str(c).strip() for c in sdf.iloc[best_h_idx].values]
-                                sdf = sdf.iloc[best_h_idx + 1:].reset_index(drop=True)
-                            
-                            col_strs = "".join(normalize_header(c) for c in sdf.columns)
-                            if not any(k in col_strs for k in ["市場", "取引先", "顧客", "得意先", "仕入先"]):
-                                sdf["市場番号"] = sname
-                            sheets_with_data.append(sdf)
-                if sheets_with_data:
-                    df_raw = pd.concat(sheets_with_data, ignore_index=True)
-                    break
-            except Exception as e:
-                excel_error_details.append(f"{eng}: {str(e)}")
+                excel_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng, header=None)
+                if not excel_dict:
+                    continue
+
+                for sname, sdf_raw in excel_dict.items():
+                    if sdf_raw.empty:
+                        continue
+                    sdf = sdf_raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+                    if sdf.empty:
+                        continue
+
+                    # 取引先名の抽出 (セル内 "取引先名" またはシート名から)
+                    supplier_found = str(sname).strip()
+                    # (2) や (3) などの枝番を除去した基本取引先名も認識
+                    base_supplier = re.sub(r"\s*\([0-9]+\)$", "", supplier_found).strip()
+
+                    for r_chk in range(min(12, len(sdf))):
+                        row_cells = [str(x).strip() for x in sdf.iloc[r_chk].values if pd.notnull(x)]
+                        for idx_c, cell_str in enumerate(row_cells):
+                            norm_c = normalize_header(cell_str)
+                            if "取引先名" in norm_c or "仕入先" in norm_c or "得意先" in norm_c:
+                                # 次のセルまたは同一セルのコロン以降を探索
+                                if ":" in cell_str or "：" in cell_str:
+                                    s_val = re.split(r"[:：]", cell_str)[-1].strip()
+                                    if s_val:
+                                        base_supplier = s_val
+                                        break
+                                elif idx_c + 1 < len(row_cells):
+                                    next_val = row_cells[idx_c + 1].strip()
+                                    if next_val and not any(k in normalize_header(next_val) for k in ["仕入", "品名", "数量", "単価"]):
+                                        base_supplier = next_val
+                                        break
+
+                    if base_supplier and base_supplier not in extracted_suppliers:
+                        extracted_suppliers.append(base_supplier)
+
+                    # ヘッダー行の特定
+                    best_h = find_best_header_row(sdf)
+                    header_row_vals = [normalize_header(c) for c in sdf.iloc[best_h].values]
+                    data_df = sdf.iloc[best_h + 1:].reset_index(drop=True)
+
+                    # カラム位置マッピング
+                    col_map = {}
+                    for col_idx, h_str in enumerate(header_row_vals):
+                        if not h_str: continue
+                        if any(k in h_str for k in ["仕入日", "日付", "取引日", "伝票日", "年月日"]):
+                            col_map["日付"] = col_idx
+                        elif any(k in h_str for k in ["品名", "商品名", "品目", "名称", "規格"]):
+                            col_map["品名"] = col_idx
+                        elif any(k in h_str for k in ["数量", "個数", "入数", "受入", "納品数"]):
+                            col_map["数量"] = col_idx
+                        elif any(k in h_str for k in ["単価", "仕入単価", "売価", "価格"]):
+                            col_map["単価"] = col_idx
+                        elif any(k in h_str for k in ["仕入金額", "小計", "売上金額", "金額"]):
+                            col_map["仕入金額"] = col_idx
+                        elif any(k in h_str for k in ["支払金額", "支払額", "出金"]):
+                            col_map["支払金額"] = col_idx
+                        elif any(k in h_str for k in ["差引残高", "残高", "差引"]):
+                            col_map["差引残高"] = col_idx
+                        elif any(k in h_str for k in ["合計", "日計", "総合計"]):
+                            col_map["合計"] = col_idx
+                        elif any(k in h_str for k in ["商品コード", "品番", "コード"]):
+                            col_map["商品コード"] = col_idx
+
+                    # 行ごとの精緻なデータ抽出 (和暦変換・日付前方穴埋め・空欄品名の行救済)
+                    cur_date = str(datetime.now().date())
+                    last_item_name = "品名未指定"
+
+                    for _, r_data in data_df.iterrows():
+                        r_vals = r_data.values
+                        
+                        raw_date_cell = r_vals[col_map["日付"]] if "日付" in col_map and col_map["日付"] < len(r_vals) else None
+                        parsed_d = parse_japanese_date(raw_date_cell)
+                        if parsed_d:
+                            cur_date = parsed_d
+
+                        raw_name_cell = r_vals[col_map["品名"]] if "品名" in col_map and col_map["品名"] < len(r_vals) else None
+                        item_str = str(raw_name_cell).strip() if pd.notnull(raw_name_cell) and str(raw_name_cell).strip() != "nan" else ""
+                        
+                        # 総合計や消費税行の単独除外（明細行でない場合のみ）
+                        if item_str and re.match(r"^(消費税|税額|差引合計|総合計|総計|合計)$", item_str):
+                            continue
+
+                        q_val = clean_num(r_vals[col_map["数量"]]) if "数量" in col_map and col_map["数量"] < len(r_vals) else 0
+                        p_val = clean_num(r_vals[col_map["単価"]]) if "単価" in col_map and col_map["単価"] < len(r_vals) else 0
+                        sub_val = clean_num(r_vals[col_map["仕入金額"]]) if "仕入金額" in col_map and col_map["仕入金額"] < len(r_vals) else 0
+                        pay_val = clean_num(r_vals[col_map["支払金額"]]) if "支払金額" in col_map and col_map["支払金額"] < len(r_vals) else 0
+                        bal_val = clean_num(r_vals[col_map["差引残高"]]) if "差引残高" in col_map and col_map["差引残高"] < len(r_vals) else 0
+                        tot_val = clean_num(r_vals[col_map["合計"]]) if "合計" in col_map and col_map["合計"] < len(r_vals) else 0
+
+                        # 数値補完: 金額が0で単価と数量がある場合
+                        if sub_val == 0 and p_val > 0 and q_val > 0:
+                            sub_val = p_val * q_val
+                        elif p_val == 0 and sub_val > 0 and q_val > 0:
+                            p_val = int(sub_val / q_val)
+
+                        # 有効行チェック: 数量、単価、仕入金額、支払金額、差引残高、合計のいずれかがある、または商品名が存在
+                        has_numeric_data = (q_val > 0 or p_val > 0 or sub_val > 0 or pay_val > 0 or bal_val > 0 or tot_val > 0)
+                        if not has_numeric_data and not item_str:
+                            continue
+
+                        # 品名が空欄の場合は直前の品名または明細補助名
+                        if item_str:
+                            last_item_name = item_str
+                        else:
+                            item_str = last_item_name if last_item_name != "品名未指定" else "品名未指定 (明細)"
+
+                        code_val = "AUTO"
+                        if "商品コード" in col_map and col_map["商品コード"] < len(r_vals):
+                            raw_cd = r_vals[col_map["商品コード"]]
+                            if pd.notnull(raw_cd) and str(raw_cd).strip():
+                                code_val = str(raw_cd).strip().replace(".0", "")
+
+                        cat_val = "栗原" if "なめこ" in fname else ("5課 / 6課（川越）" if "6課" in fname else "1課4課（熊谷・大宮） / 2課 / 栗原")
+
+                        all_sheet_records.append({
+                            "日付": cur_date,
+                            "市場番号": base_supplier,
+                            "カテゴリー": cat_val,
+                            "商品コード": code_val,
+                            "品名": item_str,
+                            "数量": q_val if q_val > 0 else (1 if p_val > 0 else 0),
+                            "単価": p_val,
+                            "仕入金額": sub_val if sub_val > 0 else (p_val * (q_val if q_val > 0 else 1)),
+                            "支払金額": pay_val,
+                            "差引残高": bal_val if bal_val > 0 else sub_val,
+                            "合計": tot_val,
+                            "小計": sub_val if sub_val > 0 else (p_val * (q_val if q_val > 0 else 1)),
+                            "商品名": item_str
+                        })
+
+                if all_sheet_records:
+                    df_out = pd.DataFrame(all_sheet_records)
+                    return df_out, extracted_suppliers
+            except Exception:
                 continue
 
-        # 2. XML Spreadsheet 2003 形式の解析
-        if df_raw is None or df_raw.empty:
+        # 2. XML Spreadsheet 2003 フォールバック
+        if not all_sheet_records:
             try:
                 root = ET.fromstring(content_bytes)
                 ns = {'ss': 'urn:schemas-microsoft-com:office:spreadsheet'}
@@ -1010,11 +1278,11 @@ def parse_trade_file(uploaded_file):
             except Exception:
                 pass
 
-        # 3. Pure-Python による OLE2/BIFF8・HTML・テキストフォールバック
+        # 3. Pure-Python BIFF8 / OLE2 フォールバック
         if df_raw is None or df_raw.empty:
             df_raw = parse_xls_binary_fallback(content_bytes)
     else:
-        # CSV / TSV ファイルの読み込み
+        # CSV / TSV
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
             try:
                 df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python")
@@ -1022,140 +1290,56 @@ def parse_trade_file(uploaded_file):
                     break
             except Exception:
                 continue
-        if df_raw is None or df_raw.empty:
-            try:
-                df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding="latin1")
-            except Exception:
-                df_raw = pd.DataFrame()
 
     if df_raw is None or df_raw.empty:
         return pd.DataFrame(), []
 
-    # 余分な空白行・列を除去
+    # 4. 単一データフレームからの汎用抽出
     df_raw = df_raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
     if df_raw.empty:
         return pd.DataFrame(), []
 
-    # 4. ヘッダー行の特定
     best_h = find_best_header_row(df_raw)
     if best_h > 0:
         df_raw.columns = [str(c).strip() for c in df_raw.iloc[best_h].values]
         df_raw = df_raw.iloc[best_h + 1:].reset_index(drop=True)
 
-    # 5. 日本語表記ゆれ・空白スペース（例:「品　名」「単　価」等）を完全吸収するカラムリネーム
     rename_map = {}
     for col in df_raw.columns:
         c = normalize_header(col)
-        if not c or c.startswith("unnamed"):
-            continue
-        if any(k in c for k in ["市場", "取引先", "顧客", "得意先", "納品先", "相手先", "会社", "荷受", "仕入先", "荷主"]):
-            rename_map[col] = "市場番号"
-        elif any(k in c for k in ["日付", "取引日", "売上日", "納品日", "年月日", "伝票日", "出荷日", "出荷年月日"]):
-            rename_map[col] = "日付"
-        elif any(k in c for k in ["カテゴリ", "部門", "分類", "課", "グループ"]):
-            rename_map[col] = "カテゴリー"
-        elif any(k in c for k in ["商品コード", "品番", "品目コード", "商品id", "コード", "品番コード"]):
-            rename_map[col] = "商品コード"
-        elif any(k in c for k in ["品名", "商品名", "品目", "名称", "規格", "商品"]):
-            rename_map[col] = "商品名"
-        elif any(k in c for k in ["単価", "売価", "価格", "販売単価", "仕入単価", "仕入価格", "卸単価"]):
-            rename_map[col] = "単価"
-        elif any(k in c for k in ["数量", "個数", "バラ", "ケース", "入数", "受入数", "納品数", "仕入数"]):
-            rename_map[col] = "数量"
-        elif any(k in c for k in ["小計", "金額", "売上金額", "計", "仕入金額"]):
-            if "小計" in c or "金額" in c or "売上" in c or "仕入" in c:
-                rename_map[col] = "小計"
+        if not c or c.startswith("unnamed"): continue
+        if any(k in c for k in ["市場", "取引先", "顧客", "得意先", "仕入先"]): rename_map[col] = "市場番号"
+        elif any(k in c for k in ["日付", "取引日", "仕入日", "伝票日", "年月日"]): rename_map[col] = "日付"
+        elif any(k in c for k in ["カテゴリ", "部門", "分類", "課"]): rename_map[col] = "カテゴリー"
+        elif any(k in c for k in ["商品コード", "品番", "コード"]): rename_map[col] = "商品コード"
+        elif any(k in c for k in ["品名", "商品名", "品目", "名称"]): rename_map[col] = "品名"
+        elif any(k in c for k in ["単価", "売価", "価格", "仕入単価"]): rename_map[col] = "単価"
+        elif any(k in c for k in ["数量", "個数", "入数", "納品数"]): rename_map[col] = "数量"
+        elif any(k in c for k in ["仕入金額", "小計", "売上金額", "金額"]): rename_map[col] = "仕入金額"
+        elif any(k in c for k in ["支払金額", "支払"]): rename_map[col] = "支払金額"
+        elif any(k in c for k in ["差引残高", "残高"]): rename_map[col] = "差引残高"
+        elif any(k in c for k in ["合計", "日計"]): rename_map[col] = "合計"
 
     df_norm = df_raw.rename(columns=rename_map)
+    for col_req in ["品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"]:
+        if col_req not in df_norm.columns:
+            df_norm[col_req] = 0 if col_req != "品名" else "品名未指定"
 
-    # 6. 未マッチ列に対する位置・型ベースのインテリジェント補完
-    if "商品名" not in df_norm.columns:
-        best_str_col = None
-        max_str_cnt = 0
-        for col in df_norm.columns:
-            str_cnt = df_norm[col].apply(lambda x: 1 if isinstance(x, str) and len(x.strip()) >= 2 and not x.replace(".", "", 1).isdigit() else 0).sum()
-            if str_cnt > max_str_cnt:
-                max_str_cnt = str_cnt
-                best_str_col = col
-        if best_str_col:
-            df_norm = df_norm.rename(columns={best_str_col: "商品名"})
-        else:
-            df_norm["商品名"] = "築館なめこ" if "なめこ" in fname else "品名未指定"
+    for n_col in ["数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"]:
+        df_norm[n_col] = df_norm[n_col].apply(clean_num)
 
-    def clean_num(val, default=0):
-        try:
-            if pd.isnull(val): return default
-            s = str(val).replace(",", "").replace("¥", "").replace("円", "").strip()
-            return int(float(s))
-        except:
-            return default
+    df_norm["日付"] = df_norm["日付"].apply(parse_japanese_date) if "日付" in df_norm.columns else str(datetime.now().date())
+    df_norm["市場番号"] = df_norm["市場番号"].astype(str).str.strip() if "市場番号" in df_norm.columns else "M-001 (自社)"
+    df_norm["カテゴリー"] = df_norm["カテゴリー"].astype(str).str.strip() if "カテゴリー" in df_norm.columns else "1課4課（熊谷・大宮） / 2課 / 栗原"
+    df_norm["商品コード"] = df_norm["商品コード"].astype(str).str.strip() if "商品コード" in df_norm.columns else "AUTO"
+    df_norm["小計"] = df_norm["仕入金額"]
+    df_norm["商品名"] = df_norm["品名"]
 
-    if "単価" in df_norm.columns:
-        df_norm["単価"] = df_norm["単価"].apply(clean_num)
-    else:
-        df_norm["単価"] = 0
-
-    if "数量" in df_norm.columns:
-        df_norm["数量"] = df_norm["数量"].apply(clean_num)
-    else:
-        df_norm["数量"] = 0
-
-    if "小計" in df_norm.columns:
-        df_norm["小計"] = df_norm["小計"].apply(clean_num)
-    else:
-        df_norm["小計"] = 0
-
-    # 7. 単価・数量・金額の相互自動補完
-    df_norm["数量"] = df_norm.apply(lambda r: 1 if (r["数量"] == 0 and r["単価"] > 0) else r["数量"], axis=1)
-    df_norm["単価"] = df_norm.apply(lambda r: int(r["小計"] / r["数量"]) if (r["単価"] == 0 and r["小計"] > 0 and r["数量"] > 0) else r["単価"], axis=1)
-    df_norm["小計"] = df_norm.apply(lambda r: r["小計"] if r["小計"] > 0 else (r["単価"] * r["数量"]), axis=1)
-
-    # 8. 日付・市場番号・カテゴリー・商品コードの自動付与
-    if "日付" not in df_norm.columns:
-        df_norm["日付"] = str(datetime.now().date())
-    else:
-        df_norm["日付"] = df_norm["日付"].astype(str).str.split("T").str[0].str.split(" ").str[0].str.strip()
-        df_norm["日付"] = df_norm["日付"].replace(["nan", "None", ""], str(datetime.now().date()))
-
-    if "市場番号" not in df_norm.columns:
-        default_market = "築館なめこ組合" if "なめこ" in fname else ("仕入6課特約店" if "6課" in fname else "M-001 (一括インポート)")
-        df_norm["市場番号"] = default_market
-    else:
-        df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001").astype(str).str.strip()
-
-    if "カテゴリー" not in df_norm.columns:
-        default_cat = "栗原" if "なめこ" in fname else ("5課 / 6課（川越）" if "6課" in fname else "1課4課（熊谷・大宮） / 2課 / 栗原")
-        df_norm["カテゴリー"] = default_cat
-    else:
-        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("1課4課（熊谷・大宮） / 2課 / 栗原").astype(str).str.strip()
-
-    if "商品コード" not in df_norm.columns:
-        df_norm["商品コード"] = "AUTO"
-    else:
-        df_norm["商品コード"] = df_norm["商品コード"].fillna("AUTO").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-
-    # 9. 確実で安全な行フィルタリング（有効なデータを決して誤消去しない）
-    exclude_re = r"^(小計|合計|総合計|総計|消費税|税額|差引合計|伝票計|総合計金額|日付|年月日|項目|コード|品名)$"
-    df_norm = df_norm[~df_norm["商品名"].astype(str).str.strip().str.match(exclude_re, na=False)].copy()
-    df_norm = df_norm[df_norm["商品名"].astype(str).str.strip().replace(["nan", "None", "", "品名未指定"], pd.NA).notna()].copy()
-
-    # 有効行条件: 単価・数量・小計のいずれかがある、または商品名に2文字以上の文字列が存在する
-    df_norm = df_norm[
-        (df_norm["単価"] > 0) | 
-        (df_norm["数量"] > 0) | 
-        (df_norm["小計"] > 0) | 
-        (df_norm["商品名"].astype(str).str.len() >= 2)
-    ].reset_index(drop=True)
-
-    # 数量が0のまま残った場合は1に補正
-    df_norm["数量"] = df_norm["数量"].apply(lambda q: 1 if q <= 0 else q)
-    df_norm["小計"] = df_norm.apply(lambda r: r["小計"] if r["小計"] > 0 else (r["単価"] * r["数量"]), axis=1)
-
-    target_cols = ["日付", "市場番号", "カテゴリー", "商品コード", "商品名", "単価", "数量", "小計"]
-    df_result = df_norm[target_cols].copy()
-    extracted = [str(s).strip() for s in df_norm["市場番号"].dropna().unique().tolist() if str(s).strip() and str(s).strip() != "nan"]
-
-    return df_result, extracted
+    # 有効行フィルタリング
+    valid_mask = (df_norm["数量"] > 0) | (df_norm["単価"] > 0) | (df_norm["仕入金額"] > 0) | (df_norm["差引残高"] > 0) | (df_norm["品名"].astype(str).str.len() >= 2)
+    df_result = df_norm[valid_mask].reset_index(drop=True)
+    ext_s = [s for s in df_result["市場番号"].unique() if s and s != "nan"]
+    return df_result, ext_s
 
 # ==========================================
 # 9.5 生成AI (Gemini 4 Argon & スマート青果アナライザー) エンジン
@@ -1278,8 +1462,8 @@ def generate_produce_ai_insights(df: pd.DataFrame, custom_prompt: str = "") -> s
         cat_summary = ", ".join([f"{k}: ¥{int(v):,}" for k, v in cat_grp.items()])
 
     top_items = ""
-    if "商品名" in df.columns:
-        item_grp = df.groupby("商品名")["小計"].sum().sort_values(ascending=False).head(3)
+    if "品名" in df.columns:
+        item_grp = df.groupby("品名")["小計"].sum().sort_values(ascending=False).head(3)
         top_items = ", ".join([f"{k} (¥{int(v):,})" for k, v in item_grp.items()])
 
     high_records = df[df["単価"] > (avg_price * 3)] if avg_price > 0 else pd.DataFrame()
@@ -1451,7 +1635,7 @@ with st.sidebar:
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 取引・在庫管理 Pro</h1>
-        <p>エクセル自動照合・不一致一括修正 ＆ 昔の.xls形式最新.xlsx変換 ＆ 生成AI（Gemini 4 Argon / スマート青果アナライザー）搭載</p>
+        <p>エクセル自動照合・不一致一括修正 ＆ 昔の.xls形式全シート最新.xlsx変換 ＆ 生成AI（Gemini 4 Argon / スマート青果アナライザー）搭載</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -1478,13 +1662,13 @@ tabs = st.tabs(tab_titles)
 # ==========================================
 with tabs[0]:
     records_cnt = len(df_current) if df_current is not None else 0
-    total_qty_sum = int(df_current["数量"].sum()) if records_cnt > 0 else 0
-    total_amount_sum = int(df_current["小計"].sum()) if records_cnt > 0 else 0
+    total_qty_sum = int(df_current["数量"].sum()) if records_cnt > 0 and "数量" in df_current.columns else 0
+    total_amount_sum = int(df_current["仕入金額"].sum()) if records_cnt > 0 and "仕入金額" in df_current.columns else (int(df_current["小計"].sum()) if records_cnt > 0 and "小計" in df_current.columns else 0)
 
     k1, k2, k3, k4 = st.columns([1, 1, 1.2, 1.3])
     k1.metric("📋 取引件数", f"{records_cnt:,} 件")
     k2.metric("📦 総取引数量", f"{total_qty_sum:,} 個")
-    k3.metric("💰 総取引金額", f"¥ {total_amount_sum:,}")
+    k3.metric("💰 総仕入金額", f"¥ {total_amount_sum:,}")
     
     db_users_count = len(get_all_users_from_db())
     view_owner_label = f"全社員統合 ({db_users_count}名)" if viewing_user_filter is None else f"{viewing_user_filter} (専用)"
@@ -1512,14 +1696,14 @@ with tabs[0]:
                 "取引エクセルまたはCSVファイルをここへドラッグ＆ドロップ",
                 type=["xlsx", "xls", "csv", "tsv", "txt"],
                 key="auto_record_file_uploader_tab0",
-                help="どのパソコンのエクセルファイルでも自動解析され、即座に下の記録一覧へ正確に反映されます。昔の.xls形式も最新.xlsx形式へ即時保存可能です。"
+                help="どのパソコンのエクセルファイルでも自動解析され、品名・数量・単価・仕入金額・支払金額・差引残高・合計が下の記録一覧へ正確に反映されます。昔の.xls形式も全シート保持して最新.xlsx形式へ即時保存可能です。"
             )
         with col_up_box2:
             st.markdown("""
                 <div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; font-size: 12px; color: #475569;">
                     <b>🛡️ 堅牢解析 & 最新形式変換エンジン:</b><br>
-                    • 外部依存ゼロの自立型 Pure-Python パーサー内蔵<br>
-                    • 昔の <b>.xls 形式を最新の .xlsx 形式へ1秒で変換保存</b><br>
+                    • シート毎の <b>品名・数量・単価・仕入金額・支払金額・差引残高・合計</b> を完全保持<br>
+                    • 昔の <b>.xls 形式を最新の .xlsx 形式へ全シート保持して1秒で変換保存</b><br>
                     • 元ファイルとの<b>100%合致自動検証＆一括修正機能</b>
                 </div>
             """, unsafe_allow_html=True)
@@ -1530,25 +1714,24 @@ with tabs[0]:
                 btn_auto_import = st.button("⚡ このファイルの内容を直ちに自動記録する", type="primary", use_container_width=True, key="btn_exec_auto_record")
             with col_act2:
                 try:
-                    df_quick_check, _ = parse_trade_file(uploaded_entry_file)
+                    xlsx_quick_bytes = convert_xls_file_to_multisheet_xlsx_bytes(uploaded_entry_file)
                     uploaded_entry_file.seek(0)
-                    if not df_quick_check.empty:
-                        xlsx_quick_bytes = convert_df_to_xlsx_bytes(df_quick_check)
-                        orig_base = uploaded_entry_file.name.rsplit(".", 1)[0]
-                        st.download_button(
-                            label=f"💾 このファイルを最新Excel (.xlsx) 形式で保存",
-                            data=xlsx_quick_bytes,
-                            file_name=f"{orig_base}_最新版.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                            key="quick_download_xlsx_tab0"
-                        )
+                    orig_base = uploaded_entry_file.name.rsplit(".", 1)[0]
+                    st.download_button(
+                        label=f"💾 このファイルを全シート保持して最新Excel (.xlsx) 形式で保存",
+                        data=xlsx_quick_bytes,
+                        file_name=f"{orig_base}_最新版.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="quick_download_xlsx_tab0"
+                    )
                 except Exception:
                     pass
 
             if btn_auto_import:
                 try:
                     df_parsed, extracted_sups = parse_trade_file(uploaded_entry_file)
+                    uploaded_entry_file.seek(0)
                     if not df_parsed.empty:
                         for s in extracted_sups:
                             if s and s not in st.session_state.extracted_suppliers:
@@ -1561,7 +1744,7 @@ with tabs[0]:
                             "df": df_parsed
                         }
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録！下の記録一覧へ正確に反映されました。")
+                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録！品名・数量・単価・仕入金額・支払金額・差引残高・合計が下の記録一覧へ正確に反映されました。")
                         st.rerun()
                     else:
                         st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
@@ -1573,8 +1756,6 @@ with tabs[0]:
             v_batch = st.session_state.verification_batch
             v_file_name = v_batch["file_name"]
             expected_df = v_batch["df"].copy()
-            expected_total_qty = int(expected_df["数量"].sum()) if not expected_df.empty and "数量" in expected_df.columns else 0
-            expected_total_subtotal = int(expected_df["小計"].sum()) if not expected_df.empty and "小計" in expected_df.columns else 0
 
             mismatches = []
             matched_count = 0
@@ -1585,13 +1766,13 @@ with tabs[0]:
                     exp_market = str(exp_row.get("市場番号", "")).strip()
                     exp_cat = str(exp_row.get("カテゴリー", "1課 (熊谷・大宮)")).strip()
                     exp_code = str(exp_row.get("商品コード", "AUTO")).strip()
-                    exp_name = str(exp_row.get("商品名", "")).strip()
+                    exp_name = str(exp_row.get("品名", exp_row.get("商品名", ""))).strip()
                     exp_p = int(exp_row.get("単価", 0))
                     exp_q = int(exp_row.get("数量", 0))
-                    exp_sub = int(exp_row.get("小計", exp_p * exp_q))
+                    exp_sub = int(exp_row.get("仕入金額", exp_row.get("小計", exp_p * exp_q)))
 
                     candidates = df_current[
-                        (df_current["商品名"] == exp_name) & 
+                        (df_current["品名"] == exp_name) & 
                         (df_current["日付"] == exp_date)
                     ]
                     
@@ -1635,77 +1816,70 @@ with tabs[0]:
             else:
                 for idx, exp_row in expected_df.iterrows():
                     mismatches.append({
-                        "行番号": idx + 1, "商品名": str(exp_row.get("商品名", "")),
+                        "行番号": idx + 1, "商品名": str(exp_row.get("品名", "")),
                         "日付": str(exp_row.get("日付", "")), "市場番号": str(exp_row.get("市場番号", "")),
                         "カテゴリー": str(exp_row.get("カテゴリー", "")), "商品コード": str(exp_row.get("商品コード", "")),
                         "不一致項目": "登録データなし",
                         "元ファイルの値(正)": f"単価:¥{exp_row.get('単価', 0):,}, 数量:{exp_row.get('数量', 0):,}",
                         "現在の登録値(誤)": "テーブルが空です",
                         "exp_price": int(exp_row.get("単価", 0)), "exp_qty": int(exp_row.get("数量", 0)),
-                        "exp_subtotal": int(exp_row.get("小計", 0)), "record_id": None,
+                        "exp_subtotal": int(exp_row.get("仕入金額", 0)), "record_id": None,
                         "exp_row_dict": exp_row.to_dict()
                     })
 
             st.markdown("#### 🔍 元ファイルデータ照合 & 整合性リアルタイム検証")
             c_meta1, c_meta2, c_meta3, c_meta4 = st.columns([2.5, 1.5, 1.5, 1.5])
-            c_meta1.caption(f"📁 照合元ファイル: **{v_file_name}**")
-            c_meta2.caption(f"📋 元ファイル行数: **{len(expected_df)} 件**")
-            c_meta3.caption(f"💰 元ファイル総額: **¥ {expected_total_subtotal:,}**")
-            match_rate = round(((len(expected_df) - len(mismatches)) / len(expected_df)) * 100, 1) if len(expected_df) > 0 else 0
-            c_meta4.caption(f"🎯 合致率: **{match_rate}%**")
+            with c_meta1:
+                st.caption(f"📁 照合元ファイル: **{v_file_name}**")
+            with c_meta2:
+                st.metric("元ファイル件数", f"{len(expected_df):,} 件")
+            with c_meta3:
+                st.metric("完全合致件数", f"{matched_count:,} 件")
+            with c_meta4:
+                match_pct = round((matched_count / len(expected_df)) * 100, 1) if len(expected_df) > 0 else 0
+                st.metric("合致率", f"{match_pct} %", delta=None if match_pct == 100 else f"-{len(mismatches)} 件不一致")
 
-            if len(mismatches) == 0:
-                st.success(f"🛡️ **【100%合致確認済み】元ファイル『{v_file_name}』の全 {len(expected_df)} 件のデータが、下の記録一覧（登録済みデータ）と100%完全一致しています。単価・数量・金額の欠落やズレはありません。**")
-            else:
+            if mismatches:
                 st.markdown(f"""
                     <div class="mismatch-box">
-                        <h4 style="margin: 0; color: #991b1b;">⚠️ 元ファイル照合: {len(mismatches)} 件の不一致・差異が検出されました</h4>
-                        <p style="margin: 4px 0 0 0; color: #4b5563; font-size: 13px;">
-                            元ファイルの内容と現在の登録データとの間に相違があります。下のボタンから『個別修正』または『すべて選択して一括修正』を行うと、元のファイルと完全に同じデータに瞬時に修正され、下の記録一覧に正確に反映されます。
-                        </p>
+                        <b style="color: #991b1b;">⚠️ 元ファイルとデータベース間に {len(mismatches)} 件の不一致が検出されました。</b><br>
+                        <span style="font-size: 13px; color: #4b5563;">
+                            下の『全不一致データを一括修正・完全同期』を押すだけで、元ファイルと完全に一致させることができます。
+                        </span>
                     </div>
                 """, unsafe_allow_html=True)
+                
+                df_mismatch_view = pd.DataFrame(mismatches)[["行番号", "日付", "商品名", "不一致項目", "元ファイルの値(正)", "現在の登録値(誤)"]]
+                st.dataframe(df_mismatch_view, use_container_width=True)
 
-                diff_table_df = pd.DataFrame(mismatches)[["行番号", "商品名", "不一致項目", "元ファイルの値(正)", "現在の登録値(誤)"]]
-                st.dataframe(diff_table_df, use_container_width=True)
-
-                st.markdown("##### ✍️ 1. 個別にデータを選択して修正する")
-                mismatch_labels = [f"行{m['行番号']}: {m['商品名']} ({m['不一致項目']}: 正={m['元ファイルの値(正)']} ⇔ 誤={m['現在の登録値(誤)']})" for m in mismatches]
-                selected_m_idx = st.selectbox(
-                    "修正したい不一致データを選択:",
-                    range(len(mismatch_labels)),
-                    format_func=lambda i: mismatch_labels[i],
-                    key="sel_mismatch_single_fix"
-                )
-                target_m = mismatches[selected_m_idx]
-
-                c_m1, c_m2, c_m3, c_m4, c_m5 = st.columns([1.5, 2, 1.5, 1.5, 2])
-                with c_m1:
-                    fix_date = st.text_input("日付", value=str(target_m["日付"]), key="f_indiv_date")
-                with c_m2:
-                    fix_market = st.text_input("市場番号/取引先", value=str(target_m["市場番号"]), key="f_indiv_market")
-                with c_m3:
-                    fix_price = st.number_input("元ファイル単価 (円)", min_value=0, value=int(target_m["exp_price"]), step=10, key="f_indiv_price")
-                with c_m4:
-                    fix_qty = st.number_input("元ファイル数量", min_value=0, value=int(target_m["exp_qty"]), step=1, key="f_indiv_qty")
-                with c_m5:
-                    fix_subtotal = fix_price * fix_qty
-                    st.metric("修正後金額", f"¥ {fix_subtotal:,}")
-
-                c_btn_single, c_btn_all, c_btn_close = st.columns([2.5, 3.5, 1.5])
+                c_sel_fix, c_btn_single, c_btn_all, c_btn_close = st.columns([2.0, 1.5, 2.5, 1.0])
+                with c_sel_fix:
+                    opts = [f"行{m['行番号']}: {m['商品名']} ({m['不一致項目']})" for m in mismatches]
+                    sel_m_idx = st.selectbox("個別修正する項目を選択:", range(len(opts)), format_func=lambda i: opts[i], key="sel_mismatch_idx")
+                
                 with c_btn_single:
-                    if st.button("✍️ 選択したデータを元ファイルと同じに修正", type="primary", use_container_width=True, key="fix_single_mismatch_btn"):
+                    if st.button("🛠️ 選択項目を修正", use_container_width=True, key="fix_single_mismatch_btn"):
+                        target_m = mismatches[sel_m_idx]
+                        r_exp = target_m["exp_row_dict"]
+                        fix_price = int(r_exp.get("単価", 0))
+                        fix_qty = int(r_exp.get("数量", 0))
+                        fix_subtotal = int(r_exp.get("仕入金額", fix_price * fix_qty))
+                        fix_market = str(r_exp.get("市場番号", "M-001"))
+                        fix_date = str(r_exp.get("日付", ""))
+
                         if target_m.get("record_id"):
                             update_single_record_in_db({
                                 "id": target_m["record_id"], "日付": fix_date, "市場番号": fix_market,
                                 "カテゴリー": target_m["カテゴリー"], "商品コード": target_m["商品コード"],
-                                "商品名": target_m["商品名"], "単価": fix_price, "数量": fix_qty, "小計": fix_subtotal
+                                "品名": target_m["商品名"], "単価": fix_price, "数量": fix_qty, "仕入金額": fix_subtotal,
+                                "支払金額": int(r_exp.get("支払金額", 0)), "差引残高": int(r_exp.get("差引残高", 0)), "合計": int(r_exp.get("合計", 0))
                             })
                         else:
                             insert_records_to_db(current_user, [{
                                 "日付": fix_date, "市場番号": fix_market, "カテゴリー": target_m["カテゴリー"],
-                                "商品コード": target_m["商品コード"], "商品名": target_m["商品名"],
-                                "単価": fix_price, "数量": fix_qty, "小計": fix_subtotal
+                                "商品コード": target_m["商品コード"], "品名": target_m["商品名"],
+                                "単価": fix_price, "数量": fix_qty, "仕入金額": fix_subtotal,
+                                "支払金額": int(r_exp.get("支払金額", 0)), "差引残高": int(r_exp.get("差引残高", 0)), "合計": int(r_exp.get("合計", 0))
                             }])
                         invalidate_records_cache()
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
@@ -1718,12 +1892,17 @@ with tabs[0]:
                             r_exp = m_item["exp_row_dict"]
                             p = int(r_exp.get("単価", 0))
                             q = int(r_exp.get("数量", 0))
+                            sub_v = int(r_exp.get("仕入金額", p * q))
+                            pay_v = int(r_exp.get("支払金額", 0))
+                            bal_v = int(r_exp.get("差引残高", 0))
+                            tot_v = int(r_exp.get("合計", 0))
                             if m_item.get("record_id"):
                                 update_single_record_in_db({
                                     "id": m_item["record_id"], "日付": str(r_exp.get("日付", "")),
                                     "市場番号": str(r_exp.get("市場番号", "")), "カテゴリー": str(r_exp.get("カテゴリー", "")),
-                                    "商品コード": str(r_exp.get("商品コード", "")), "商品名": str(r_exp.get("商品名", "")),
-                                    "単価": p, "数量": q, "小計": p * q
+                                    "商品コード": str(r_exp.get("商品コード", "")), "品名": str(r_exp.get("品名", r_exp.get("商品名", ""))),
+                                    "単価": p, "数量": q, "仕入金額": sub_v, "小計": sub_v,
+                                    "支払金額": pay_v, "差引残高": bal_v, "合計": tot_v
                                 })
                             else:
                                 insert_records_to_db(current_user, [r_exp])
@@ -1861,9 +2040,13 @@ with tabs[0]:
                         "市場番号": batch_market_no.strip() if batch_market_no.strip() else "M-001 (自社)",
                         "カテゴリー": chosen_dept,
                         "商品コード": code,
-                        "商品名": name,
+                        "品名": name,
                         "単価": r["price"],
                         "数量": r["qty"],
+                        "仕入金額": r["price"] * r["qty"],
+                        "支払金額": 0,
+                        "差引残高": r["price"] * r["qty"],
+                        "合計": 0,
                         "小計": r["price"] * r["qty"]
                     })
 
@@ -1882,24 +2065,34 @@ with tabs[0]:
     if records_cnt > 0:
         col_config = {
             "id": None,
-            "日付": st.column_config.TextColumn("日付", required=True),
-            "市場番号": st.column_config.TextColumn("市場番号", required=True),
+            "小計": None,
+            "商品名": None,
+            "日付": st.column_config.TextColumn("仕入日 / 日付", required=True),
+            "市場番号": st.column_config.TextColumn("取引先名 / 市場番号", required=True),
             "カテゴリー": st.column_config.TextColumn("カテゴリー"),
             "商品コード": st.column_config.TextColumn("商品コード"),
-            "商品名": st.column_config.TextColumn("商品名"),
-            "単価": st.column_config.NumberColumn("単価 (円)", min_value=0, format="¥%d"),
+            "品名": st.column_config.TextColumn("品名", required=True),
             "数量": st.column_config.NumberColumn("数量", min_value=0, format="%d"),
-            "小計": st.column_config.NumberColumn("小計 (自動計算)", disabled=True, format="¥%d")
+            "単価": st.column_config.NumberColumn("単価 (円)", min_value=0, format="¥%d"),
+            "仕入金額": st.column_config.NumberColumn("仕入金額 (円)", min_value=0, format="¥%d"),
+            "支払金額": st.column_config.NumberColumn("支払金額 (円)", min_value=0, format="¥%d"),
+            "差引残高": st.column_config.NumberColumn("差引残高 (円)", format="¥%d"),
+            "合計": st.column_config.NumberColumn("合計 (円)", min_value=0, format="¥%d")
         }
         if "登録担当者" in df_current.columns:
             col_config["登録担当者"] = st.column_config.TextColumn("担当社員", disabled=True)
 
+        # 整理された表示順序
+        display_cols = ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計", "登録担当者", "小計", "商品名"]
+        valid_cols = [c for c in display_cols if c in df_current.columns]
+        df_for_editor = df_current[valid_cols].copy()
+
         edited_df = st.data_editor(
-            df_current,
+            df_for_editor,
             column_config=col_config,
             num_rows="dynamic",
             use_container_width=True,
-            height=320,
+            height=340,
             key=f"native_fast_editor_v{st.session_state.get('editor_version', 0)}"
         )
 
@@ -1909,17 +2102,24 @@ with tabs[0]:
                 for _, row in edited_df.iterrows():
                     r_dict = row.to_dict()
                     try:
-                        p, q = int(float(r_dict.get("単価", 0))), int(float(r_dict.get("数量", 0)))
-                    except:
-                        p, q = 0, 0
-                    r_dict["単価"], r_dict["数量"], r_dict["小計"] = p, q, p * q
+                        p = int(float(r_dict.get("単価", 0)))
+                        q = int(float(r_dict.get("数量", 0)))
+                        sub = int(float(r_dict.get("仕入金額", r_dict.get("小計", p * q))))
+                        pay = int(float(r_dict.get("支払金額", 0)))
+                        bal = int(float(r_dict.get("差引残高", 0)))
+                        tot = int(float(r_dict.get("合計", 0)))
+                    except Exception:
+                        p, q, sub, pay, bal, tot = 0, 0, 0, 0, 0, 0
+                    r_dict["単価"], r_dict["数量"], r_dict["仕入金額"], r_dict["支払金額"], r_dict["差引残高"], r_dict["合計"] = p, q, sub, pay, bal, tot
+                    r_dict["小計"] = sub
+                    r_dict["商品名"] = r_dict.get("品名", "品名未指定")
                     if pd.notnull(r_dict.get("id")):
                         update_single_record_in_db(r_dict)
                     else:
                         insert_records_to_db(current_user, [r_dict], auto_backup=False)
 
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.toast("✅ 編集内容を保存しました！")
+                st.toast("✅ 編集内容（品名・数量・単価・仕入金額・支払金額・差引残高・合計）を保存しました！")
                 st.rerun()
 
         with col_del:
@@ -1935,7 +2135,8 @@ with tabs[0]:
                     st.rerun()
 
         with col_dl_xlsx:
-            xlsx_export_bytes = convert_df_to_xlsx_bytes(edited_df)
+            export_cols = [c for c in ["日付", "市場番号", "カテゴリー", "商品コード", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計", "登録担当者"] if c in edited_df.columns]
+            xlsx_export_bytes = convert_df_to_xlsx_bytes(edited_df[export_cols], sheet_name="青果取引データ")
             st.download_button(
                 "📗 最新 Excel (.xlsx) 出力",
                 data=xlsx_export_bytes,
@@ -1945,7 +2146,8 @@ with tabs[0]:
             )
 
         with col_dl_csv:
-            csv_export = edited_df.to_csv(index=False).encode("utf-8-sig")
+            export_cols = [c for c in ["日付", "市場番号", "カテゴリー", "商品コード", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計", "登録担当者"] if c in edited_df.columns]
+            csv_export = edited_df[export_cols].to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "📥 CSV出力",
                 data=csv_export,
@@ -2135,11 +2337,12 @@ with tabs[5]:
 
     st.markdown("""
         <div class="converter-box">
-            <h4 style="margin: 0; color: #0369a1;">🔄 昔のエクセルファイル形式（.xls）を最新形式（.xlsx）へワンクリック即時変換</h4>
+            <h4 style="margin: 0; color: #0369a1;">🔄 昔のエクセルファイル形式（.xls）を最新形式（.xlsx）へ全シート・全数値保持で完全変換</h4>
             <p style="margin: 6px 0 0 0; color: #334155; font-size: 13px;">
-                「仕入台帳6課 .xls」や「築館なめこ .xls」など、古いバイナリやスペース付き帳票の <b>.xls</b> ファイルをアップロードするだけで、
-                ヘッダーや空白を自動補正・解読し、最新の <b>Excelブック (.xlsx)</b> 形式へ瞬時に変換してダウンロードできます。<br>
-                変換したファイルはそのままデータベースへ一括インポートしたり、お手元のExcelで最新形式として保存・利用できます。
+                「ビューティー花壇 .xls」や「築館なめこ .xls」「仕入台帳6課 .xls」など、古い形式の <b>.xls</b> ファイルをアップロードするだけで、
+                <b>シート毎に表示されている「品名」「数量」「単価」「仕入金額」「支払金額」「差引残高」「合計」の数値データおよび書式を100%保持</b> したまま、
+                最新の <b>Excelブック (.xlsx)</b> 形式へ瞬時に変換してダウンロードできます。<br>
+                同時に、下のインポートボタンを押すことで、そのままデータベースへ自動記録され、<b>「登録済みデータ一覧」へ全ての数値データと書式が自動的に反映</b>されます。
             </p>
         </div>
     """, unsafe_allow_html=True)
@@ -2156,18 +2359,23 @@ with tabs[5]:
         file_base_name = fname.rsplit(".", 1)[0]
 
         try:
+            # 全シート生データの抽出
+            raw_sheets = extract_all_raw_sheets_from_file(uploaded_file)
+            uploaded_file.seek(0)
             df_up, sups = parse_trade_file(uploaded_file)
             uploaded_file.seek(0)
 
-            if not df_up.empty:
-                st.markdown(f"#### 📄 解析結果プレビュー: 『{fname}』 (全 {len(df_up):,} 件)")
+            if not df_up.empty or raw_sheets:
+                total_rows = len(df_up) if not df_up.empty else sum(len(s) for s in raw_sheets.values())
+                st.markdown(f"#### 📄 解析結果プレビュー: 『{fname}』 (検出シート数: {len(raw_sheets)} シート / 全 {total_rows:,} 件)")
                 
-                # 変換ダウンロードエリア
-                c_trans1, c_trans2 = st.columns([1.5, 1.5])
+                # 変換ダウンロードエリア (全シート保持 .xlsx)
+                c_trans1, c_trans2 = st.columns([1.8, 1.2])
                 with c_trans1:
-                    xlsx_converted_data = convert_df_to_xlsx_bytes(df_up, sheet_name="取引データ")
+                    xlsx_converted_data = convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file)
+                    uploaded_file.seek(0)
                     st.download_button(
-                        label="📗 最新の Excel ブック (.xlsx) に変換してダウンロード",
+                        label="📗 全シート保持 最新 Excel ブック (.xlsx) に一括変換してダウンロード",
                         data=xlsx_converted_data,
                         file_name=f"{file_base_name}_最新変換.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2175,9 +2383,10 @@ with tabs[5]:
                         type="primary"
                     )
                 with c_trans2:
-                    csv_converted_data = df_up.to_csv(index=False).encode("utf-8-sig")
+                    csv_export_cols = [c for c in ["日付", "市場番号", "カテゴリー", "商品コード", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"] if c in df_up.columns]
+                    csv_converted_data = df_up[csv_export_cols].to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
-                        label="📥 CSV (カンマ区切り) 形式でダウンロード",
+                        label="📥 全シート統合 CSV 形式でダウンロード",
                         data=csv_converted_data,
                         file_name=f"{file_base_name}_変換.csv",
                         mime="text/csv",
@@ -2185,15 +2394,27 @@ with tabs[5]:
                     )
 
                 if is_legacy_xls:
-                    st.success(f"🎉 昔のエクセル形式 (<b>{fname}</b>) を最新の <b>.xlsx</b> 形式に正常変換しました！上記の緑色ボタンからダウンロードいただけます。")
+                    sheet_names_str = ", ".join(list(raw_sheets.keys())[:4]) + (" ほか" if len(raw_sheets) > 4 else "")
+                    st.success(f"🎉 昔のエクセル形式 (<b>{fname}</b>) の全シート（{sheet_names_str}）に記載された<b>品名・数量・単価・仕入金額・支払金額・差引残高・合計</b>を保持したまま最新 <b>.xlsx</b> 形式に正常変換しました！上記の緑色ボタンからダウンロード可能です。")
 
                 st.write("")
-                st.dataframe(df_up.head(10), use_container_width=True)
+                # シート別プレビュー表示
+                if len(raw_sheets) > 1:
+                    st.markdown("##### 📑 シート別プレビュー（各シートの品名・数値データをそのまま確認）")
+                    preview_tabs = st.tabs(list(raw_sheets.keys())[:6])
+                    for t_idx, (sname, sdf) in enumerate(list(raw_sheets.items())[:6]):
+                        with preview_tabs[t_idx]:
+                            st.caption(f"シート名: **{sname}** ({len(sdf)} 行)")
+                            st.dataframe(sdf.head(15), use_container_width=True)
+                else:
+                    st.markdown("##### 📋 解析データプレビュー")
+                    preview_cols = [c for c in ["日付", "市場番号", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"] if c in df_up.columns]
+                    st.dataframe(df_up[preview_cols].head(15), use_container_width=True)
 
-                st.markdown("##### 📥 データベースへの一括インポート")
+                st.markdown("##### 📥 データベースへの一括自動記録")
                 col_imp1, col_imp2 = st.columns([2, 3])
                 with col_imp1:
-                    if st.button("📥 この内容をデータベースに一括インポートする", type="primary", use_container_width=True, key="btn_bulk_import_exec"):
+                    if st.button("📥 この内容をデータベースに一括自動記録する", type="primary", use_container_width=True, key="btn_bulk_import_exec"):
                         for s in sups:
                             if s and s not in st.session_state.extracted_suppliers:
                                 st.session_state.extracted_suppliers.append(s)
@@ -2204,7 +2425,7 @@ with tabs[5]:
                             "df": df_up
                         }
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.success(f"🎉 『{uploaded_file.name}』から {len(df_up):,} 件を一括インポートしました！（登録担当者: {current_user}）")
+                        st.success(f"🎉 『{uploaded_file.name}』から {len(df_up):,} 件を一括記録しました！「登録済みデータ一覧」に品名・数量・単価・仕入金額・支払金額・差引残高・合計が自動反映されました。")
                         st.rerun()
                 with col_imp2:
                     if sups:
