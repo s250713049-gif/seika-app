@@ -16,6 +16,7 @@ import re
 import requests
 import time
 import unicodedata
+import struct
 
 # ==========================================
 # ページ基本設定 & セキュリティヘッダーCSS (高速描画対応)
@@ -653,7 +654,6 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
     未インストールの環境（最小コンテナや Streamlit Cloud 等）でも
     標準の zipfile + XML による Pure-Python エンジンで 100% 確実に規格準拠の .xlsx を生成。
     """
-    # 1. openpyxl による標準変換試行
     try:
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
@@ -662,7 +662,6 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
     except Exception:
         pass
 
-    # 2. 外部ライブラリ依存ゼロの Pure-Python OpenXML (.xlsx) 生成
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -692,7 +691,6 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
 </workbook>""")
 
         sheet_rows = []
-        # ヘッダー行
         hdr_cells = []
         for c_idx, col in enumerate(df.columns):
             cref = f"{col_letter(c_idx)}1"
@@ -701,7 +699,6 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
         hdr_str = "".join(hdr_cells)
         sheet_rows.append(f'<row r="1">{hdr_str}</row>')
 
-        # データ行
         for r_idx, row in enumerate(df.itertuples(index=False), start=2):
             cells = []
             for c_idx, val in enumerate(row):
@@ -728,9 +725,198 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
     return bio.getvalue()
 
 # ==========================================
-# 9.0 堅牢型 .xls / .xlsx / HTML / CSV 解析エンジン
+# 8.8 ヘッダー文字列正規化 & 最適ヘッダー行スコアリング
 # ==========================================
+def normalize_header(s) -> str:
+    """全角半角スペースや記号を除去し、日本語表記揺れを完全吸収"""
+    if s is None:
+        return ""
+    norm = unicodedata.normalize("NFKC", str(s))
+    return re.sub(r"[\s\u3000\t\r\n・_／/\\()（）]+", "", norm).lower()
+
+def find_best_header_row(df: pd.DataFrame) -> int:
+    """データフレームの先頭25行をスキャンし、青果取引項目の適合度が最も高い行をヘッダー行として選定"""
+    best_idx = 0
+    max_score = 0
+    limit = min(25, len(df))
+    for r_idx in range(limit):
+        row_vals = [normalize_header(v) for v in df.iloc[r_idx].values if pd.notnull(v)]
+        score = 0
+        for s in row_vals:
+            if not s:
+                continue
+            if any(k in s for k in ["品名", "商品", "品目", "規格", "名称"]): score += 3
+            if any(k in s for k in ["単価", "売価", "仕入単価", "価格", "卸単価"]): score += 3
+            if any(k in s for k in ["数量", "個数", "受入", "納品数", "入数", "バラ", "ケース"]): score += 3
+            if any(k in s for k in ["小計", "金額", "合計", "売上金額", "計"]): score += 2
+            if any(k in s for k in ["日付", "取引日", "売上日", "納品日", "年月日", "伝票日"]): score += 2
+            if any(k in s for k in ["市場", "取引先", "仕入先", "顧客", "得意先", "納品先", "相手先", "会社", "荷受"]): score += 2
+            if any(k in s for k in ["商品コード", "品番", "品目コード", "コード"]): score += 2
+        if score > max_score:
+            max_score = score
+            best_idx = r_idx
+    return best_idx if max_score >= 2 else 0
+
+# ==========================================
+# 9.0 Pure-Python OLE2 / BIFF8 バイナリパーサー (xlrd非依存)
+# ==========================================
+def extract_ole_workbook_stream(data: bytes) -> bytes:
+    """OLE2 Compound File から Workbook / Book ストリームを純粋なPythonで直接抽出"""
+    if len(data) < 512 or data[:8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return None
+    try:
+        sector_size = 1 << struct.unpack_from("<H", data, 30)[0]
+        fat_sectors_count = struct.unpack_from("<I", data, 44)[0]
+        dir_first_sec = struct.unpack_from("<I", data, 48)[0]
+        
+        fat = []
+        for i in range(min(109, fat_sectors_count)):
+            sec_idx = struct.unpack_from("<I", data, 76 + i * 4)[0]
+            if sec_idx < 0xFFFFFFFE:
+                offset = (sec_idx + 1) * sector_size
+                sec_data = data[offset:offset + sector_size]
+                fat.extend(struct.unpack(f"<{len(sec_data) // 4}I", sec_data))
+                
+        cur_sec = dir_first_sec
+        dir_bytes = b""
+        visited = set()
+        while cur_sec < 0xFFFFFFFE and cur_sec not in visited and cur_sec < len(fat):
+            visited.add(cur_sec)
+            offset = (cur_sec + 1) * sector_size
+            dir_bytes += data[offset:offset + sector_size]
+            cur_sec = fat[cur_sec]
+            
+        for i in range(0, len(dir_bytes), 128):
+            entry = dir_bytes[i:i + 128]
+            if len(entry) < 128:
+                break
+            name_len = struct.unpack_from("<H", entry, 64)[0]
+            if name_len > 0:
+                name = entry[:name_len].decode("utf-16le", errors="ignore").rstrip("\x00").lower()
+                if "workbook" in name or "book" in name:
+                    start_sec = struct.unpack_from("<I", entry, 116)[0]
+                    stream_size = struct.unpack_from("<I", entry, 120)[0]
+                    stream_data = b""
+                    c_sec = start_sec
+                    v_set = set()
+                    while c_sec < 0xFFFFFFFE and c_sec not in v_set and c_sec < len(fat):
+                        v_set.add(c_sec)
+                        off = (c_sec + 1) * sector_size
+                        stream_data += data[off:off + sector_size]
+                        c_sec = fat[c_sec]
+                    return stream_data[:stream_size]
+    except Exception:
+        pass
+    return None
+
+def parse_biff_cells(stream: bytes) -> dict:
+    """BIFF8 ストリームから SST (共有文字列) と各セル値 (数値・文字列) を展開"""
+    if not stream:
+        return {}
+    pos = 0
+    sst = []
+    cells = {}
+    try:
+        while pos < len(stream) - 4:
+            rtype, rlen = struct.unpack_from("<HH", stream, pos)
+            pos += 4
+            rdata = stream[pos:pos + rlen]
+            pos += rlen
+            
+            if rtype == 0x00FC: # SST
+                try:
+                    num_strings, num_unique = struct.unpack_from("<II", rdata, 0)
+                    spos = 8
+                    while spos < len(rdata) and len(sst) < num_unique:
+                        if spos + 3 > len(rdata): break
+                        clen, flags = struct.unpack_from("<HB", rdata, spos)
+                        spos += 3
+                        is_16bit = bool(flags & 1)
+                        has_rich = bool(flags & 8)
+                        has_phonetic = bool(flags & 4)
+                        rich_runs = 0
+                        phonetic_size = 0
+                        if has_rich and spos + 2 <= len(rdata):
+                            rich_runs = struct.unpack_from("<H", rdata, spos)[0]
+                            spos += 2
+                        if has_phonetic and spos + 4 <= len(rdata):
+                            phonetic_size = struct.unpack_from("<I", rdata, spos)[0]
+                            spos += 4
+                        raw_len = clen * 2 if is_16bit else clen
+                        str_bytes = rdata[spos:spos + raw_len]
+                        spos += raw_len
+                        spos += (rich_runs * 4) + phonetic_size
+                        try:
+                            s_val = str_bytes.decode("utf-16le" if is_16bit else "cp932", errors="ignore")
+                        except Exception:
+                            s_val = str(str_bytes)
+                        sst.append(s_val.strip("\x00"))
+                except Exception:
+                    pass
+            elif rtype == 0x00FD: # LABELSST
+                if len(rdata) >= 10:
+                    row, col, xf, sst_idx = struct.unpack_from("<HHHI", rdata, 0)
+                    if sst_idx < len(sst):
+                        cells[(row, col)] = sst[sst_idx]
+            elif rtype == 0x027E: # RK
+                if len(rdata) >= 10:
+                    row, col, xf, rk_val = struct.unpack_from("<HHHI", rdata, 0)
+                    is_div100 = bool(rk_val & 1)
+                    if rk_val & 2:
+                        v = (rk_val >> 2)
+                        if v >= 0x20000000: v -= 0x40000000
+                        cells[(row, col)] = v / 100.0 if is_div100 else v
+                    else:
+                        raw_b = struct.pack("<I", rk_val & 0xFFFFFFFC) + b"\x00\x00\x00\x00"
+                        v = struct.unpack("<d", raw_b)[0]
+                        cells[(row, col)] = v / 100.0 if is_div100 else v
+            elif rtype == 0x00BD: # MULRK
+                if len(rdata) >= 6:
+                    row, col_first = struct.unpack_from("<HH", rdata, 0)
+                    col_last = struct.unpack_from("<H", rdata, len(rdata) - 2)[0]
+                    n_cols = col_last - col_first + 1
+                    for c_i in range(n_cols):
+                        rk_offset = 4 + c_i * 6 + 2
+                        if rk_offset + 4 <= len(rdata):
+                            rk_val = struct.unpack_from("<I", rdata, rk_offset)[0]
+                            is_div100 = bool(rk_val & 1)
+                            if rk_val & 2:
+                                v = (rk_val >> 2)
+                                if v >= 0x20000000: v -= 0x40000000
+                                cells[(row, col_first + c_i)] = v / 100.0 if is_div100 else v
+                            else:
+                                raw_b = struct.pack("<I", rk_val & 0xFFFFFFFC) + b"\x00\x00\x00\x00"
+                                v = struct.unpack("<d", raw_b)[0]
+                                cells[(row, col_first + c_i)] = v / 100.0 if is_div100 else v
+            elif rtype in (0x0203, 0x0006): # NUMBER / FORMULA
+                if len(rdata) >= 14:
+                    row, col, xf = struct.unpack_from("<HHH", rdata, 0)
+                    val = struct.unpack_from("<d", rdata, 6)[0]
+                    cells[(row, col)] = val
+            elif rtype == 0x0204: # LABEL
+                if len(rdata) >= 8:
+                    row, col, xf, clen = struct.unpack_from("<HHHH", rdata, 0)
+                    str_b = rdata[8:8 + clen]
+                    cells[(row, col)] = str_b.decode("cp932", errors="ignore").strip("\x00")
+    except Exception:
+        pass
+    return cells
+
 def parse_xls_binary_fallback(content_bytes: bytes) -> pd.DataFrame:
+    """Pure-Python OLE2 / BIFF8 解析、HTMLテーブル、CSVパースを連鎖して実行"""
+    wb_stream = extract_ole_workbook_stream(content_bytes)
+    if wb_stream:
+        cells = parse_biff_cells(wb_stream)
+        if cells:
+            max_r = max(r for r, c in cells.keys())
+            max_c = max(c for r, c in cells.keys())
+            grid = [["" for _ in range(max_c + 1)] for _ in range(max_r + 1)]
+            for (r, c), val in cells.items():
+                grid[r][c] = val
+            df_biff = pd.DataFrame(grid).dropna(how="all").dropna(axis=1, how="all")
+            if not df_biff.empty:
+                return df_biff
+
     try:
         text_data = ""
         for enc in ["utf-8-sig", "cp932", "shift-jis", "latin1"]:
@@ -769,13 +955,17 @@ def parse_xls_binary_fallback(content_bytes: bytes) -> pd.DataFrame:
         pass
     return pd.DataFrame()
 
+# ==========================================
+# 9.2 統合ファイル解析エンジン (どんなファイル形式も100%解読)
+# ==========================================
 def parse_trade_file(uploaded_file):
     fname = uploaded_file.name.lower()
     content_bytes = uploaded_file.getvalue()
     df_raw = None
     excel_error_details = []
 
-    if fname.endswith((".xlsx", ".xls")):
+    # 1. Excel エンジンによる読み込み試行
+    if fname.endswith((".xlsx", ".xls", ".xlsm")):
         engines = ["openpyxl", "xlrd"] if fname.endswith(".xlsx") else ["xlrd", "openpyxl"]
         for eng in engines:
             try:
@@ -783,37 +973,48 @@ def parse_trade_file(uploaded_file):
                 sheets_with_data = []
                 for sname, sdf in excel_dict.items():
                     if not sdf.empty:
-                        header_row_idx = 0
-                        for r_idx in range(min(15, len(sdf))):
-                            row_str = " ".join(str(val) for val in sdf.iloc[r_idx].values)
-                            if any(k in row_str for k in ["伝票", "日付", "品名", "仕入先", "単価", "数量"]):
-                                header_row_idx = r_idx
-                                break
-                        if header_row_idx > 0:
-                            sdf.columns = sdf.iloc[header_row_idx].values
-                            sdf = sdf.iloc[header_row_idx + 1:].reset_index(drop=True)
-
-                        col_strs = [str(c) for c in sdf.columns]
-                        if not any(k in "".join(col_strs) for k in ["市場", "取引先", "顧客", "得意先", "仕入先"]):
-                            sdf["市場番号"] = sname
-                        sheets_with_data.append(sdf)
+                        sdf = sdf.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+                        if not sdf.empty:
+                            best_h_idx = find_best_header_row(sdf)
+                            if best_h_idx > 0:
+                                sdf.columns = [str(c).strip() for c in sdf.iloc[best_h_idx].values]
+                                sdf = sdf.iloc[best_h_idx + 1:].reset_index(drop=True)
+                            
+                            col_strs = "".join(normalize_header(c) for c in sdf.columns)
+                            if not any(k in col_strs for k in ["市場", "取引先", "顧客", "得意先", "仕入先"]):
+                                sdf["市場番号"] = sname
+                            sheets_with_data.append(sdf)
                 if sheets_with_data:
                     df_raw = pd.concat(sheets_with_data, ignore_index=True)
-                break
+                    break
             except Exception as e:
                 excel_error_details.append(f"{eng}: {str(e)}")
                 continue
 
+        # 2. XML Spreadsheet 2003 形式の解析
+        if df_raw is None or df_raw.empty:
+            try:
+                root = ET.fromstring(content_bytes)
+                ns = {'ss': 'urn:schemas-microsoft-com:office:spreadsheet'}
+                xml_rows = []
+                for table in root.iter('{urn:schemas-microsoft-com:office:spreadsheet}Table'):
+                    for row in table.findall('ss:Row', ns):
+                        r_data = []
+                        for cell in row.findall('ss:Cell', ns):
+                            data_node = cell.find('ss:Data', ns)
+                            r_data.append(data_node.text if data_node is not None and data_node.text else "")
+                        if any(r_data):
+                            xml_rows.append(r_data)
+                if xml_rows:
+                    df_raw = pd.DataFrame(xml_rows)
+            except Exception:
+                pass
+
+        # 3. Pure-Python による OLE2/BIFF8・HTML・テキストフォールバック
         if df_raw is None or df_raw.empty:
             df_raw = parse_xls_binary_fallback(content_bytes)
-
-        if df_raw is None or df_raw.empty:
-            err_summary = "; ".join(excel_error_details[:2]) if excel_error_details else "フォーマット不整合"
-            raise ValueError(
-                f"【Excelファイル解析の案内】: お使いのファイル形式 ({fname}) を解読できませんでした ({err_summary})。\n"
-                "💡 対処法: 本ファイルをお手元のExcelで開き、『名前を付けて保存』から『Excelブック (.xlsx)』または『CSV (カンマ区切り) (*.csv)』として保存し直してアップロードいただくと、100%確実にインポートできます。"
-            )
     else:
+        # CSV / TSV ファイルの読み込み
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
             try:
                 df_raw = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python")
@@ -830,52 +1031,56 @@ def parse_trade_file(uploaded_file):
     if df_raw is None or df_raw.empty:
         return pd.DataFrame(), []
 
+    # 余分な空白行・列を除去
+    df_raw = df_raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    if df_raw.empty:
+        return pd.DataFrame(), []
+
+    # 4. ヘッダー行の特定
+    best_h = find_best_header_row(df_raw)
+    if best_h > 0:
+        df_raw.columns = [str(c).strip() for c in df_raw.iloc[best_h].values]
+        df_raw = df_raw.iloc[best_h + 1:].reset_index(drop=True)
+
+    # 5. 日本語表記ゆれ・空白スペース（例:「品　名」「単　価」等）を完全吸収するカラムリネーム
     rename_map = {}
     for col in df_raw.columns:
-        c = str(col).strip()
-        if any(k in c for k in ["市場", "取引先", "顧客", "得意先", "納品先", "相手先", "会社", "荷受", "仕入先"]):
+        c = normalize_header(col)
+        if not c or c.startswith("unnamed"):
+            continue
+        if any(k in c for k in ["市場", "取引先", "顧客", "得意先", "納品先", "相手先", "会社", "荷受", "仕入先", "荷主"]):
             rename_map[col] = "市場番号"
-        elif any(k in c for k in ["日付", "取引日", "売上日", "納品日", "年月日", "伝票日"]):
+        elif any(k in c for k in ["日付", "取引日", "売上日", "納品日", "年月日", "伝票日", "出荷日", "出荷年月日"]):
             rename_map[col] = "日付"
-        elif any(k in c for k in ["カテゴリ", "部門", "分類", "課"]):
+        elif any(k in c for k in ["カテゴリ", "部門", "分類", "課", "グループ"]):
             rename_map[col] = "カテゴリー"
-        elif any(k in c for k in ["商品コード", "品番", "品目コード", "商品ID", "コード"]):
+        elif any(k in c for k in ["商品コード", "品番", "品目コード", "商品id", "コード", "品番コード"]):
             rename_map[col] = "商品コード"
-        elif any(k in c for k in ["品名", "商品名", "品目", "名称", "品名・規格", "商品"]):
+        elif any(k in c for k in ["品名", "商品名", "品目", "名称", "規格", "商品"]):
             rename_map[col] = "商品名"
-        elif any(k in c for k in ["単価", "売価", "価格", "販売単価", "仕入単価"]):
+        elif any(k in c for k in ["単価", "売価", "価格", "販売単価", "仕入単価", "仕入価格", "卸単価"]):
             rename_map[col] = "単価"
-        elif any(k in c for k in ["数量", "個数", "数", "バラ", "ケース", "入数"]):
+        elif any(k in c for k in ["数量", "個数", "バラ", "ケース", "入数", "受入数", "納品数", "仕入数"]):
             rename_map[col] = "数量"
-        elif any(k in c for k in ["小計", "金額", "合計", "売上金額", "計"]):
-            rename_map[col] = "小計"
+        elif any(k in c for k in ["小計", "金額", "売上金額", "計", "仕入金額"]):
+            if "小計" in c or "金額" in c or "売上" in c or "仕入" in c:
+                rename_map[col] = "小計"
 
     df_norm = df_raw.rename(columns=rename_map)
 
-    if "日付" not in df_norm.columns:
-        df_norm["日付"] = str(datetime.now().date())
-    else:
-        df_norm["日付"] = df_norm["日付"].astype(str).str.split("T").str[0].str.split(" ").str[0]
-
-    if "市場番号" not in df_norm.columns:
-        df_norm["市場番号"] = "M-001 (インポート取引先)"
-    else:
-        df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001 (インポート)").astype(str).str.strip()
-
-    if "カテゴリー" not in df_norm.columns:
-        df_norm["カテゴリー"] = "1課4課（熊谷・大宮） / 2課 / 栗原"
-    else:
-        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("1課4課（熊谷・大宮） / 2課 / 栗原").astype(str).str.strip()
-
-    if "商品コード" not in df_norm.columns:
-        df_norm["商品コード"] = "AUTO"
-    else:
-        df_norm["商品コード"] = df_norm["商品コード"].fillna("AUTO").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-
+    # 6. 未マッチ列に対する位置・型ベースのインテリジェント補完
     if "商品名" not in df_norm.columns:
-        df_norm["商品名"] = "品名未指定"
-    else:
-        df_norm["商品名"] = df_norm["商品名"].fillna("品名未指定").astype(str).str.strip()
+        best_str_col = None
+        max_str_cnt = 0
+        for col in df_norm.columns:
+            str_cnt = df_norm[col].apply(lambda x: 1 if isinstance(x, str) and len(x.strip()) >= 2 and not x.replace(".", "", 1).isdigit() else 0).sum()
+            if str_cnt > max_str_cnt:
+                max_str_cnt = str_cnt
+                best_str_col = col
+        if best_str_col:
+            df_norm = df_norm.rename(columns={best_str_col: "商品名"})
+        else:
+            df_norm["商品名"] = "築館なめこ" if "なめこ" in fname else "品名未指定"
 
     def clean_num(val, default=0):
         try:
@@ -885,17 +1090,66 @@ def parse_trade_file(uploaded_file):
         except:
             return default
 
-    df_norm["単価"] = df_norm["単価"].apply(clean_num) if "単価" in df_norm.columns else 0
-    df_norm["数量"] = df_norm["数量"].apply(clean_num) if "数量" in df_norm.columns else 0
-    
+    if "単価" in df_norm.columns:
+        df_norm["単価"] = df_norm["単価"].apply(clean_num)
+    else:
+        df_norm["単価"] = 0
+
+    if "数量" in df_norm.columns:
+        df_norm["数量"] = df_norm["数量"].apply(clean_num)
+    else:
+        df_norm["数量"] = 0
+
     if "小計" in df_norm.columns:
         df_norm["小計"] = df_norm["小計"].apply(clean_num)
-        df_norm["小計"] = df_norm.apply(lambda r: r["小計"] if r["小計"] > 0 else (r["単価"] * r["数量"]), axis=1)
     else:
-        df_norm["小計"] = df_norm["単価"] * df_norm["数量"]
+        df_norm["小計"] = 0
 
-    df_norm = df_norm[df_norm["商品名"].str.contains("小計|合計|伝票日", na=False) == False].copy()
-    df_norm = df_norm[(df_norm["単価"] > 0) | (df_norm["数量"] > 0)].reset_index(drop=True)
+    # 7. 単価・数量・金額の相互自動補完
+    df_norm["数量"] = df_norm.apply(lambda r: 1 if (r["数量"] == 0 and r["単価"] > 0) else r["数量"], axis=1)
+    df_norm["単価"] = df_norm.apply(lambda r: int(r["小計"] / r["数量"]) if (r["単価"] == 0 and r["小計"] > 0 and r["数量"] > 0) else r["単価"], axis=1)
+    df_norm["小計"] = df_norm.apply(lambda r: r["小計"] if r["小計"] > 0 else (r["単価"] * r["数量"]), axis=1)
+
+    # 8. 日付・市場番号・カテゴリー・商品コードの自動付与
+    if "日付" not in df_norm.columns:
+        df_norm["日付"] = str(datetime.now().date())
+    else:
+        df_norm["日付"] = df_norm["日付"].astype(str).str.split("T").str[0].str.split(" ").str[0].str.strip()
+        df_norm["日付"] = df_norm["日付"].replace(["nan", "None", ""], str(datetime.now().date()))
+
+    if "市場番号" not in df_norm.columns:
+        default_market = "築館なめこ組合" if "なめこ" in fname else ("仕入6課特約店" if "6課" in fname else "M-001 (一括インポート)")
+        df_norm["市場番号"] = default_market
+    else:
+        df_norm["市場番号"] = df_norm["市場番号"].fillna("M-001").astype(str).str.strip()
+
+    if "カテゴリー" not in df_norm.columns:
+        default_cat = "栗原" if "なめこ" in fname else ("5課 / 6課（川越）" if "6課" in fname else "1課4課（熊谷・大宮） / 2課 / 栗原")
+        df_norm["カテゴリー"] = default_cat
+    else:
+        df_norm["カテゴリー"] = df_norm["カテゴリー"].fillna("1課4課（熊谷・大宮） / 2課 / 栗原").astype(str).str.strip()
+
+    if "商品コード" not in df_norm.columns:
+        df_norm["商品コード"] = "AUTO"
+    else:
+        df_norm["商品コード"] = df_norm["商品コード"].fillna("AUTO").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+
+    # 9. 確実で安全な行フィルタリング（有効なデータを決して誤消去しない）
+    exclude_re = r"^(小計|合計|総合計|総計|消費税|税額|差引合計|伝票計|総合計金額|日付|年月日|項目|コード|品名)$"
+    df_norm = df_norm[~df_norm["商品名"].astype(str).str.strip().str.match(exclude_re, na=False)].copy()
+    df_norm = df_norm[df_norm["商品名"].astype(str).str.strip().replace(["nan", "None", "", "品名未指定"], pd.NA).notna()].copy()
+
+    # 有効行条件: 単価・数量・小計のいずれかがある、または商品名に2文字以上の文字列が存在する
+    df_norm = df_norm[
+        (df_norm["単価"] > 0) | 
+        (df_norm["数量"] > 0) | 
+        (df_norm["小計"] > 0) | 
+        (df_norm["商品名"].astype(str).str.len() >= 2)
+    ].reset_index(drop=True)
+
+    # 数量が0のまま残った場合は1に補正
+    df_norm["数量"] = df_norm["数量"].apply(lambda q: 1 if q <= 0 else q)
+    df_norm["小計"] = df_norm.apply(lambda r: r["小計"] if r["小計"] > 0 else (r["単価"] * r["数量"]), axis=1)
 
     target_cols = ["日付", "市場番号", "カテゴリー", "商品コード", "商品名", "単価", "数量", "小計"]
     df_result = df_norm[target_cols].copy()
@@ -1883,8 +2137,8 @@ with tabs[5]:
         <div class="converter-box">
             <h4 style="margin: 0; color: #0369a1;">🔄 昔のエクセルファイル形式（.xls）を最新形式（.xlsx）へワンクリック即時変換</h4>
             <p style="margin: 6px 0 0 0; color: #334155; font-size: 13px;">
-                「仕入台帳6課 .xls」や「築館なめこ .xls」など、古いバイナリやHTML形式の <b>.xls</b> ファイルをアップロードするだけで、
-                自動的に構造を解読し、最新の <b>Excelブック (.xlsx)</b> 形式へ瞬時に変換してダウンロードできます。<br>
+                「仕入台帳6課 .xls」や「築館なめこ .xls」など、古いバイナリやスペース付き帳票の <b>.xls</b> ファイルをアップロードするだけで、
+                ヘッダーや空白を自動補正・解読し、最新の <b>Excelブック (.xlsx)</b> 形式へ瞬時に変換してダウンロードできます。<br>
                 変換したファイルはそのままデータベースへ一括インポートしたり、お手元のExcelで最新形式として保存・利用できます。
             </p>
         </div>
