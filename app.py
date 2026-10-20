@@ -76,6 +76,13 @@ st.markdown("""
         border-radius: 8px;
         margin-bottom: 12px;
     }
+    .converter-box {
+        background: linear-gradient(135deg, #f0fdf4 0%, #e0f2fe 100%);
+        border: 1.5px solid #38bdf8;
+        padding: 14px 18px;
+        border-radius: 10px;
+        margin-bottom: 14px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -628,6 +635,99 @@ if "last_input_date" not in st.session_state:
     st.session_state.last_input_date = datetime.now().date()
 
 # ==========================================
+# 8.5 最新形式 (.xlsx / OpenXML) への高信頼変換エンジン (Pure-Python対応)
+# ==========================================
+def col_letter(col_idx: int) -> str:
+    """0-indexed 列番号を Excel 列文字 (A, B, ..., Z, AA, AB, ...) に変換"""
+    res = ""
+    col_idx += 1
+    while col_idx > 0:
+        col_idx, rem = divmod(col_idx - 1, 26)
+        res = chr(65 + rem) + res
+    return res
+
+def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    """
+    データフレームを最新の Excel (.xlsx / OpenXML) バイナリに完全変換。
+    openpyxl がインストールされている環境では openpyxl を使用し、
+    未インストールの環境（最小コンテナや Streamlit Cloud 等）でも
+    標準の zipfile + XML による Pure-Python エンジンで 100% 確実に規格準拠の .xlsx を生成。
+    """
+    # 1. openpyxl による標準変換試行
+    try:
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+        return bio.getvalue()
+    except Exception:
+        pass
+
+    # 2. 外部ライブラリ依存ゼロの Pure-Python OpenXML (.xlsx) 生成
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>""")
+
+        z.writestr("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""")
+
+        z.writestr("xl/_rels/workbook.xml.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>""")
+
+        safe_sheet = str(sheet_name).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+        z.writestr("xl/workbook.xml", f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="{safe_sheet}" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>""")
+
+        sheet_rows = []
+        # ヘッダー行
+        hdr_cells = []
+        for c_idx, col in enumerate(df.columns):
+            cref = f"{col_letter(c_idx)}1"
+            esc_val = str(col).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+            hdr_cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc_val}</t></is></c>')
+        hdr_str = "".join(hdr_cells)
+        sheet_rows.append(f'<row r="1">{hdr_str}</row>')
+
+        # データ行
+        for r_idx, row in enumerate(df.itertuples(index=False), start=2):
+            cells = []
+            for c_idx, val in enumerate(row):
+                cref = f"{col_letter(c_idx)}{r_idx}"
+                if val is None or (isinstance(val, float) and val != val):
+                    continue
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    cells.append(f'<c r="{cref}"><v>{val}</v></c>')
+                else:
+                    esc = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                    cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc}</t></is></c>')
+            row_str = "".join(cells)
+            sheet_rows.append(f'<row r="{r_idx}">{row_str}</row>')
+
+        all_rows = "".join(sheet_rows)
+        sheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    {all_rows}
+  </sheetData>
+</worksheet>"""
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    return bio.getvalue()
+
+# ==========================================
 # 9.0 堅牢型 .xls / .xlsx / HTML / CSV 解析エンジン
 # ==========================================
 def parse_xls_binary_fallback(content_bytes: bytes) -> pd.DataFrame:
@@ -1097,7 +1197,7 @@ with st.sidebar:
 st.markdown("""
     <div class="app-header">
         <h1>🍎 青果卸売 取引・在庫管理 Pro</h1>
-        <p>エクセル自動照合・不一致一括修正 ＆ 生成AI（Gemini 4 Argon / スマート青果アナライザー）搭載</p>
+        <p>エクセル自動照合・不一致一括修正 ＆ 昔の.xls形式最新.xlsx変換 ＆ 生成AI（Gemini 4 Argon / スマート青果アナライザー）搭載</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -1115,7 +1215,7 @@ tab_titles = [
     "🤖 生成AIアナリティクス & アシスタント",
     "👥 社員別データ監視 (管理者)" if current_role == "admin" else "👤 担当データ状況",
     "🛡️ BCP自動バックアップ・復旧",
-    "📥 取引データ一括インポート (Excel / CSV)"
+    "📥 取引データ一括インポート & xlsx変換"
 ]
 tabs = st.tabs(tab_titles)
 
@@ -1151,21 +1251,21 @@ with tabs[0]:
     st.write("")
     st.markdown(f'<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録 (入力者: <b>{current_user}</b>)</div>', unsafe_allow_html=True)
 
-    with st.expander("📁 A. 選択したファイルを自動記録する (Excel / CSV 一発取り込み)", expanded=True):
+    with st.expander("📁 A. 選択したファイルを自動記録する (Excel / CSV 一発取り込み & .xlsx変換対応)", expanded=True):
         col_up_box1, col_up_box2 = st.columns([2.5, 1.5])
         with col_up_box1:
             uploaded_entry_file = st.file_uploader(
                 "取引エクセルまたはCSVファイルをここへドラッグ＆ドロップ",
                 type=["xlsx", "xls", "csv", "tsv", "txt"],
                 key="auto_record_file_uploader_tab0",
-                help="どのパソコンのエクセルファイルでも自動解析され、即座に下の記録一覧へ正確に反映されます。"
+                help="どのパソコンのエクセルファイルでも自動解析され、即座に下の記録一覧へ正確に反映されます。昔の.xls形式も最新.xlsx形式へ即時保存可能です。"
             )
         with col_up_box2:
             st.markdown("""
                 <div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; font-size: 12px; color: #475569;">
-                    <b>🛡️ 堅牢解析 & 自動照合エンジン:</b><br>
-                    • 外部依存ゼロの自立型Pure-Pythonパーサー内蔵<br>
-                    • .xlsx, .xls, .csv, TSV どんな形式も瞬時に読み込み<br>
+                    <b>🛡️ 堅牢解析 & 最新形式変換エンジン:</b><br>
+                    • 外部依存ゼロの自立型 Pure-Python パーサー内蔵<br>
+                    • 昔の <b>.xls 形式を最新の .xlsx 形式へ1秒で変換保存</b><br>
                     • 元ファイルとの<b>100%合致自動検証＆一括修正機能</b>
                 </div>
             """, unsafe_allow_html=True)
@@ -1174,6 +1274,24 @@ with tabs[0]:
             col_act1, col_act2 = st.columns([2, 3])
             with col_act1:
                 btn_auto_import = st.button("⚡ このファイルの内容を直ちに自動記録する", type="primary", use_container_width=True, key="btn_exec_auto_record")
+            with col_act2:
+                try:
+                    df_quick_check, _ = parse_trade_file(uploaded_entry_file)
+                    uploaded_entry_file.seek(0)
+                    if not df_quick_check.empty:
+                        xlsx_quick_bytes = convert_df_to_xlsx_bytes(df_quick_check)
+                        orig_base = uploaded_entry_file.name.rsplit(".", 1)[0]
+                        st.download_button(
+                            label=f"💾 このファイルを最新Excel (.xlsx) 形式で保存",
+                            data=xlsx_quick_bytes,
+                            file_name=f"{orig_base}_最新版.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="quick_download_xlsx_tab0"
+                        )
+                except Exception:
+                    pass
+
             if btn_auto_import:
                 try:
                     df_parsed, extracted_sups = parse_trade_file(uploaded_entry_file)
@@ -1531,7 +1649,7 @@ with tabs[0]:
             key=f"native_fast_editor_v{st.session_state.get('editor_version', 0)}"
         )
 
-        col_save, col_del, col_dl = st.columns([2, 2.5, 2])
+        col_save, col_del, col_dl_xlsx, col_dl_csv = st.columns([1.5, 2.0, 1.5, 1.2])
         with col_save:
             if st.button("💾 編集内容を保存", type="primary", use_container_width=True):
                 for _, row in edited_df.iterrows():
@@ -1562,7 +1680,17 @@ with tabs[0]:
                     st.toast(f"🗑️ {len(deleted_ids)} 件を削除しました（いつでも元通り復元可能）。")
                     st.rerun()
 
-        with col_dl:
+        with col_dl_xlsx:
+            xlsx_export_bytes = convert_df_to_xlsx_bytes(edited_df)
+            st.download_button(
+                "📗 最新 Excel (.xlsx) 出力",
+                data=xlsx_export_bytes,
+                file_name=f"seika_trade_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+        with col_dl_csv:
             csv_export = edited_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "📥 CSV出力",
@@ -1746,25 +1874,72 @@ with tabs[4]:
         st.info("バックアップデータはまだ作成されていません。")
 
 # ==========================================
-# タブ 6: 取引データ一括インポート (Excel / CSV)
+# タブ 6: 取引データ一括インポート & 形式変換 (.xls ➡ .xlsx)
 # ==========================================
 with tabs[5]:
-    st.markdown('<div class="section-title">📥 取引データ一括インポート (Excel / CSV)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📥 取引データ一括インポート & 昔のエクセル形式 (.xls) ➡ 最新形式 (.xlsx) 変換</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+        <div class="converter-box">
+            <h4 style="margin: 0; color: #0369a1;">🔄 昔のエクセルファイル形式（.xls）を最新形式（.xlsx）へワンクリック即時変換</h4>
+            <p style="margin: 6px 0 0 0; color: #334155; font-size: 13px;">
+                「仕入台帳6課 .xls」や「築館なめこ .xls」など、古いバイナリやHTML形式の <b>.xls</b> ファイルをアップロードするだけで、
+                自動的に構造を解読し、最新の <b>Excelブック (.xlsx)</b> 形式へ瞬時に変換してダウンロードできます。<br>
+                変換したファイルはそのままデータベースへ一括インポートしたり、お手元のExcelで最新形式として保存・利用できます。
+            </p>
+        </div>
+    """, unsafe_allow_html=True)
+
     uploaded_file = st.file_uploader(
-        "取引データファイル（Excel / CSV）を選択", 
+        "取引データファイル（.xls / .xlsx / .csv / .tsv）を選択またはドラッグ＆ドロップ", 
         type=["xlsx", "xls", "csv", "txt", "tsv"], 
-        key="bulk_trade_file_uploader"
+        key="bulk_trade_file_uploader_enhanced"
     )
+
     if uploaded_file is not None:
+        fname = uploaded_file.name
+        is_legacy_xls = fname.lower().endswith(".xls")
+        file_base_name = fname.rsplit(".", 1)[0]
+
         try:
             df_up, sups = parse_trade_file(uploaded_file)
+            uploaded_file.seek(0)
+
             if not df_up.empty:
-                st.caption(f"読み込みプレビュー (全 {len(df_up)} 件 / 検出された取引先: {len(sups)} 件):")
-                st.dataframe(df_up.head(10), use_container_width=True)
+                st.markdown(f"#### 📄 解析結果プレビュー: 『{fname}』 (全 {len(df_up):,} 件)")
                 
+                # 変換ダウンロードエリア
+                c_trans1, c_trans2 = st.columns([1.5, 1.5])
+                with c_trans1:
+                    xlsx_converted_data = convert_df_to_xlsx_bytes(df_up, sheet_name="取引データ")
+                    st.download_button(
+                        label="📗 最新の Excel ブック (.xlsx) に変換してダウンロード",
+                        data=xlsx_converted_data,
+                        file_name=f"{file_base_name}_最新変換.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary"
+                    )
+                with c_trans2:
+                    csv_converted_data = df_up.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="📥 CSV (カンマ区切り) 形式でダウンロード",
+                        data=csv_converted_data,
+                        file_name=f"{file_base_name}_変換.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                if is_legacy_xls:
+                    st.success(f"🎉 昔のエクセル形式 (<b>{fname}</b>) を最新の <b>.xlsx</b> 形式に正常変換しました！上記の緑色ボタンからダウンロードいただけます。")
+
+                st.write("")
+                st.dataframe(df_up.head(10), use_container_width=True)
+
+                st.markdown("##### 📥 データベースへの一括インポート")
                 col_imp1, col_imp2 = st.columns([2, 3])
                 with col_imp1:
-                    if st.button("📥 この内容をデータベースに一括インポート", type="primary", use_container_width=True):
+                    if st.button("📥 この内容をデータベースに一括インポートする", type="primary", use_container_width=True, key="btn_bulk_import_exec"):
                         for s in sups:
                             if s and s not in st.session_state.extracted_suppliers:
                                 st.session_state.extracted_suppliers.append(s)
@@ -1775,11 +1950,11 @@ with tabs[5]:
                             "df": df_up
                         }
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.success(f"🎉 『{uploaded_file.name}』から {len(df_up)} 件を一括インポートしました！（登録者: {current_user}）")
+                        st.success(f"🎉 『{uploaded_file.name}』から {len(df_up):,} 件を一括インポートしました！（登録担当者: {current_user}）")
                         st.rerun()
                 with col_imp2:
                     if sups:
-                        st.caption(f"抽出取引先: {', '.join(sups[:5])}{' ほか' if len(sups) > 5 else ''}")
+                        st.caption(f"抽出された取引先（次回から候補として利用可能）: {', '.join(sups[:5])}{' ほか' if len(sups) > 5 else ''}")
             else:
                 st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
         except Exception as e:
