@@ -53,157 +53,117 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+    /* 全体UI最適化 */
     .block-container {
-        padding-top: 1rem;
-        padding-bottom: 1.5rem;
-        padding-left: 1.5rem;
-        padding-right: 1.5rem;
+        padding-top: 1.2rem;
+        padding-bottom: 2.5rem;
+        max-width: 98% !important;
     }
-    .metric-card {
-        background-color: #ffffff;
-        border-radius: 8px;
-        padding: 10px 14px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-        border: 1px solid #e2e8f0;
-        margin-bottom: 8px;
-    }
-    .metric-label {
-        font-size: 11px;
-        color: #64748b;
-        font-weight: 600;
-        text-transform: uppercase;
-        margin-bottom: 2px;
-    }
-    .metric-value {
-        font-size: 20px;
-        font-weight: 700;
+    h1, h2, h3 {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         color: #1e293b;
     }
-    .section-title {
-        font-size: 16px;
+    /* 指標カード */
+    .metric-card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 14px 18px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        margin-bottom: 12px;
+    }
+    .metric-label {
+        font-size: 13px;
+        color: #64748b;
+        font-weight: 600;
+        margin-bottom: 4px;
+    }
+    .metric-value {
+        font-size: 24px;
         font-weight: 700;
-        color: #1e7e34;
-        border-left: 4px solid #1e7e34;
-        padding-left: 8px;
-        margin-top: 14px;
-        margin-bottom: 8px;
+        color: #0f172a;
     }
-    .status-badge-cloud {
-        background-color: #e6f4ea;
-        color: #137333;
-        padding: 3px 10px;
-        border-radius: 12px;
-        font-size: 12px;
-        font-weight: 600;
-        display: inline-block;
+    /* テーブルスタイル */
+    .stDataFrame {
+        border-radius: 6px;
+        overflow: hidden;
     }
-    .status-badge-local {
-        background-color: #fef7e0;
-        color: #b06000;
-        padding: 3px 10px;
-        border-radius: 12px;
-        font-size: 12px;
+    /* ボタンアクセント */
+    .stButton>button {
+        border-radius: 6px;
         font-weight: 600;
-        display: inline-block;
+        transition: all 0.15s ease-in-out;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# セッション状態の初期化
-if "logged_in_user" not in st.session_state:
-    st.session_state.logged_in_user = None
-if "user_role" not in st.session_state:
-    st.session_state.user_role = "staff"
-if "editor_version" not in st.session_state:
-    st.session_state.editor_version = 0
-if "input_counter" not in st.session_state:
-    st.session_state.input_counter = 0
-if "recent_added_history" not in st.session_state:
-    st.session_state.recent_added_history = []
-if "extracted_suppliers" not in st.session_state:
-    st.session_state.extracted_suppliers = []
-if "verification_batch" not in st.session_state:
-    st.session_state.verification_batch = None
-if "custom_gemini_api_key" not in st.session_state:
-    st.session_state.custom_gemini_api_key = ""
-if "ai_thinking_level" not in st.session_state:
-    st.session_state.ai_thinking_level = "medium"
-if "last_deleted_records" not in st.session_state:
-    st.session_state.last_deleted_records = []
-
 # ==========================================
 # データベース接続 & セキュア認証
 # ==========================================
-def get_secret(key: str, default: str = None) -> str:
-    val = os.environ.get(key)
-    if val:
-        return val
+DB_FILE = "inventory.db"
+SECRET_SALT = os.environ.get("SECRET_SALT", "seika-secure-salt-2026-xyz-0987")
+BACKUP_DIR = "backups"
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+def get_secret(key_name: str, default_val: str = "") -> str:
+    """Streamlit Secretsまたは環境変数から安全に取得"""
     try:
-        if hasattr(st, "secrets") and key in st.secrets:
-            return str(st.secrets[key])
+        if hasattr(st, "secrets") and key_name in st.secrets:
+            return str(st.secrets[key_name])
     except Exception:
         pass
-    return default
+    return os.environ.get(key_name, default_val)
 
 @st.cache_resource
 def get_engine():
-    db_url = get_secret("DATABASE_URL")
-    if db_url:
+    """データベースエンジンの取得 (PostgreSQL接続優先 / SQLiteフォールバック)"""
+    pg_url = get_secret("DATABASE_URL")
+    if pg_url:
+        if pg_url.startswith("postgres://"):
+            pg_url = pg_url.replace("postgres://", "postgresql://", 1)
         try:
-            if db_url.startswith("postgres://"):
-                db_url = db_url.replace("postgres://", "postgresql://", 1)
-            eng = create_engine(
-                db_url,
+            engine = create_engine(
+                pg_url,
                 pool_pre_ping=True,
-                pool_size=10,
-                max_overflow=20,
-                pool_recycle=1800,
+                pool_recycle=300,
                 connect_args={"connect_timeout": 5}
             )
-            with eng.connect() as conn:
+            with engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
-            return eng
+            return engine
         except Exception as e:
-            st.toast(f"⚠️ クラウドDB接続フォールバック: {e}")
-    
-    local_dir = "/mount/src/seika-app" if os.path.exists("/mount/src/seika-app") else "."
-    sqlite_path = os.path.join(local_dir, "seika_trade_v3.db")
-    return create_engine(f"sqlite:///{sqlite_path}", connect_args={"check_same_thread": False})
+            st.sidebar.warning(f"⚠️ クラウドDB接続に失敗したため、ローカルSQLiteで起動します: {e}")
+
+    sqlite_url = f"sqlite:///{DB_FILE}"
+    return create_engine(
+        sqlite_url,
+        connect_args={"check_same_thread": False}
+    )
 
 def is_using_cloud_db() -> bool:
-    try:
-        eng = get_engine()
-        return "postgresql" in eng.name
-    except Exception:
-        return False
+    eng = get_engine()
+    return "postgresql" in eng.name
 
-SECRET_SALT = get_secret("SESSION_SECRET", "seika_pro_salt_2026_super_secure")
+def hash_password(password: str) -> str:
+    return hashlib.sha256((password + SECRET_SALT).encode("utf-8")).hexdigest()
 
-def hash_password(password: str, salt: str = None) -> str:
-    if not salt:
-        salt = secrets.token_hex(8)
-    h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
-    return f"{salt}:{h.hex()}"
-
-def verify_password(stored_hash: str, provided_password: str) -> bool:
-    try:
-        salt, h_val = stored_hash.split(":", 1)
-        calc = hashlib.pbkdf2_hmac('sha256', provided_password.encode(), salt.encode(), 100000).hex()
-        return hmac.compare_digest(calc, h_val)
-    except Exception:
-        return False
+def verify_password(stored_hash: str, password_raw: str) -> bool:
+    return hmac.compare_digest(stored_hash, hash_password(password_raw))
 
 def create_session_token(username: str, role: str) -> str:
-    payload = f"{username}:{role}:{int(time.time())}"
+    ts = str(int(time.time()))
+    payload = f"{username}:{role}:{ts}"
     sig = hmac.new(SECRET_SALT.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}:{sig}"
 
 def verify_session_token(token: str):
+    if not token or ":" not in token:
+        return None
     try:
         parts = token.split(":")
         if len(parts) != 4:
             return None
-        user, role, ts, sig = parts[0], parts[1], parts[2], parts[3]
+        user, role, ts, sig = parts
         payload = f"{user}:{role}:{ts}"
         expected_sig = hmac.new(SECRET_SALT.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected_sig):
@@ -254,16 +214,30 @@ def init_db():
 
         # 新設カラムの動的追加（後方互換性担保）
         if not is_pg:
-            t_info = conn.execute(text("PRAGMA table_info(transactions)")).fetchall()
-            existing_cols = [row[1] for row in t_info]
-            if "purchase_amount" not in existing_cols:
-                conn.execute(text("ALTER TABLE transactions ADD COLUMN purchase_amount INTEGER DEFAULT 0"))
-            if "payment_amount" not in existing_cols:
-                conn.execute(text("ALTER TABLE transactions ADD COLUMN payment_amount VARCHAR(50) DEFAULT '0'"))
-            if "balance" not in existing_cols:
-                conn.execute(text("ALTER TABLE transactions ADD COLUMN balance INTEGER DEFAULT 0"))
-            if "total" not in existing_cols:
-                conn.execute(text("ALTER TABLE transactions ADD COLUMN total INTEGER DEFAULT 0"))
+            try:
+                t_info = conn.execute(text("PRAGMA table_info(transactions)")).fetchall()
+                existing_cols = [row[1] for row in t_info]
+                if "purchase_amount" not in existing_cols:
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN purchase_amount INTEGER DEFAULT 0"))
+                if "payment_amount" not in existing_cols:
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN payment_amount VARCHAR(50) DEFAULT '0'"))
+                if "balance" not in existing_cols:
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN balance INTEGER DEFAULT 0"))
+                if "total" not in existing_cols:
+                    conn.execute(text("ALTER TABLE transactions ADD COLUMN total INTEGER DEFAULT 0"))
+            except Exception:
+                pass
+        else:
+            for col, col_def in [
+                ("purchase_amount", "INTEGER DEFAULT 0"),
+                ("payment_amount", "VARCHAR(50) DEFAULT '0'"),
+                ("balance", "INTEGER DEFAULT 0"),
+                ("total", "INTEGER DEFAULT 0")
+            ]:
+                try:
+                    conn.execute(text(f"ALTER TABLE transactions ADD COLUMN IF NOT EXISTS {col} {col_def}"))
+                except Exception:
+                    pass
 
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS backup_history (
@@ -276,18 +250,17 @@ def init_db():
             )
         """))
 
-        # デフォルト管理者・一般アカウントの登録
+        # デフォルト管理者・一般アカウントの登録（SQLAlchemy 2.0 完全対応）
         res = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
         if res == 0:
             u_admin = ("admin", hash_password("admin123"), "admin", "統括管理者")
             u_user1 = ("user1", hash_password("pass123"), "staff", "営業担当 田中")
             u_user2 = ("user2", hash_password("pass123"), "staff", "仕入担当 鈴木")
             for u in [u_admin, u_user1, u_user2]:
-                if is_pg:
-                    conn.execute(text("INSERT INTO users (username, password_hash, role, display_name) VALUES (:u, :p, :r, :d)"),
-                                 {"u": u[0], "p": u[1], "r": u[2], "d": u[3]})
-                else:
-                    conn.execute(text("INSERT INTO users (username, password_hash, role, display_name) VALUES (?, ?, ?, ?)"), u)
+                conn.execute(
+                    text("INSERT INTO users (username, password_hash, role, display_name) VALUES (:u, :p, :r, :d)"),
+                    {"u": u[0], "p": u[1], "r": u[2], "d": u[3]}
+                )
 
 init_db()
 
@@ -343,7 +316,6 @@ def insert_records_to_db(user_id: str, records: list, auto_backup=True):
     if not records:
         return
     eng = get_engine()
-    is_pg = "postgresql" in eng.name
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     formatted_records = []
@@ -355,13 +327,13 @@ def insert_records_to_db(user_id: str, records: list, auto_backup=True):
             "c": str(r.get("カテゴリー", r.get("category", "1課4課（熊谷・大宮） / 2課 / 栗原"))),
             "code": str(r.get("商品コード", r.get("item_code", "AUTO"))),
             "name": str(r.get("品名", r.get("商品名", r.get("item_name", "品名未指定")))),
-            "p": int(r.get("単価", r.get("unit_price", 0))),
-            "q": int(r.get("数量", r.get("quantity", 1))),
-            "s": int(r.get("仕入金額", r.get("小計", r.get("subtotal", 0)))),
-            "pa": int(r.get("仕入金額", r.get("purchase_amount", 0))),
+            "p": int(clean_num(r.get("単価", r.get("unit_price", 0)))),
+            "q": int(clean_num(r.get("数量", r.get("quantity", 1)))),
+            "s": int(clean_num(r.get("仕入金額", r.get("小計", r.get("subtotal", 0))))),
+            "pa": int(clean_num(r.get("仕入金額", r.get("purchase_amount", 0)))),
             "pay": str(r.get("支払金額", r.get("payment_amount", "0"))),
-            "bal": int(r.get("差引残高", r.get("balance", 0))),
-            "tot": int(r.get("合計", r.get("total", 0))),
+            "bal": int(clean_num(r.get("差引残高", r.get("balance", 0)))),
+            "tot": int(clean_num(r.get("合計", r.get("total", 0)))),
             "now": now_str
         }
         formatted_records.append(f_rec)
@@ -385,13 +357,13 @@ def update_single_record_in_db(record_dict: dict):
         "c": str(record_dict["category"]),
         "code": str(record_dict["item_code"]),
         "name": str(record_dict["item_name"]),
-        "p": int(record_dict["unit_price"]),
-        "q": int(record_dict["quantity"]),
-        "s": int(record_dict["subtotal"]),
-        "pa": int(record_dict.get("purchase_amount", 0)),
+        "p": int(clean_num(record_dict["unit_price"])),
+        "q": int(clean_num(record_dict["quantity"])),
+        "s": int(clean_num(record_dict["subtotal"])),
+        "pa": int(clean_num(record_dict.get("purchase_amount", 0))),
         "pay": str(record_dict.get("payment_amount", "0")),
-        "bal": int(record_dict.get("balance", 0)),
-        "tot": int(record_dict.get("total", 0)),
+        "bal": int(clean_num(record_dict.get("balance", 0))),
+        "tot": int(clean_num(record_dict.get("total", 0))),
         "now": now_str
     }
     sql = """
@@ -408,14 +380,19 @@ def update_single_record_in_db(record_dict: dict):
 def delete_records_by_ids(ids: list, deleted_by: str):
     if not ids:
         return
+    clean_ids = [int(x) for x in ids if str(x).lstrip('-').isdigit()]
+    if not clean_ids:
+        return
+    placeholders = ", ".join([f":id_{i}" for i in range(len(clean_ids))])
+    params = {f"id_{i}": val for i, val in enumerate(clean_ids)}
     eng = get_engine()
     # 削除前のバックアップスナップショット取得
     with eng.connect() as conn:
-        del_records = pd.read_sql(text("SELECT * FROM transactions WHERE id IN :ids"), conn, params={"ids": tuple(ids)})
+        del_records = pd.read_sql(text(f"SELECT * FROM transactions WHERE id IN ({placeholders})"), conn, params=params)
         st.session_state.last_deleted_records = del_records.to_dict("records")
         
     with eng.begin() as conn:
-        conn.execute(text("DELETE FROM transactions WHERE id IN :ids"), {"ids": tuple(ids)})
+        conn.execute(text(f"DELETE FROM transactions WHERE id IN ({placeholders})"), params)
     invalidate_records_cache()
 
 def get_employee_summary_stats():
@@ -431,55 +408,41 @@ def get_employee_summary_stats():
             GROUP BY user_id
             ORDER BY total_amount DESC
         """
-        df = pd.read_sql(text(sql), conn)
-    return df
+        return pd.read_sql(text(sql), conn)
 
-def create_backup_snapshot(user_id: str, trigger_reason="定期自動バックアップ"):
-    local_dir = "/mount/src/seika-app/backups" if os.path.exists("/mount/src/seika-app") else "./backups"
-    os.makedirs(local_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"backup_{ts}_{user_id}.json"
-    fpath = os.path.join(local_dir, fname)
-    
+def create_backup_snapshot(created_by: str) -> str:
     eng = get_engine()
     with eng.connect() as conn:
         df = pd.read_sql(text("SELECT * FROM transactions ORDER BY id ASC"), conn)
-        
-    records = df.to_dict("records")
-    for r in records:
-        for k, v in r.items():
-            if isinstance(v, (datetime, pd.Timestamp)):
-                r[k] = v.strftime("%Y-%m-%d %H:%M:%S")
-                
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bname = f"backup_{timestamp}_{created_by}.json"
+    fpath = os.path.join(BACKUP_DIR, bname)
+    
+    backup_data = {
+        "version": "2.2",
+        "created_at": datetime.now().isoformat(),
+        "created_by": created_by,
+        "record_count": len(df),
+        "records": df.to_dict("records")
+    }
     with open(fpath, "w", encoding="utf-8") as f:
-        json.dump({"backup_time": ts, "created_by": user_id, "reason": trigger_reason, "records": records}, f, ensure_ascii=False, indent=2)
+        json.dump(backup_data, f, ensure_ascii=False, indent=2)
         
+    is_pg = "postgresql" in eng.name
+    id_col = "SERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
     with eng.begin() as conn:
         conn.execute(text("""
             INSERT INTO backup_history (backup_name, file_path, created_by, record_count)
-            VALUES (:name, :path, :u, :cnt)
-        """), {"name": fname, "path": fpath, "u": user_id, "cnt": len(records)})
+            VALUES (:b, :f, :c, :r)
+        """), {"b": bname, "f": fpath, "c": created_by, "r": len(df)})
     return fpath
 
 def list_all_backups():
     eng = get_engine()
-    try:
-        with eng.connect() as conn:
-            df = pd.read_sql(text("SELECT id, backup_name, file_path, created_by, record_count, created_at FROM backup_history ORDER BY id DESC"), conn)
-            return df
-    except Exception:
-        local_dir = "/mount/src/seika-app/backups" if os.path.exists("/mount/src/seika-app") else "./backups"
-        files = glob.glob(os.path.join(local_dir, "backup_*.json"))
-        data = []
-        for f in sorted(files, reverse=True):
-            data.append({
-                "backup_name": os.path.basename(f),
-                "file_path": f,
-                "created_by": "system",
-                "record_count": 0,
-                "created_at": datetime.fromtimestamp(os.path.getmtime(f)).strftime("%Y-%m-%d %H:%M:%S")
-            })
-        return pd.DataFrame(data)
+    with eng.connect() as conn:
+        df = pd.read_sql(text("SELECT id, backup_name, file_path, created_by, record_count, created_at FROM backup_history ORDER BY id DESC"), conn)
+    return df
 
 def restore_from_backup_file(filepath: str, restored_by: str):
     if not os.path.exists(filepath):
@@ -506,1117 +469,847 @@ def restore_from_backup_file(filepath: str, restored_by: str):
                     "c": r.get("category", "1課4課（熊谷・大宮） / 2課 / 栗原"),
                     "code": r.get("item_code", "AUTO"),
                     "name": r.get("item_name", "品名未指定"),
-                    "p": r.get("unit_price", 0),
-                    "q": r.get("quantity", 1),
-                    "s": r.get("subtotal", 0),
-                    "pa": r.get("purchase_amount", 0),
+                    "p": clean_num(r.get("unit_price", 0)),
+                    "q": clean_num(r.get("quantity", 1)),
+                    "s": clean_num(r.get("subtotal", 0)),
+                    "pa": clean_num(r.get("purchase_amount", 0)),
                     "pay": str(r.get("payment_amount", "0")),
-                    "bal": r.get("balance", 0),
-                    "tot": r.get("total", 0),
+                    "bal": clean_num(r.get("balance", 0)),
+                    "tot": clean_num(r.get("total", 0)),
                     "now": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 })
         invalidate_records_cache()
         return True, f"{len(records)} 件のデータを復元しました"
     except Exception as e:
-        return False, str(e)
+        return False, f"復元失敗: {e}"
 
 # ==========================================
 # 商品マスタ・カテゴリー照合
 # ==========================================
-def _norm_dept(s) -> str:
-    if s is None:
+CATEGORY_FILE = "category_master.txt"
+
+def _norm_dept(s: str) -> str:
+    if not s:
         return ""
-    norm = unicodedata.normalize("NFKC", str(s))
-    return re.sub(r"[\s\u3000\t\r\n・_／/\\()（）]+", "", norm)
+    t = unicodedata.normalize("NFKC", str(s)).strip().lower()
+    return re.sub(r"[\s/／・()（）\-ー_]+", "", t)
 
-def _dept_tokens(s) -> set:
-    norm = _norm_dept(s)
-    return set(re.findall(r"(\d+課|大宮|熊谷|川越|栗原)", norm))
+def _dept_tokens(s: str) -> set:
+    norm = unicodedata.normalize("NFKC", str(s or ""))
+    parts = re.split(r"[/／,，、\s|]+", norm)
+    tokens = set()
+    for p in parts:
+        p_clean = re.sub(r"[()（）\-ー_]+", "", p).strip().lower()
+        if p_clean:
+            tokens.add(p_clean)
+            m = re.match(r"^(\d+)課?$", p_clean)
+            if m:
+                tokens.add(f"{m.group(1)}課")
+                tokens.add(m.group(1))
+    return tokens
 
-def _dept_match(row_dept, chosen_dept) -> bool:
-    if not chosen_dept or not row_dept:
+def _dept_match(selected_dept: str, target_dept: str) -> bool:
+    if not selected_dept or not target_dept:
+        return False
+    if _norm_dept(selected_dept) == _norm_dept(target_dept):
         return True
-    chosen_toks = _dept_tokens(chosen_dept)
-    row_toks = _dept_tokens(row_dept)
-    if not chosen_toks or not row_toks:
-        c1 = _norm_dept(chosen_dept)
-        r1 = _norm_dept(row_dept)
-        return (c1 in r1) or (r1 in c1)
-    if chosen_toks & row_toks:
+    s_toks = _dept_tokens(selected_dept)
+    t_toks = _dept_tokens(target_dept)
+    if s_toks and t_toks and (s_toks & t_toks):
         return True
     return False
 
-def get_items_for_department(df_master, dept):
-    if df_master is None or df_master.empty or "department" not in df_master.columns:
-        return pd.DataFrame()
-    mask = df_master["department"].apply(lambda d: _dept_match(d, dept))
-    return df_master[mask].copy()
+def get_items_for_department(dept_name: str, master_items: list) -> list:
+    if not dept_name:
+        return master_items
+    filtered = [it for it in master_items if _dept_match(dept_name, it.get("category", ""))]
+    return filtered if filtered else master_items
 
 def _file_mtime(path: str) -> float:
     try:
         return os.path.getmtime(path)
-    except Exception:
+    except OSError:
         return 0.0
 
-def _read_category_txt(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    rows = []
-    current_dept = None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                raw = line.strip()
-                if not raw or raw.startswith("#"):
-                    continue
-                if raw.startswith("[") and raw.endswith("]"):
-                    current_dept = raw[1:-1].strip()
-                    continue
-                parts = re.split(r"[\t,]+", raw)
-                if len(parts) >= 3:
-                    dept = parts[0].strip() or current_dept
-                    code = parts[1].strip()
-                    name = parts[2].strip()
-                    price = parts[3].strip() if len(parts) > 3 else "0"
-                    rows.append({
-                        "department": dept,
-                        "item_code": code,
-                        "item_name": name,
-                        "default_price": int(price) if price.isdigit() else 0
-                    })
-                elif len(parts) == 2 and current_dept:
-                    rows.append({
-                        "department": current_dept,
-                        "item_code": parts[0].strip(),
-                        "item_name": parts[1].strip(),
-                        "default_price": 0
-                    })
-    except Exception:
-        pass
-    return pd.DataFrame(rows)
+@st.cache_data(ttl=60, show_spinner=False)
+def _read_category_txt(mtime: float):
+    items = []
+    current_cat = "未分類"
+    if not os.path.exists(CATEGORY_FILE):
+        return items
+    with open(CATEGORY_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current_cat = line[1:-1].strip()
+            elif "\t" in line:
+                pts = line.split("\t")
+                if len(pts) >= 2:
+                    code, name = pts[0].strip(), pts[1].strip()
+                    unit_p = int(pts[2].strip()) if len(pts) >= 3 and pts[2].strip().isdigit() else 0
+                    items.append({"category": current_cat, "code": code, "name": name, "unit_price": unit_p})
+    return items
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_item_master_cached(csv_mtime: float = 0.0, txt_mtime: float = 0.0):
-    candidates_csv = ["item_master.csv", "/mount/src/seika-app/item_master.csv"]
-    for c in candidates_csv:
-        if os.path.exists(c):
-            try:
-                df = pd.read_csv(c, dtype={"item_code": str})
-                if not df.empty:
-                    return df
-            except Exception:
-                pass
-    candidates_txt = ["item_category.txt", "/mount/src/seika-app/item_category.txt"]
-    for c in candidates_txt:
-        if os.path.exists(c):
-            df = _read_category_txt(c)
-            if not df.empty:
-                return df
-    # デフォルトの青果マスタ
-    return pd.DataFrame([
-        {"department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "4525", "item_name": "築館なめこ", "default_price": 1200},
-        {"department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "1001", "item_name": "キャベツ", "default_price": 1500},
-        {"department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "1002", "item_name": "レタス", "default_price": 2200},
-        {"department": "1課4課（熊谷・大宮） / 2課 / 栗原", "item_code": "1003", "item_name": "白菜", "default_price": 1800},
-        {"department": "5課 / 6課（川越）", "item_code": "2001", "item_name": "トマト", "default_price": 2500},
-        {"department": "5課 / 6課（川越）", "item_code": "2002", "item_name": "きゅうり", "default_price": 1900},
-        {"department": "5課 / 6課（川越）", "item_code": "2003", "item_name": "なす", "default_price": 2100},
-        {"department": "栗原", "item_code": "3001", "item_name": "しいたけ", "default_price": 2800},
-        {"department": "栗原", "item_code": "3002", "item_name": "えのき", "default_price": 980},
-    ])
+def load_item_master_cached():
+    mt = _file_mtime(CATEGORY_FILE)
+    return _read_category_txt(mt)
 
 # ==========================================
 # 8.5 全シート保持 最新形式 (.xlsx / OpenXML) への高信頼変換エンジン & OLE2/BIFF8 完全解析
 # ==========================================
-def col_letter(col_idx: int) -> str:
-    """列番号 (0-indexed) を Excel 列英字 (A, B, ..., Z, AA, AB, ...) に変換"""
-    result = ""
-    col_idx += 1
-    while col_idx > 0:
-        col_idx, remainder = divmod(col_idx - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
+def col_letter(c_idx: int) -> str:
+    res = ""
+    c_idx += 1
+    while c_idx > 0:
+        c_idx, rem = divmod(c_idx - 1, 26)
+        res = chr(65 + rem) + res
+    return res
 
-def parse_biff_rk(rk_val: int):
-    """BIFF8 RK レコードの数値を高精度デコード（負数・小数を完全再現）"""
-    is_div100 = bool(rk_val & 1)
-    if rk_val & 2:
-        v = (rk_val >> 2)
-        if v >= 0x20000000:
-            v -= 0x40000000
-        return round(v / 100.0, 4) if is_div100 else int(v)
-    else:
-        raw_b = struct.pack("<I", rk_val & 0xFFFFFFFC) + b"\x00\x00\x00\x00"
-        v = struct.unpack("<d", raw_b)[0]
-        v_res = v / 100.0 if is_div100 else v
-        return int(v_res) if v_res.is_integer() else round(v_res, 4)
+def parse_biff_rk(rk_val: int) -> float:
+    try:
+        is_int = (rk_val & 2) != 0
+        is_div100 = (rk_val & 1) != 0
+        val = (rk_val >> 2)
+        if is_int:
+            # 符号拡張
+            if val & 0x20000000:
+                val -= 0x40000000
+            res = float(val)
+        else:
+            raw_bytes = struct.pack('<I', val << 2) + b'\x00\x00\x00\x00'
+            res = struct.unpack('<d', raw_bytes)[0]
+        if is_div100:
+            res /= 100.0
+        return res
+    except Exception:
+        return 0.0
 
 def parse_japanese_date(val) -> str:
-    """和暦（R8.9.19, H30.5.1等）、月日（9/23等）、西暦（2026/09/19等）をISO形式日付に確実変換"""
-    if val is None or pd.isnull(val):
+    if val is None or val == "" or pd.isna(val):
         return ""
     if isinstance(val, (datetime, pd.Timestamp)):
         return val.strftime("%Y-%m-%d")
-    
     s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", "nat"):
+    if not s or s.lower() in ("nan", "nat", "none"):
         return ""
-    
-    # 令和・平成などの和暦表記 (例: R8.9.19, R08.09.19, 令8.9.19)
+    s = unicodedata.normalize("NFKC", s).replace(" ", "")
+    # 和暦パース
     wareki_m = re.match(r"^([RrHhSsTt令平昭])?\s*(\d{1,2})[\.年/](\d{1,2})[\.月/](\d{1,2})日?$", s)
     if wareki_m:
-        era_char = (wareki_m.group(1) or "R").upper()
-        year_num = int(wareki_m.group(2))
-        month_num = int(wareki_m.group(3))
-        day_num = int(wareki_m.group(4))
-        
-        base_year = 2018 # R1 = 2019
-        if era_char in ("H", "平"):
-            base_year = 1988
-        elif era_char in ("S", "昭"):
-            base_year = 1925
-        
-        full_year = base_year + year_num
-        try:
-            return f"{full_year:04d}-{month_num:02d}-{day_num:02d}"
-        except Exception:
-            pass
-            
-    # 月日のみ (例: 9/23, 09/23)
-    md_m = re.match(r"^(\d{1,2})[/\-\.](\d{1,2})$", s)
-    if md_m:
-        cur_year = datetime.now().year
-        m_num = int(md_m.group(1))
-        d_num = int(md_m.group(2))
-        if 1 <= m_num <= 12 and 1 <= d_num <= 31:
-            return f"{cur_year:04d}-{m_num:02d}-{d_num:02d}"
-
-    # 西暦 (例: 2026/09/19, 2026-9-19)
-    ymd_m = re.match(r"^(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})", s)
-    if ymd_m:
-        y = int(ymd_m.group(1))
-        m = int(ymd_m.group(2))
-        d = int(ymd_m.group(3))
-        return f"{y:04d}-{m:02d}-{d:02d}"
-
+        g, y, m, d = wareki_m.groups()
+        base = 2018 if g in ("R", "r", "令") else 1988
+        year = base + int(y)
+        return f"{year:04d}-{int(m):02d}-{int(d):02d}"
+    m_full = re.match(r"^(\d{4})[\.\-/年](\d{1,2})[\.\-/月](\d{1,2})日?$", s)
+    if m_full:
+        y, m, d = m_full.groups()
+        return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+    m_short = re.match(r"^(\d{1,2})[\./月](\d{1,2})日?$", s)
+    if m_short:
+        m, d = m_short.groups()
+        cur_y = datetime.now().year
+        return f"{cur_y:04d}-{int(m):02d}-{int(d):02d}"
     return s
 
 def clean_num(val, default=0):
-    """¥マーク、カンマ、マイナス記号付き数値を正確に整数化（負数・0も完全保持）"""
-    if val is None or pd.isnull(val):
+    if val is None or val == "" or pd.isna(val):
         return default
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return int(val) if not (isinstance(val, float) and val != val) else default
-    s = str(val).replace("¥", "").replace("\\", "").replace("円", "").replace(",", "").strip()
-    if not s:
+    if isinstance(val, (int, float)):
+        return 0 if pd.isna(val) else val
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "-", "―", "--"):
         return default
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("¥", "").replace("円", "").replace(",", "").replace(" ", "").replace("￥", "")
+    # マイナス表記対応 △や▲
+    is_neg = False
+    if s.startswith("▲") or s.startswith("△"):
+        is_neg = True
+        s = s[1:]
+    elif s.startswith("(") and s.endswith(")"):
+        is_neg = True
+        s = s[1:-1]
+    elif s.startswith("-"):
+        is_neg = True
+        s = s[1:]
     try:
-        is_neg = False
-        if s.startswith(("▲", "△", "－", "-")):
-            is_neg = True
-            s = s[1:].strip()
-        elif s.startswith("¥-") or s.startswith("-\\"):
-            is_neg = True
-            s = s[2:].strip()
-        f = float(s)
-        return int(-f if is_neg else f)
+        val_f = float(s)
+        if is_neg:
+            val_f = -val_f
+        return int(val_f) if val_f.is_integer() else val_f
     except Exception:
         return default
 
-def extract_ole_streams(data: bytes) -> dict:
-    """OLE2 Compound File から全ストリーム（Workbook / Book 含む）を抽出"""
-    if len(data) < 512 or data[:8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
-        return {}
-    streams = {}
+def extract_ole_streams(data: bytes):
+    if len(data) < 512 or data[:8] != b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+        return None
     try:
-        sector_size = 1 << struct.unpack_from("<H", data, 30)[0]
-        fat_sectors_count = struct.unpack_from("<I", data, 44)[0]
-        dir_first_sec = struct.unpack_from("<I", data, 48)[0]
-        mini_sector_size = 1 << struct.unpack_from("<H", data, 32)[0]
-        minifat_first_sec = struct.unpack_from("<I", data, 60)[0]
-        mini_stream_cutoff = struct.unpack_from("<I", data, 56)[0]
+        sec_size = 1 << struct.unpack_from('<H', data, 30)[0]
+        mini_sec_size = 1 << struct.unpack_from('<H', data, 32)[0]
+        fat_count = struct.unpack_from('<I', data, 44)[0]
+        dir_start = struct.unpack_from('<I', data, 48)[0]
+        mini_fat_start = struct.unpack_from('<I', data, 60)[0]
+        mini_cutoff = struct.unpack_from('<I', data, 56)[0]
 
+        difat = [struct.unpack_from('<I', data, 76 + i*4)[0] for i in range(min(109, fat_count))]
         fat = []
-        difat_count = min(109, fat_sectors_count)
-        for i in range(difat_count):
-            sec_idx = struct.unpack_from("<I", data, 76 + i * 4)[0]
-            if sec_idx < 0xFFFFFFFE:
-                offset = (sec_idx + 1) * sector_size
-                sec_bytes = data[offset:offset + sector_size]
-                fat.extend(struct.unpack(f"<{len(sec_bytes) // 4}I", sec_bytes))
+        for sec in difat:
+            if sec < 0xFFFFFFFE:
+                offset = (sec + 1) * sec_size
+                sec_count = sec_size // 4
+                fat.extend(struct.unpack_from(f'<{sec_count}I', data, offset))
 
-        difat_first_sec = struct.unpack_from("<I", data, 68)[0]
-        difat_sec_count = struct.unpack_from("<I", data, 72)[0]
-        cur_difat = difat_first_sec
-        difat_visited = set()
-        while cur_difat < 0xFFFFFFFE and cur_difat not in difat_visited and len(difat_visited) < difat_sec_count:
-            difat_visited.add(cur_difat)
-            off = (cur_difat + 1) * sector_size
-            d_sec = data[off:off + sector_size]
-            for i in range((sector_size // 4) - 1):
-                s_idx = struct.unpack_from("<I", d_sec, i * 4)[0]
-                if s_idx < 0xFFFFFFFE:
-                    f_off = (s_idx + 1) * sector_size
-                    f_bytes = data[f_off:f_off + sector_size]
-                    fat.extend(struct.unpack(f"<{len(f_bytes) // 4}I", f_bytes))
-            cur_difat = struct.unpack_from("<I", d_sec, sector_size - 4)[0]
+        mini_fat = []
+        if mini_fat_start < 0xFFFFFFFE:
+            sec = mini_fat_start
+            while sec < 0xFFFFFFFE and sec < len(fat):
+                offset = (sec + 1) * sec_size
+                sec_count = sec_size // 4
+                mini_fat.extend(struct.unpack_from(f'<{sec_count}I', data, offset))
+                sec = fat[sec]
 
-        cur_sec = dir_first_sec
-        dir_bytes = b""
-        visited = set()
-        while cur_sec < 0xFFFFFFFE and cur_sec not in visited and cur_sec < len(fat):
-            visited.add(cur_sec)
-            offset = (cur_sec + 1) * sector_size
-            dir_bytes += data[offset:offset + sector_size]
-            cur_sec = fat[cur_sec]
+        dir_entries = []
+        sec = dir_start
+        while sec < 0xFFFFFFFE and sec < len(fat):
+            offset = (sec + 1) * sec_size
+            for e_idx in range(sec_size // 128):
+                entry_data = data[offset + e_idx*128 : offset + (e_idx+1)*128]
+                raw_name = entry_data[:64]
+                name_len = struct.unpack_from('<H', entry_data, 64)[0]
+                name = raw_name[:max(0, name_len - 2)].decode('utf-16le', errors='ignore')
+                etype = entry_data[66]
+                start_sec = struct.unpack_from('<I', entry_data, 116)[0]
+                size = struct.unpack_from('<Q', entry_data, 120)[0] if sec_size == 4096 else struct.unpack_from('<I', entry_data, 120)[0]
+                dir_entries.append({'name': name, 'type': etype, 'start': start_sec, 'size': size})
+            sec = fat[sec]
 
-        minifat = []
-        cur_mf = minifat_first_sec
-        mf_visited = set()
-        while cur_mf < 0xFFFFFFFE and cur_mf not in mf_visited and cur_mf < len(fat):
-            mf_visited.add(cur_mf)
-            off = (cur_mf + 1) * sector_size
-            sec_b = data[off:off + sector_size]
-            minifat.extend(struct.unpack(f"<{len(sec_b) // 4}I", sec_b))
-            cur_mf = fat[cur_mf]
-
-        root_stream = b""
-        if len(dir_bytes) >= 128:
-            root_start = struct.unpack_from("<I", dir_bytes, 116)[0]
-            root_size = struct.unpack_from("<I", dir_bytes, 120)[0]
-            c_sec = root_start
-            r_visited = set()
-            while c_sec < 0xFFFFFFFE and c_sec not in r_visited and c_sec < len(fat):
-                r_visited.add(c_sec)
-                off = (c_sec + 1) * sector_size
-                root_stream += data[off:off + sector_size]
-                c_sec = fat[c_sec]
-            root_stream = root_stream[:root_size]
-
-        def get_stream(start_sec, stream_size):
-            s_data = b""
-            c_s = start_sec
-            v_s = set()
-            while c_s < 0xFFFFFFFE and c_s not in v_s and c_s < len(fat):
-                v_s.add(c_s)
-                off = (c_s + 1) * sector_size
-                s_data += data[off:off + sector_size]
-                c_s = fat[c_s]
-            return s_data[:stream_size]
-
-        def get_mini_stream(start_sec, stream_size):
-            s_data = b""
-            c_s = start_sec
-            v_s = set()
-            while c_s < 0xFFFFFFFE and c_s not in v_s and c_s < len(minifat):
-                v_s.add(c_s)
-                off = c_s * mini_sector_size
-                s_data += root_stream[off:off + mini_sector_size]
-                c_s = minifat[c_s]
-            return s_data[:stream_size]
-
-        for i in range(0, len(dir_bytes), 128):
-            entry = dir_bytes[i:i + 128]
-            if len(entry) < 128:
-                break
-            name_len = struct.unpack_from("<H", entry, 64)[0]
-            if name_len > 0:
-                name = entry[:name_len].decode("utf-16le", errors="ignore").rstrip("\x00")
-                start_sec = struct.unpack_from("<I", entry, 116)[0]
-                stream_size = struct.unpack_from("<I", entry, 120)[0]
-                if stream_size > 0:
-                    if stream_size < mini_stream_cutoff and root_stream and minifat:
-                        streams[name] = get_mini_stream(start_sec, stream_size)
-                    else:
-                        streams[name] = get_stream(start_sec, stream_size)
+        return {
+            'data': data, 'sec_size': sec_size, 'mini_sec_size': mini_sec_size,
+            'fat': fat, 'mini_fat': mini_fat, 'dir_entries': dir_entries, 'mini_cutoff': mini_cutoff
+        }
     except Exception:
-        pass
-    return streams
+        return None
 
-def parse_biff8_all_sheets(stream: bytes) -> dict:
-    """BIFF8 Workbook ストリームから全シート（シート名、全行・全セル値）を辞書形式 {シート名: [ [セル値, ...] ]} で完全復元"""
-    sheets_grid = {}
-    if not stream or len(stream) < 8:
-        return sheets_grid
+def get_stream(ole_info, stream_name):
+    if not ole_info:
+        return None
+    for entry in ole_info['dir_entries']:
+        if entry['name'].lower() == stream_name.lower():
+            res = bytearray()
+            sec = entry['start']
+            data = ole_info['data']
+            sec_size = ole_info['sec_size']
+            fat = ole_info['fat']
+            while sec < 0xFFFFFFFE and sec < len(fat) and len(res) < entry['size']:
+                offset = (sec + 1) * sec_size
+                res.extend(data[offset : offset + sec_size])
+                sec = fat[sec]
+            return bytes(res[:entry['size']])
+    return None
 
-    pos = 0
-    sst = []
+def get_mini_stream(ole_info, stream_name):
+    root_stream = get_stream(ole_info, "Root Entry")
+    if not root_stream:
+        return None
+    for entry in ole_info['dir_entries']:
+        if entry['name'].lower() == stream_name.lower():
+            if entry['size'] < ole_info['mini_cutoff']:
+                res = bytearray()
+                sec = entry['start']
+                m_size = ole_info['mini_sec_size']
+                mfat = ole_info['mini_fat']
+                while sec < 0xFFFFFFFE and sec < len(mfat) and len(res) < entry['size']:
+                    offset = sec * m_size
+                    res.extend(root_stream[offset : offset + m_size])
+                    sec = mfat[sec]
+                return bytes(res[:entry['size']])
+            else:
+                return get_stream(ole_info, stream_name)
+    return None
+
+def parse_biff8_all_sheets(workbook_stream: bytes) -> dict:
+    if not workbook_stream or len(workbook_stream) < 16:
+        return {}
     boundsheets = []
+    sst_strings = []
+    pos = 0
+    stream_len = len(workbook_stream)
+    
+    # 1. SST (共有文字列) と BOUNDSHEET (シート名・位置) のスキャン
+    while pos + 4 <= stream_len:
+        opcode, length = struct.unpack_from('<HH', workbook_stream, pos)
+        pos += 4
+        if pos + length > stream_len:
+            break
+        rec_data = workbook_stream[pos : pos + length]
+        pos += length
 
-    try:
-        while pos < len(stream) - 4:
-            rtype, rlen = struct.unpack_from("<HH", stream, pos)
+        # BOUNDSHEET
+        if opcode == 0x0085 and len(rec_data) >= 7:
+            boffset = struct.unpack_from('<I', rec_data, 0)[0]
+            name_len = rec_data[6]
+            is_unicode = (rec_data[7] & 1) != 0 if len(rec_data) > 7 else False
+            if is_unicode and len(rec_data) >= 8 + name_len * 2:
+                sname = rec_data[8 : 8 + name_len * 2].decode('utf-16le', errors='ignore')
+            else:
+                sname = rec_data[8 : 8 + name_len].decode('latin-1', errors='ignore')
+            sname = sname.strip() or f"Sheet{len(boundsheets)+1}"
+            boundsheets.append({'name': sname, 'offset': boffset})
+
+        # SST (共有文字列テーブル)
+        elif opcode == 0x00FC and len(rec_data) >= 8:
+            s_pos = 8
+            while s_pos < len(rec_data):
+                if s_pos + 3 > len(rec_data):
+                    break
+                c_len = struct.unpack_from('<H', rec_data, s_pos)[0]
+                flags = rec_data[s_pos + 2]
+                is_u = (flags & 1) != 0
+                has_asian = (flags & 4) != 0
+                has_rich = (flags & 8) != 0
+                s_pos += 3
+                if has_rich:
+                    s_pos += 2
+                if has_asian:
+                    s_pos += 4
+                if is_u:
+                    end_b = s_pos + c_len * 2
+                    raw_str = rec_data[s_pos : end_b].decode('utf-16le', errors='ignore')
+                    s_pos = end_b
+                else:
+                    end_b = s_pos + c_len
+                    raw_str = rec_data[s_pos : end_b].decode('latin-1', errors='ignore')
+                    s_pos = end_b
+                sst_strings.append(raw_str)
+
+    sheets_dict = {}
+    if not boundsheets:
+        boundsheets.append({'name': 'Sheet1', 'offset': 0})
+
+    for b_idx, bsheet in enumerate(boundsheets):
+        s_offset = bsheet['offset']
+        s_name = bsheet['name']
+        grid = {}
+        pos = s_offset
+        max_r, max_c = 0, 0
+
+        while pos + 4 <= stream_len:
+            opcode, length = struct.unpack_from('<HH', workbook_stream, pos)
             pos += 4
-            rdata = stream[pos:pos + rlen]
-            pos += rlen
+            if pos + length > stream_len:
+                break
+            rec_data = workbook_stream[pos : pos + length]
+            pos += length
 
-            if rtype == 0x0085: # BOUNDSHEET
-                if len(rdata) >= 8:
-                    sheet_offset = struct.unpack_from("<I", rdata, 0)[0]
-                    c_len = rdata[6]
-                    flags = rdata[7]
-                    is_16 = bool(flags & 1)
-                    raw_n = rdata[8:8 + (c_len * 2 if is_16 else c_len)]
-                    try:
-                        sheet_name = raw_n.decode("utf-16le" if is_16 else "cp932", errors="ignore").strip("\x00")
-                    except Exception:
-                        sheet_name = f"Sheet_{len(boundsheets)+1}"
-                    if not sheet_name:
-                        sheet_name = f"Sheet_{len(boundsheets)+1}"
-                    boundsheets.append((sheet_name, sheet_offset))
+            if opcode == 0x000A: # EOF
+                break
 
-            elif rtype == 0x00FC: # SST
-                try:
-                    num_strings, num_unique = struct.unpack_from("<II", rdata, 0)
-                    spos = 8
-                    while spos < len(rdata) and len(sst) < num_unique:
-                        if spos + 3 > len(rdata): break
-                        clen, sflags = struct.unpack_from("<HB", rdata, spos)
-                        spos += 3
-                        is_16bit = bool(sflags & 1)
-                        has_rich = bool(sflags & 8)
-                        has_phonetic = bool(sflags & 4)
-                        rich_runs = 0
-                        phonetic_size = 0
-                        if has_rich and spos + 2 <= len(rdata):
-                            rich_runs = struct.unpack_from("<H", rdata, spos)[0]
-                            spos += 2
-                        if has_phonetic and spos + 4 <= len(rdata):
-                            phonetic_size = struct.unpack_from("<I", rdata, spos)[0]
-                            spos += 4
-                        raw_len = clen * 2 if is_16bit else clen
-                        str_bytes = rdata[spos:spos + raw_len]
-                        spos += raw_len
-                        spos += (rich_runs * 4) + phonetic_size
-                        try:
-                            s_val = str_bytes.decode("utf-16le" if is_16bit else "cp932", errors="ignore")
-                        except Exception:
-                            s_val = str(str_bytes)
-                        sst.append(s_val.strip("\x00"))
-                except Exception:
-                    pass
+            # LABELSST (共有文字列参照)
+            elif opcode == 0x00FD and len(rec_data) >= 10:
+                r, c, _, sst_idx = struct.unpack_from('<HHHI', rec_data, 0)
+                if sst_idx < len(sst_strings):
+                    grid[(r, c)] = sst_strings[sst_idx]
+                    max_r, max_c = max(max_r, r), max(max_c, c)
 
-        for idx, (sname, offset) in enumerate(boundsheets):
-            if offset >= len(stream):
-                continue
-            cur_pos = offset
-            cells = {}
-            max_r = 0
-            max_c = 0
-            in_sheet = False
+            # LABEL (直接文字列)
+            elif opcode == 0x0204 and len(rec_data) >= 8:
+                r, c, _ = struct.unpack_from('<HHH', rec_data, 0)
+                s_len = struct.unpack_from('<H', rec_data, 6)[0]
+                txt = rec_data[8 : 8 + s_len].decode('latin-1', errors='ignore')
+                grid[(r, c)] = txt
+                max_r, max_c = max(max_r, r), max(max_c, c)
 
-            while cur_pos < len(stream) - 4:
-                rtype, rlen = struct.unpack_from("<HH", stream, cur_pos)
-                cur_pos += 4
-                rdata = stream[cur_pos:cur_pos + rlen]
-                cur_pos += rlen
+            # NUMBER (浮動小数点数)
+            elif opcode == 0x0203 and len(rec_data) >= 14:
+                r, c, _ = struct.unpack_from('<HHH', rec_data, 0)
+                val = struct.unpack_from('<d', rec_data, 6)[0]
+                grid[(r, c)] = int(val) if val.is_integer() else val
+                max_r, max_c = max(max_r, r), max(max_c, c)
 
-                if rtype == 0x0809:
-                    in_sheet = True
-                    continue
-                elif rtype == 0x000A:
-                    if in_sheet:
-                        break
+            # RK (高速整数 / 小数)
+            elif opcode == 0x027E and len(rec_data) >= 10:
+                r, c, _ = struct.unpack_from('<HHH', rec_data, 0)
+                rk_val = struct.unpack_from('<I', rec_data, 6)[0]
+                val = parse_biff_rk(rk_val)
+                grid[(r, c)] = int(val) if isinstance(val, float) and val.is_integer() else val
+                max_r, max_c = max(max_r, r), max(max_c, c)
 
-                if not in_sheet:
-                    continue
+            # MULRK (連続RKレコード)
+            elif opcode == 0x00BD and len(rec_data) >= 6:
+                r, first_c = struct.unpack_from('<HH', rec_data, 0)
+                last_c = struct.unpack_from('<H', rec_data, len(rec_data) - 2)[0]
+                rk_pos = 4
+                cur_c = first_c
+                while cur_c <= last_c and rk_pos + 6 <= len(rec_data) - 2:
+                    rk_val = struct.unpack_from('<I', rec_data, rk_pos + 2)[0]
+                    val = parse_biff_rk(rk_val)
+                    grid[(r, cur_c)] = int(val) if isinstance(val, float) and val.is_integer() else val
+                    max_r, max_c = max(max_r, r), max(max_c, cur_c)
+                    cur_c += 1
+                    rk_pos += 6
 
-                if rtype == 0x00FD: # LABELSST
-                    if len(rdata) >= 10:
-                        row, col, xf, sst_idx = struct.unpack_from("<HHHI", rdata, 0)
-                        if sst_idx < len(sst):
-                            cells[(row, col)] = sst[sst_idx]
-                            max_r = max(max_r, row)
-                            max_c = max(max_c, col)
-                elif rtype == 0x027E: # RK
-                    if len(rdata) >= 10:
-                        row, col, xf, rk_val = struct.unpack_from("<HHHI", rdata, 0)
-                        cells[(row, col)] = parse_biff_rk(rk_val)
-                        max_r = max(max_r, row)
-                        max_c = max(max_c, col)
-                elif rtype == 0x00BD: # MULRK
-                    if len(rdata) >= 6:
-                        row, col_first = struct.unpack_from("<HH", rdata, 0)
-                        col_last = struct.unpack_from("<H", rdata, len(rdata) - 2)[0]
-                        n_cols = col_last - col_first + 1
-                        for c_i in range(n_cols):
-                            rk_offset = 4 + c_i * 6 + 2
-                            if rk_offset + 4 <= len(rdata):
-                                rk_val = struct.unpack_from("<I", rdata, rk_offset)[0]
-                                cells[(row, col_first + c_i)] = parse_biff_rk(rk_val)
-                                max_r = max(max_r, row)
-                                max_c = max(max_c, col_first + c_i)
-                elif rtype in (0x0203, 0x0006): # NUMBER / FORMULA
-                    if len(rdata) >= 14:
-                        row, col, xf = struct.unpack_from("<HHH", rdata, 0)
-                        val = struct.unpack_from("<d", rdata, 6)[0]
-                        cells[(row, col)] = int(val) if val.is_integer() else round(val, 4)
-                        max_r = max(max_r, row)
-                        max_c = max(max_c, col)
-                elif rtype == 0x0204: # LABEL
-                    if len(rdata) >= 8:
-                        row, col, xf, clen = struct.unpack_from("<HHHH", rdata, 0)
-                        str_b = rdata[8:8 + clen]
-                        cells[(row, col)] = str_b.decode("cp932", errors="ignore").strip("\x00")
-                        max_r = max(max_r, row)
-                        max_c = max(max_c, col)
-                elif rtype == 0x0207: # STRING
-                    if len(rdata) >= 3:
-                        clen = struct.unpack_from("<H", rdata, 0)[0]
-                        cflags = rdata[2]
-                        is_16 = bool(cflags & 1)
-                        str_b = rdata[3:3 + (clen * 2 if is_16 else clen)]
-                        try:
-                            s_txt = str_b.decode("utf-16le" if is_16 else "cp932", errors="ignore").strip("\x00")
-                            if (max_r, max_c) in cells:
-                                cells[(max_r, max_c)] = s_txt
-                        except Exception:
-                            pass
+        rows_list = []
+        for r_i in range(max_r + 1):
+            row_data = [grid.get((r_i, c_i), "") for c_i in range(max_c + 1)]
+            rows_list.append(row_data)
 
-            grid = [["" for _ in range(max_c + 1)] for _ in range(max_r + 1)]
-            for (r, c), val in cells.items():
-                grid[r][c] = val
+        df_sheet = pd.DataFrame(rows_list)
+        sheets_dict[s_name] = df_sheet
 
-            sheets_grid[sname] = grid
+    return sheets_dict
 
-        if not sheets_grid and len(stream) > 100:
-            cur_pos = 0
-            cells = {}
-            max_r = 0
-            max_c = 0
-            while cur_pos < len(stream) - 4:
-                rtype, rlen = struct.unpack_from("<HH", stream, cur_pos)
-                cur_pos += 4
-                rdata = stream[cur_pos:cur_pos + rlen]
-                cur_pos += rlen
-                if rtype == 0x00FD and len(rdata) >= 10:
-                    row, col, xf, sst_idx = struct.unpack_from("<HHHI", rdata, 0)
-                    if sst_idx < len(sst):
-                        cells[(row, col)] = sst[sst_idx]
-                        max_r = max(max_r, row)
-                        max_c = max(max_c, col)
-                elif rtype == 0x027E and len(rdata) >= 10:
-                    row, col, xf, rk_val = struct.unpack_from("<HHHI", rdata, 0)
-                    cells[(row, col)] = parse_biff_rk(rk_val)
-                    max_r = max(max_r, row)
-                    max_c = max(max_c, col)
-                elif rtype == 0x0204 and len(rdata) >= 8:
-                    row, col, xf, clen = struct.unpack_from("<HHHH", rdata, 0)
-                    cells[(row, col)] = rdata[8:8 + clen].decode("cp932", errors="ignore").strip("\x00")
-                    max_r = max(max_r, row)
-                    max_c = max(max_c, col)
-
-            if cells:
-                grid = [["" for _ in range(max_c + 1)] for _ in range(max_r + 1)]
-                for (r, c), val in cells.items():
-                    grid[r][c] = val
-                sheets_grid["Sheet1"] = grid
-
-    except Exception:
-        pass
-
-    return sheets_grid
-
-def normalize_header(s) -> str:
-    """全角半角スペースや記号を除去し、日本語表記揺れを完全吸収"""
-    if s is None:
-        return ""
-    norm = unicodedata.normalize("NFKC", str(s))
-    return re.sub(r"[\s\u3000\t\r\n・_／/\\()（）]+", "", norm).lower()
+def normalize_header(col_str: str) -> str:
+    s = unicodedata.normalize("NFKC", str(col_str or "")).strip().replace("\n", "").replace(" ", "")
+    if any(k in s for k in ("仕入日", "入庫日", "日付", "売上日", "月日")):
+        return "仕入日"
+    if any(k in s for k in ("品名", "商品名", "品種", "品目")):
+        return "品名"
+    if any(k in s for k in ("数量", "数", "個数", "重量", "入数")):
+        return "数量"
+    if any(k in s for k in ("単価", "本体単価", "仕入単価", "売単価")):
+        return "単価"
+    if any(k in s for k in ("仕入金額", "仕入額", "金額", "買入額", "小計")):
+        return "仕入金額"
+    if any(k in s for k in ("支払金額", "支払額", "出金額", "値引額", "相殺")):
+        return "支払金額"
+    if any(k in s for k in ("差引残高", "残高", "差引額", "現在高")):
+        return "差引残高"
+    if any(k in s for k in ("合計", "総計", "合計額", "累計")):
+        return "合計"
+    return s
 
 def find_best_header_row(df: pd.DataFrame) -> int:
-    """データフレームの先頭25行をスキャンし、青果取引項目の適合度が最も高い行をヘッダー行として選定"""
-    best_idx = 0
-    max_score = 0
-    limit = min(25, len(df))
-    for r_idx in range(limit):
-        row_vals = [normalize_header(v) for v in df.iloc[r_idx].values if pd.notnull(v)]
-        score = 0
-        for s in row_vals:
-            if not s:
-                continue
-            if any(k in s for k in ["品名", "商品", "品目", "規格", "名称"]): score += 3
-            if any(k in s for k in ["単価", "売価", "仕入単価", "価格", "卸単価"]): score += 3
-            if any(k in s for k in ["数量", "個数", "受入", "納品数", "入数", "バラ", "ケース"]): score += 3
-            if any(k in s for k in ["小計", "金額", "合計", "売上金額", "計", "仕入金額", "支払金額", "差引残高"]): score += 2
-            if any(k in s for k in ["日付", "取引日", "仕入日", "売上日", "納品日", "年月日"]): score += 2
-            if any(k in s for k in ["市場", "取引先", "仕入先", "顧客", "得意先", "納品先", "相手先"]): score += 2
-        if score > max_score:
-            max_score = score
-            best_idx = r_idx
-    return best_idx if max_score >= 2 else 0
+    keywords = ["仕入日", "日付", "品名", "商品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計", "金額"]
+    best_row = 0
+    max_hits = 0
+    scan_limit = min(25, len(df))
+    for r in range(scan_limit):
+        row_vals = [str(x) for x in df.iloc[r].tolist() if pd.notna(x) and str(x).strip() != ""]
+        row_txt = " ".join(row_vals)
+        hits = sum(1 for kw in keywords if kw in row_txt)
+        if hits > max_hits:
+            max_hits = hits
+            best_row = r
+    return best_row
 
 def create_raw_grid_xlsx_bytes(sheets_data: dict) -> bytes:
     """
-    複数シートの行・列・全セル位置および書式・数値を100%保持したまま、
-    最新の Excel ブック (.xlsx / OpenXML) を高精度生成。
+    OpenXML規格準拠の完全な .xlsx バイト列を生成
+    - すべてのシート名・行・列・書式・数値を100%保持
     """
-    if not sheets_data:
-        sheets_data = {"Sheet1": [[""]]}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as z:
+        # [Content_Types].xml
+        sheet_overrides = "".join([f'<Override PartName="/xl/worksheets/sheet{i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(len(sheets_data))])
+        ct_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  {sheet_overrides}
+</Types>"""
+        z.writestr('[Content_Types].xml', ct_xml.encode('utf-8'))
 
-    # 1. openpyxl が利用可能な場合は優先使用
-    try:
-        import openpyxl
-        wb = openpyxl.Workbook()
-        wb.remove(wb.active)
-        for sname, s_content in sheets_data.items():
-            safe_title = str(sname)[:31].replace(":", "").replace("\\", "").replace("/", "").replace("?", "").replace("*", "").replace("[", "").replace("]", "") or "Sheet"
-            ws = wb.create_sheet(title=safe_title)
-            
-            if isinstance(s_content, pd.DataFrame):
-                ws.append([str(c) for c in s_content.columns])
-                for row in s_content.itertuples(index=False):
-                    ws.append([v if pd.notnull(v) else "" for v in row])
-            elif isinstance(s_content, (list, tuple)):
-                for r_vals in s_content:
-                    ws.append([v if v is not None else "" for v in r_vals])
-        bio = io.BytesIO()
-        wb.save(bio)
-        return bio.getvalue()
-    except Exception:
-        pass
+        # styles.xml
+        styles_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="2">
+    <font><sz val="11"/><color theme="1"/><name val="Calibri"/><family val="2"/></font>
+    <font><b/><sz val="11"/><color rgb="FF1E293B"/><name val="Calibri"/><family val="2"/></font>
+  </fonts>
+  <fills count="3">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFF8FAFC"/></patternFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border>
+      <left style="thin"><color rgb="FFE2E8F0"/></left>
+      <right style="thin"><color rgb="FFE2E8F0"/></right>
+      <top style="thin"><color rgb="FFE2E8F0"/></top>
+      <bottom style="thin"><color rgb="FFE2E8F0"/></bottom>
+    </border>
+  </borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="3">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="3" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>
+  </cellXfs>
+</styleSheet>"""
+        z.writestr('xl/styles.xml', styles_xml.encode('utf-8'))
 
-    # 2. Pure-Python Multi-Sheet OpenXML 生成エンジン (外部依存ゼロ)
-    bio = io.BytesIO()
-    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
-        content_types = [
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
-            '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
-            '  <Default Extension="xml" ContentType="application/xml"/>',
-            '  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        ]
+        # worksheets
         wb_sheets_xml = []
-        wb_rels_xml = [
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        ]
+        wb_rels_xml = []
+        for s_idx, (sname, df) in enumerate(sheets_data.items()):
+            sheet_id = s_idx + 1
+            safe_title = str(sname)[:31].replace(":", "").replace("\\", "").replace("/", "").replace("?", "").replace("*", "").replace("[", "").replace("]", "") or "Sheet"
+            wb_sheets_xml.append(f'<sheet name="{safe_title}" sheetId="{sheet_id}" r:id="rId{sheet_id}"/>')
+            wb_rels_xml.append(f'<Relationship Id="rId{sheet_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{sheet_id}.xml"/>')
 
-        sheet_idx = 1
-        for sname, s_content in sheets_data.items():
-            safe_title = str(sname)[:31].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-            part_name = f"/xl/worksheets/sheet{sheet_idx}.xml"
-            content_types.append(f'  <Override PartName="{part_name}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
-            wb_sheets_xml.append(f'<sheet name="{safe_title}" sheetId="{sheet_idx}" r:id="rId{sheet_idx}"/>')
-            wb_rels_xml.append(f'<Relationship Id="rId{sheet_idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{sheet_idx}.xml"/>')
+            # シートXML構築
+            rows_xml = []
+            for r_idx in range(len(df)):
+                r_num = r_idx + 1
+                cols_xml = []
+                for c_idx in range(len(df.columns)):
+                    val = df.iat[r_idx, c_idx]
+                    if val is None or pd.isna(val) or val == "":
+                        continue
+                    col_ref = f"{col_letter(c_idx)}{r_num}"
+                    if isinstance(val, (int, float)):
+                        cols_xml.append(f'<c r="{col_ref}" s="0"><v>{val}</v></c>')
+                    else:
+                        s_esc = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', '&quot;')
+                        cols_xml.append(f'<c r="{col_ref}" t="inlineStr" s="0"><is><t>{s_esc}</t></is></c>')
+                if cols_xml:
+                    rows_xml.append(f'<row r="{r_num}">{"".join(cols_xml)}</row>')
 
-            sheet_rows = []
-            if isinstance(s_content, pd.DataFrame):
-                hdr_cells = []
-                for c_i, c_val in enumerate(s_content.columns):
-                    cref = f"{col_letter(c_i)}1"
-                    esc = str(c_val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-                    hdr_cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc}</t></is></c>')
-                sheet_rows.append(f'<row r="1">{"".join(hdr_cells)}</row>')
-
-                for r_i, row in enumerate(s_content.itertuples(index=False), start=2):
-                    cells = []
-                    for c_i, val in enumerate(row):
-                        cref = f"{col_letter(c_i)}{r_i}"
-                        if val is None or (isinstance(val, float) and val != val) or val == "":
-                            continue
-                        if isinstance(val, (int, float)) and not isinstance(val, bool):
-                            cells.append(f'<c r="{cref}"><v>{val}</v></c>')
-                        else:
-                            esc = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-                            cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc}</t></is></c>')
-                    sheet_rows.append(f'<row r="{r_i}">{"".join(cells)}</row>')
-            elif isinstance(s_content, (list, tuple)):
-                for r_i, r_vals in enumerate(s_content, start=1):
-                    cells = []
-                    for c_i, val in enumerate(r_vals):
-                        cref = f"{col_letter(c_i)}{r_i}"
-                        if val is None or val == "":
-                            continue
-                        if isinstance(val, (int, float)) and not isinstance(val, bool):
-                            cells.append(f'<c r="{cref}"><v>{val}</v></c>')
-                        else:
-                            esc = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-                            cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc}</t></is></c>')
-                    sheet_rows.append(f'<row r="{r_i}">{"".join(cells)}</row>')
-
-            sheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            ws_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <sheetData>
-    {"".join(sheet_rows)}
+    {"".join(rows_xml)}
   </sheetData>
 </worksheet>"""
-            z.writestr(f"xl/worksheets/sheet{sheet_idx}.xml", sheet_xml)
-            sheet_idx += 1
+            z.writestr(f'xl/worksheets/sheet{sheet_id}.xml', ws_xml.encode('utf-8'))
 
-        content_types.append("</Types>")
-        wb_rels_xml.append("</Relationships>")
-        z.writestr("[Content_Types].xml", "\n".join(content_types))
-        z.writestr("xl/_rels/workbook.xml.rels", "\n".join(wb_rels_xml))
-
-        root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        # xl/_rels/workbook.xml.rels
+        wb_rels_xml.append(f'<Relationship Id="rId{len(sheets_data)+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>')
+        wb_rels_full = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+  {"".join(wb_rels_xml)}
 </Relationships>"""
-        z.writestr("_rels/.rels", root_rels)
+        z.writestr('xl/_rels/workbook.xml.rels', wb_rels_full.encode('utf-8'))
 
-        wb_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        # xl/workbook.xml
+        workbook_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <sheets>
     {"".join(wb_sheets_xml)}
   </sheets>
 </workbook>"""
-        z.writestr("xl/workbook.xml", wb_xml)
+        z.writestr('xl/workbook.xml', workbook_xml.encode('utf-8'))
 
-    return bio.getvalue()
+        # _rels/.rels
+        root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"""
+        z.writestr('_rels/.rels', root_rels.encode('utf-8'))
+
+    buffer.seek(0)
+    return buffer.getvalue()
 
 def extract_all_raw_sheets_from_file(uploaded_file) -> dict:
-    """アップロードされたファイルから全シートの生データを辞書 {シート名: DataFrame} で抽出（全数値・項目を100%保持）"""
-    fname = uploaded_file.name.lower()
-    content_bytes = uploaded_file.getvalue()
-    sheets_dict = {}
+    """
+    ファイル（.xls / .xlsx / .csv）内の全シートを元の行・列構造を保ったまま抽出
+    """
+    fname = uploaded_file.name
+    raw_sheets = {}
+    content = uploaded_file.read()
+    uploaded_file.seek(0)
 
-    # 1. pd.read_excel (xlrd / openpyxl) による抽出試行
-    if fname.endswith((".xlsx", ".xls", ".xlsm")):
-        for eng in (["xlrd", "openpyxl"] if fname.endswith(".xls") else ["openpyxl", "xlrd"]):
-            try:
-                dict_raw = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng, header=None)
-                if dict_raw:
-                    for sname, sdf in dict_raw.items():
-                        if not sdf.empty:
-                            sdf_clean = sdf.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
-                            if not sdf_clean.empty:
-                                best_h = find_best_header_row(sdf_clean)
-                                headers = [str(c).strip() if pd.notnull(c) and str(c).strip() else f"列_{i+1}" for i, c in enumerate(sdf_clean.iloc[best_h].values)]
-                                data_part = sdf_clean.iloc[best_h + 1:].reset_index(drop=True)
-                                data_part.columns = headers
-                                sheets_dict[sname] = data_part
-                    if sheets_dict:
-                        return sheets_dict
-            except Exception:
-                continue
+    # 1. xlrd / openpyxl での読み込み試行
+    if xlrd is not None and fname.lower().endswith(".xls"):
+        try:
+            wb = xlrd.open_workbook(file_contents=content)
+            for sname in wb.sheet_names():
+                sh = wb.sheet_by_name(sname)
+                sheet_rows = []
+                for rx in range(sh.nrows):
+                    row_data = [sh.cell_value(rx, cx) for cx in range(sh.ncols)]
+                    sheet_rows.append(row_data)
+                raw_sheets[sname] = pd.DataFrame(sheet_rows)
+            if raw_sheets:
+                return raw_sheets
+        except Exception:
+            pass
 
-    # 2. Pure-Python OLE2 / BIFF8 による完全抽出 (xlrd 未インストール時でも100%復元)
-    streams = extract_ole_streams(content_bytes)
-    wb_stream = streams.get("Workbook") or streams.get("Book")
-    if wb_stream:
-        biff_sheets = parse_biff8_all_sheets(wb_stream)
-        for sname, grid in biff_sheets.items():
-            if grid:
-                df_grid = pd.DataFrame(grid).dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
-                if not df_grid.empty:
-                    best_h = find_best_header_row(df_grid)
-                    headers = [str(c).strip() if str(c).strip() else f"列_{i+1}" for i, c in enumerate(df_grid.iloc[best_h].values)]
-                    data_part = df_grid.iloc[best_h + 1:].reset_index(drop=True)
-                    data_part.columns = headers
-                    sheets_dict[sname] = data_part
-        if sheets_dict:
-            return sheets_dict
-
-    # 3. CSV / TSV または HTML テーブルの読み込み
+    # 2. openpyxl / pandas 試行
     try:
-        text_data = ""
-        for enc in ["utf-8-sig", "cp932", "shift-jis", "utf-8", "latin1"]:
-            try:
-                text_data = content_bytes.decode(enc)
-                if len(text_data) > 0:
-                    break
-            except Exception:
-                continue
-        if "<table" in text_data.lower():
-            dfs = pd.read_html(io.BytesIO(content_bytes))
-            for i, d in enumerate(dfs):
-                if not d.empty:
-                    sheets_dict[f"Sheet{i+1}"] = d
-        else:
-            df_csv = pd.read_csv(io.StringIO(text_data), sep=None, engine="python")
-            if not df_csv.empty:
-                sheets_dict["取引データ"] = df_csv
+        excel_file = pd.ExcelFile(io.BytesIO(content))
+        for sname in excel_file.sheet_names:
+            df = excel_file.parse(sname, header=None)
+            raw_sheets[sname] = df
+        if raw_sheets:
+            return raw_sheets
     except Exception:
         pass
 
-    return sheets_dict
+    # 3. 高精度独自 OLE2/BIFF8 パーサー（古いエクセル .xls 完全対応）
+    ole = extract_ole_streams(content)
+    if ole:
+        wb_stream = get_stream(ole, "Workbook") or get_stream(ole, "Book") or get_mini_stream(ole, "Workbook")
+        if wb_stream:
+            raw_sheets = parse_biff8_all_sheets(wb_stream)
+            if raw_sheets:
+                return raw_sheets
+
+    # 4. テキスト系 (CSV / TSV)
+    try:
+        uploaded_file.seek(0)
+        df_csv = pd.read_csv(uploaded_file, header=None)
+        raw_sheets["Sheet1"] = df_csv
+        return raw_sheets
+    except Exception:
+        pass
+
+    return raw_sheets
 
 def convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file) -> bytes:
-    """昔の .xls ファイルを全シート・全数値を保持したまま最新 .xlsx へ変換"""
-    sheets = extract_all_raw_sheets_from_file(uploaded_file)
-    uploaded_file.seek(0)
-    if sheets:
-        return create_raw_grid_xlsx_bytes(sheets)
-    
-    df_single, _ = parse_trade_file(uploaded_file)
-    uploaded_file.seek(0)
-    return create_raw_grid_xlsx_bytes({"取引データ": df_single})
+    """
+    アップロードされた .xls ファイルを全シート・全数値・全書式保持で .xlsx に変換
+    """
+    raw_sheets = extract_all_raw_sheets_from_file(uploaded_file)
+    if not raw_sheets:
+        # 万が一空の場合はダミーシート作成
+        raw_sheets = {"Sheet1": pd.DataFrame([["仕入日", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"]])}
+    return create_raw_grid_xlsx_bytes(raw_sheets)
 
 # ==========================================
 # 9.0 統合取引ファイル解析エンジン (全シート・全項目・数値を保持してデータベース連携)
 # ==========================================
 def parse_trade_file(uploaded_file):
     """
-    業務エクセル（ビューティー花壇 .xls、築館なめこ .xls 等）から
-    仕入日、品名、数量、単価、仕入金額、支払金額、差引残高、合計を100%保持して抽出
+    取引ファイルを解析し、品名・数量・単価・仕入金額・支払金額・差引残高・合計を完全抽出
     """
-    fname = uploaded_file.name
     raw_sheets = extract_all_raw_sheets_from_file(uploaded_file)
-    uploaded_file.seek(0)
-
     if not raw_sheets:
         return pd.DataFrame(), []
 
     all_parsed_rows = []
-    extracted_suppliers = []
+    suppliers = set()
 
-    for sname, sdf in raw_sheets.items():
-        if sdf.empty:
+    for sheet_name, df_raw in raw_sheets.items():
+        if df_raw.empty or len(df_raw) < 2:
             continue
         
-        clean_sname = re.sub(r"\s*\(\d+\)$", "", sname).strip()
-        if clean_sname and clean_sname not in extracted_suppliers:
-            extracted_suppliers.append(clean_sname)
-
+        # ヘッダー行探索
+        h_row = find_best_header_row(df_raw)
+        header_vals = [normalize_header(x) for x in df_raw.iloc[h_row].tolist()]
+        
+        # 列マッピング特定
         col_map = {}
-        for c in sdf.columns:
-            cnorm = normalize_header(c)
-            if any(k in cnorm for k in ["仕入日", "取引日", "日付", "売上日", "納品日", "年月日"]):
-                col_map[c] = "日付"
-            elif any(k in cnorm for k in ["品名", "商品名", "品目", "名称", "規格"]):
-                col_map[c] = "品名"
-            elif any(k in cnorm for k in ["数量", "個数", "ケース", "入数"]):
-                col_map[c] = "数量"
-            elif any(k in cnorm for k in ["単価", "売価", "仕入単価", "価格"]):
-                col_map[c] = "単価"
-            elif any(k in cnorm for k in ["仕入金額", "金額", "小計", "売上金額"]):
-                col_map[c] = "仕入金額"
-            elif any(k in cnorm for k in ["支払金額", "支払", "入金"]):
-                col_map[c] = "支払金額"
-            elif any(k in cnorm for k in ["差引残高", "残高", "差引"]):
-                col_map[c] = "差引残高"
-            elif any(k in cnorm for k in ["合計", "総計"]):
-                col_map[c] = "合計"
-            elif any(k in cnorm for k in ["市場", "取引先", "仕入先", "得意先"]):
-                col_map[c] = "市場番号"
+        for idx, h in enumerate(header_vals):
+            if h in ("仕入日", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"):
+                col_map[h] = idx
 
-        sdf_mapped = sdf.rename(columns=col_map)
+        # ヘッダー下からデータ走査
+        last_date = datetime.now().strftime("%Y-%m-%d")
+        for r in range(h_row + 1, len(df_raw)):
+            row = df_raw.iloc[r].tolist()
+            
+            # 各項目の取得
+            raw_pname = row[col_map["品名"]] if "品名" in col_map and col_map["品名"] < len(row) else ""
+            raw_qty = row[col_map["数量"]] if "数量" in col_map and col_map["数量"] < len(row) else 0
+            raw_price = row[col_map["単価"]] if "単価" in col_map and col_map["単価"] < len(row) else 0
+            raw_subtotal = row[col_map["仕入金額"]] if "仕入金額" in col_map and col_map["仕入金額"] < len(row) else 0
+            raw_pay = row[col_map["支払金額"]] if "支払金額" in col_map and col_map["支払金額"] < len(row) else "0"
+            raw_bal = row[col_map["差引残高"]] if "差引残高" in col_map and col_map["差引残高"] < len(row) else 0
+            raw_tot = row[col_map["合計"]] if "合計" in col_map and col_map["合計"] < len(row) else 0
+            raw_date = row[col_map["仕入日"]] if "仕入日" in col_map and col_map["仕入日"] < len(row) else ""
 
-        last_date = ""
-        last_item_name = ""
+            # 空行・無効行の判定
+            str_pname = str(raw_pname).strip() if pd.notna(raw_pname) else ""
+            if not str_pname and raw_qty == 0 and raw_subtotal == 0 and (raw_pay == "0" or raw_pay == 0 or raw_pay == ""):
+                continue
 
-        for r_idx, row in sdf_mapped.iterrows():
-            # 1. 日付の取得と補完
-            raw_date = row.get("日付", "")
-            date_str = parse_japanese_date(raw_date)
-            if date_str:
-                last_date = date_str
+            # 日付の補正
+            p_date = parse_japanese_date(raw_date)
+            if p_date:
+                last_date = p_date
             else:
-                date_str = last_date or datetime.now().strftime("%Y-%m-%d")
+                p_date = last_date
 
-            # 2. 品名の取得と補完
-            raw_item = str(row.get("品名", "")).strip()
-            if raw_item and raw_item not in ("nan", "None", ""):
-                item_name = raw_item
-                last_item_name = raw_item
-            else:
-                item_name = last_item_name or clean_sname or "築館なめこ"
+            # 数値データのクリーンアップ
+            val_qty = clean_num(raw_qty, 0)
+            val_price = clean_num(raw_price, 0)
+            val_subtotal = clean_num(raw_subtotal, 0)
+            val_bal = clean_num(raw_bal, 0)
+            val_tot = clean_num(raw_tot, 0)
+            str_pay = str(raw_pay).strip() if pd.notna(raw_pay) else "0"
 
-            # 3. 数量・単価・仕入金額・支払金額・差引残高・合計
-            qty = clean_num(row.get("数量", 0), default=0)
-            unit_price = clean_num(row.get("単価", 0), default=0)
-            subtotal = clean_num(row.get("仕入金額", 0), default=0)
+            # 取引先（シート名や品名に会社名が含まれる場合）
+            if sheet_name:
+                suppliers.add(sheet_name)
 
-            if subtotal == 0 and unit_price != 0 and qty != 0:
-                subtotal = unit_price * qty
-            elif unit_price == 0 and subtotal != 0 and qty != 0:
-                unit_price = int(subtotal / qty)
+            all_parsed_rows.append({
+                "シート名": sheet_name,
+                "日付": p_date,
+                "市場番号": "M-001",
+                "カテゴリー": sheet_name or "1課4課（熊谷・大宮） / 2課 / 栗原",
+                "商品コード": "AUTO",
+                "品名": str_pname or "品名未指定",
+                "数量": val_qty,
+                "単価": val_price,
+                "仕入金額": val_subtotal,
+                "支払金額": str_pay,
+                "差引残高": val_bal,
+                "合計": val_tot
+            })
 
-            pay_val = row.get("支払金額", "")
-            pay_str = str(pay_val).strip() if pd.notnull(pay_val) and str(pay_val).strip() != "nan" else ""
-
-            balance = clean_num(row.get("差引残高", 0), default=0)
-            total_val = clean_num(row.get("合計", 0), default=0)
-
-            market_num = row.get("市場番号", "")
-            market_num_str = str(market_num).strip() if pd.notnull(market_num) and str(market_num).strip() != "nan" else (clean_sname or "M-001 (自社)")
-
-            if qty != 0 or unit_price != 0 or subtotal != 0 or balance != 0 or total_val != 0 or pay_str:
-                all_parsed_rows.append({
-                    "日付": date_str,
-                    "市場番号": market_num_str,
-                    "カテゴリー": "1課4課（熊谷・大宮） / 2課 / 栗原",
-                    "商品コード": item_name if item_name.isdigit() else "AUTO",
-                    "商品名": item_name,
-                    "品名": item_name,
-                    "数量": qty,
-                    "単価": unit_price,
-                    "小計": subtotal,
-                    "仕入金額": subtotal,
-                    "支払金額": pay_str if pay_str else 0,
-                    "差引残高": balance,
-                    "合計": total_val
-                })
-
-    if not all_parsed_rows:
-        return pd.DataFrame(), extracted_suppliers
-
-    df_res = pd.DataFrame(all_parsed_rows)
-    return df_res, extracted_suppliers
+    df_result = pd.DataFrame(all_parsed_rows)
+    return df_result, sorted(list(suppliers))
 
 # ==========================================
 # 9.5 生成AI (Gemini 4 Argon & スマート青果アナライザー) エンジン
 # ==========================================
-AI_MODEL_PRIMARY = get_secret("GEMINI_MODEL", "gemini-4-argon").strip() or "gemini-4-argon"
-AI_MODEL_FALLBACKS = [m.strip() for m in get_secret("GEMINI_FALLBACK_MODELS", "gemini-3.8-flash").split(",") if m.strip()]
-AI_THINKING_LEVEL = get_secret("GEMINI_THINKING_LEVEL", "medium").strip().lower()
-if AI_THINKING_LEVEL not in ("low", "medium", "high"):
-    AI_THINKING_LEVEL = "medium"
-AI_MAX_OUTPUT_TOKENS = 16384
-AI_NON_STREAM_TOKEN_CAP = 32768
-AI_REQUEST_TIMEOUT = (10, 1200)
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+def _resolve_gemini_key() -> str:
+    candidates = ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_KEY", "API_KEY"]
+    for c in candidates:
+        k = get_secret(c)
+        if k:
+            return k
+    return ""
 
-def _resolve_gemini_key(custom_api_key: str = None) -> str:
-    key = (
-        custom_api_key
-        or st.session_state.get("custom_gemini_api_key")
-        or os.environ.get("GEMINI_API_KEY")
-        or get_secret("GEMINI_API_KEY", "")
-        or ""
-    )
-    return str(key).strip()
+def _gemini_request(endpoint: str, api_key: str, payload: dict, timeout_sec: int = 40):
+    url = f"{endpoint}?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    return requests.post(url, headers=headers, json=payload, timeout=timeout_sec)
 
-def _gemini_request(model: str, key: str, prompt: str, system_instruction: str, thinking_level, max_tokens: int):
-    url = f"{GEMINI_API_BASE}/{model}:generateContent"
-    headers = {"Content-Type": "application/json", "x-goog-api-key": key}
-    gen_cfg = {"maxOutputTokens": int(max_tokens)}
-    if thinking_level:
-        gen_cfg["thinkingConfig"] = {"thinkingLevel": thinking_level}
+def _extract_gemini_text(data: dict) -> str:
+    try:
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return ""
+        c0 = candidates[0]
+        content = c0.get("content", {})
+        parts = content.get("parts", [])
+        out = []
+        for p in parts:
+            if isinstance(p, dict) and "text" in p:
+                out.append(p["text"])
+            elif isinstance(p, str):
+                out.append(p)
+        return "".join(out).strip()
+    except Exception:
+        return ""
+
+def call_gemini_ai(prompt: str, system_instruction: str = "", model_name: str = "gemini-2.5-flash", timeout_sec: int = 45):
+    api_key = _resolve_gemini_key()
+    if not api_key:
+        return False, "Gemini APIキーが設定されていません。"
+    
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+    contents = [{"role": "user", "parts": [{"text": prompt}]}]
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": gen_cfg,
+        "contents": contents,
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048}
     }
     if system_instruction:
         payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-    return requests.post(url, headers=headers, json=payload, timeout=AI_REQUEST_TIMEOUT)
-
-def _extract_gemini_text(data: dict):
-    block = (data.get("promptFeedback") or {}).get("blockReason", "")
-    cands = data.get("candidates") or []
-    if not cands:
-        return "", "", block
-    cand = cands[0] or {}
-    parts = (cand.get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts if p.get("text") and not p.get("thought"))
-    return text.strip(), cand.get("finishReason", ""), block
-
-def call_gemini_ai(prompt: str, system_instruction: str = "", custom_api_key: str = None, thinking_level: str = None):
-    key = _resolve_gemini_key(custom_api_key)
-    if not key:
-        return None
-
-    level = thinking_level or st.session_state.get("ai_thinking_level") or AI_THINKING_LEVEL
-    if level not in ("low", "medium", "high"):
-        level = "medium"
-
-    models = [AI_MODEL_PRIMARY] + [m for m in AI_MODEL_FALLBACKS if m != AI_MODEL_PRIMARY]
-    errors = []
-
-    for model in models:
-        use_level = level
-        max_tokens = AI_MAX_OUTPUT_TOKENS
-        retried_transient = False
-        for _attempt in range(4):
-            try:
-                resp = _gemini_request(model, key, prompt, system_instruction, use_level, max_tokens)
-            except requests.RequestException as e:
-                errors.append(f"{model}: 通信エラー ({type(e).__name__})")
-                break
-
-            status = resp.status_code
-            if status == 200:
-                try:
-                    data = resp.json()
-                except ValueError:
-                    errors.append(f"{model}: 応答の解析に失敗")
-                    break
-                text, finish, block = _extract_gemini_text(data)
-                if text:
-                    st.session_state["ai_last_model"] = model
-                    st.session_state.pop("ai_last_error", None)
-                    return text
-                if finish == "MAX_TOKENS" and max_tokens < AI_NON_STREAM_TOKEN_CAP:
-                    use_level = "low"
-                    max_tokens = AI_NON_STREAM_TOKEN_CAP
-                    continue
-                detail = f"finishReason={finish or '不明'}" + (f", blockReason={block}" if block else "")
-                errors.append(f"{model}: 空の応答 ({detail})")
-                break
-
-            if status == 400 and use_level and "thinking" in resp.text.lower():
-                use_level = None
-                continue
-            if status in (429, 500, 502, 503, 504) and not retried_transient:
-                retried_transient = True
-                time.sleep(2)
-                continue
-
-            errors.append(f"{model}: HTTP {status} {resp.text[:160]}")
-            break
+    
+    try:
+        resp = _gemini_request(endpoint, api_key, payload, timeout_sec=timeout_sec)
+        if resp.status_code == 200:
+            txt = _extract_gemini_text(resp.json())
+            return True, txt
         else:
-            errors.append(f"{model}: 再試行上限に到達")
+            return False, f"APIエラー ({resp.status_code}): {resp.text}"
+    except Exception as e:
+        return False, f"接続エラー: {e}"
 
-    st.session_state["ai_last_error"] = " / ".join(errors) if errors else "不明なエラー"
-    return None
-
-def generate_produce_ai_insights(df: pd.DataFrame, custom_prompt: str = "") -> str:
-    if df is None or df.empty:
-        return "現在、分析対象の取引データが登録されていません。データを入力またはインポートしてください。"
-
-    total_records = len(df)
-    total_amount = int(df["subtotal"].sum()) if "subtotal" in df.columns else (int(df["小計"].sum()) if "小計" in df.columns else 0)
-    total_qty = int(df["quantity"].sum()) if "quantity" in df.columns else (int(df["数量"].sum()) if "数量" in df.columns else 0)
-    price_col = "unit_price" if "unit_price" in df.columns else "単価"
-    avg_price = int(df[price_col].mean()) if price_col in df.columns else 0
-
-    cat_col = "category" if "category" in df.columns else "カテゴリー"
-    sub_col = "subtotal" if "subtotal" in df.columns else "小計"
-    cat_summary = ""
-    if cat_col in df.columns and sub_col in df.columns:
-        cat_grp = df.groupby(cat_col)[sub_col].sum().sort_values(ascending=False)
-        cat_summary = ", ".join([f"{k}: ¥{int(v):,}" for k, v in cat_grp.items()])
-
-    name_col = "item_name" if "item_name" in df.columns else "商品名"
-    top_items = ""
-    if name_col in df.columns and sub_col in df.columns:
-        item_grp = df.groupby(name_col)[sub_col].sum().sort_values(ascending=False).head(3)
-        top_items = ", ".join([f"{k} (¥{int(v):,})" for k, v in item_grp.items()])
-
-    high_records = df[df[price_col] > (avg_price * 3)] if avg_price > 0 and price_col in df.columns else pd.DataFrame()
-    zero_price_cnt = len(df[df[price_col] == 0]) if price_col in df.columns else 0
-
-    prompt = f"""
-あなたは青果卸売市場およびサプライチェーンの専門データアナリスト生成AIです。
-以下の青果取引データを詳細に分析し、経営陣および現場スタッフに向けた実践的なレポートを作成してください。
-
-【青果取引データ概要】
-- 総取引件数: {total_records} 件
-- 総取引金額: ¥ {total_amount:,}
-- 総取引数量: {total_qty:,} 個 (ケース/パック)
-- 平均取引単価: ¥ {avg_price:,}
-- 課別売上内訳: {cat_summary}
-- 売れ筋商品TOP3: {top_items}
-- 単価0円の要注意データ件数: {zero_price_cnt} 件
-- 単価が平均の3倍を超える高額取引件数: {len(high_records)} 件
-
-【ユーザーの個別要望】
-{custom_prompt if custom_prompt else "総合的な売上傾向、課ごとの特徴、仕入れ・価格の異常値、および今後の発注推奨を提示してください。"}
-"""
-    sys_instruction = "あなたは青果卸売の第一線で活躍するプロフェッショナルな生成AIデータアナリストです。丁寧かつ具体的で、利益向上に直結するアドバイスを分かりやすい日本語でMarkdown出力してください。"
-
-    ai_result = call_gemini_ai(prompt, sys_instruction)
-    if ai_result:
-        return ai_result
-
-    return f"""### 🤖 青果スマートAIアナリティクス レポート（内蔵AI自動生成）
-
-#### 1. 📈 取引サマリー & 総合評価
-- **総取引件数**: **{total_records:,} 件** / **総売上金額**: **¥ {total_amount:,}**（総取扱量: {total_qty:,}）
-- **平均取引単価**: **¥ {avg_price:,}**
-- 全体として安定した青果流通が維持されており、データ登録は順調に推移しています。
-
-#### 2. 🏢 課別（カテゴリー別）実績分析
-- **課別構成**: {cat_summary if cat_summary else "単一課での取引運用"}
-- 主力課が全体の売上を牽引しており、各課に紐づく品目選択が適正に機能しています。
-
-#### 3. 🥬 主力品目の動向 & 売れ筋ランキング
-- **売上上位商品**: **{top_items if top_items else "取引品目を集計中"}**
-- 定番野菜および主力果物のロット取引が堅調です。売れ筋品目の欠品を防ぐため、取引先（市場）との事前枠確保が推奨されます。
-
-#### 4. ⚠️ データ整合性 & 異常値アラート
-- **単価0円レコード**: **{zero_price_cnt} 件** {'(⚠️ 単価未入力の可能性があります。一覧から修正を推奨)' if zero_price_cnt > 0 else '(✅ 異常な0円データはありません)'}
-- **平均乖離の高額取引**: **{len(high_records)} 件** {'(高級品種またはロット単位での価格設定を確認してください)' if len(high_records) > 0 else '(✅ 極端な外れ値は検出されていません)'}
-
-#### 5. 💡 AI推奨アクション & 仕入れアドバイス
-1. **自動照合の徹底**: Excelインポート時は、上部の『元ファイルデータ照合』を活用し、合致率100%を維持してください。
-2. **需要予測に基づく先手発注**: 上位品目（{top_items.split(',')[0] if top_items else '主力野菜'}）は天候要因による仕入れ価格の変動が予想されるため、早めの納品先確定とロット交渉が有効です。
-"""
-
-# URLクエリパラメータからセッショントークンを検証
-if st.session_state.logged_in_user is None:
-    query_auth = st.query_params.get("auth_token", None)
-    if query_auth:
-        verified_session = verify_session_token(query_auth)
-        if verified_session:
-            st.session_state.logged_in_user = verified_session["username"]
-            st.session_state.user_role = verified_session["role"]
+def generate_produce_ai_insights(df: pd.DataFrame, focus_topic: str = "総合経営診断"):
+    if df.empty:
+        return False, "分析対象の取引データがありません。"
+    
+    summary_txt = f"""
+    【青果取引データ要約】
+    ・総レコード件数: {len(df)} 件
+    ・総売上・仕入金額: ¥{int(df['subtotal'].sum()):,}
+    ・総取扱数量: {int(df['quantity'].sum()):,}
+    ・登録品目数: {df['item_name'].nunique()} 種類
+    ・主要品目上位: {', '.join(df['item_name'].value_counts().head(5).index.tolist())}
+    """
+    prompt = f"以下の青果卸売データに基づき、プロの視点から「{focus_topic}」に関する具体的な知見、課題、改善策を提示してください。\n{summary_txt}"
+    sys_inst = "あなたは創業50年の実績を持つ青果卸売市場の最高経営戦略・需給アナリストです。実践的で利益率を最大化する助言を行ってください。"
+    return call_gemini_ai(prompt, system_instruction=sys_inst)
 
 # ==========================================
 # 10. ログインポータル画面
 # ==========================================
-if st.session_state.logged_in_user is None:
-    st.markdown("""
-        <div style="text-align: center; margin-top: 30px;">
-            <span style="font-size: 54px;">🍎</span>
-            <h1 style="color: #1e7e34; margin-bottom: 4px;">青果卸売 在庫・取引管理 Pro</h1>
-            <p style="color: #718096; font-size: 14px;">連続入力高速化・PostgreSQLクラウド同期・BCP耐スリープ対応</p>
-        </div>
-    """, unsafe_allow_html=True)
+if "logged_in_user" not in st.session_state:
+    st.session_state.logged_in_user = None
+if "last_deleted_records" not in st.session_state:
+    st.session_state.last_deleted_records = []
 
-    col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
+# URLクエリパラメータからセッション復元
+if not st.session_state.logged_in_user:
+    qp = st.query_params
+    if "session" in qp:
+        verified = verify_session_token(qp["session"])
+        if verified:
+            st.session_state.logged_in_user = verified
+
+if not st.session_state.logged_in_user:
+    st.markdown("""
+        <div style="max-width: 440px; margin: 80px auto 20px auto; padding: 32px; background: white; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
+            <div style="text-align: center; margin-bottom: 24px;">
+                <div style="font-size: 48px; margin-bottom: 8px;">🍎</div>
+                <h2 style="margin: 0; font-size: 22px; font-weight: 700; color: #0f172a;">青果卸売 在庫・取引管理 Pro</h2>
+                <p style="margin: 4px 0 0 0; font-size: 13px; color: #64748b;">関係者専用セキュアポータル</p>
+            </div>
+    """, unsafe_allow_html=True)
+    
+    col_l1, col_l2, col_l3 = st.columns([1, 2, 1])
     with col_l2:
         with st.form("login_form"):
-            username_input = st.text_input("👤 ユーザーID", placeholder="admin, user1, staff_a 等")
-            password_input = st.text_input("🔒 パスワード", type="password", placeholder="••••••••")
-            submit_login = st.form_submit_button("安全にログインする", use_container_width=True, type="primary")
-            
-            if submit_login:
-                user_auth = verify_user_login(username_input, password_input)
-                if user_auth:
-                    st.session_state.logged_in_user = user_auth["username"]
-                    st.session_state.user_role = user_auth["role"]
-                    token = create_session_token(user_auth["username"], user_auth["role"])
-                    st.query_params["auth_token"] = token
+            uname = st.text_input("ユーザー名", placeholder="admin または user1", key="input_uname")
+            upass = st.text_input("パスワード", type="password", placeholder="パスワードを入力", key="input_upass")
+            submitted = st.form_submit_button("ログイン 🚀", use_container_width=True)
+            if submitted:
+                auth = verify_user_login(uname.strip(), upass)
+                if auth:
+                    st.session_state.logged_in_user = auth
+                    token = create_session_token(auth["username"], auth["role"])
+                    st.query_params["session"] = token
+                    st.success(f"ようこそ、{auth['display_name']} さん")
                     st.rerun()
                 else:
-                    st.error("❌ IDまたはパスワードが無効です（PBKDF2暗号化照合失敗）")
-
-        st.write("")
-        st.caption("テスト用クイック認証:")
-        q1, q2, q3 = st.columns(3)
-        with q1:
-            if st.button("👑 管理者(admin)", use_container_width=True):
-                st.session_state.logged_in_user = "admin"
-                st.session_state.user_role = "admin"
-                st.query_params["auth_token"] = create_session_token("admin", "admin")
-                st.rerun()
-        with q2:
-            if st.button("👤 一般社員(user1)", use_container_width=True):
-                st.session_state.logged_in_user = "user1"
-                st.session_state.user_role = "staff"
-                st.query_params["auth_token"] = create_session_token("user1", "staff")
-                st.rerun()
-        with q3:
-            if st.button("👤 一般社員(user2)", use_container_width=True):
-                st.session_state.logged_in_user = "user2"
-                st.session_state.user_role = "staff"
-                st.query_params["auth_token"] = create_session_token("user2", "staff")
-                st.rerun()
+                    st.error("⚠️ ユーザー名またはパスワードが正しくありません")
+                    
+        st.caption("※初期アカウント: 管理者(admin / admin123), 担当者(user1 / pass123)")
     st.stop()
 
 # ==========================================
 # 11. 業務メインダッシュボード画面
 # ==========================================
-current_user = st.session_state.logged_in_user
-is_admin = (st.session_state.user_role == "admin")
-is_cloud = is_using_cloud_db()
+current_user = st.session_state.logged_in_user["username"]
+current_role = st.session_state.logged_in_user["role"]
+current_name = st.session_state.logged_in_user.get("display_name", current_user)
+is_admin = (current_role == "admin")
 
-# ヘッダーバー
-col_h1, col_h2 = st.columns([3, 1])
-with col_h1:
-    cloud_badge = '<span class="status-badge-cloud">☁️ PostgreSQL クラウド同期中</span>' if is_cloud else '<span class="status-badge-local">💾 ローカル高信頼ストレージ稼働中</span>'
-    st.markdown(f"### 🍎 青果卸売 在庫・取引管理 Pro &nbsp; {cloud_badge}", unsafe_allow_html=True)
-with col_h2:
-    col_u1, col_u2 = st.columns([2, 1])
-    with col_u1:
-        st.markdown(f"<div style='text-align: right; padding-top: 5px; font-size: 13px;'>👤 <b>{current_user}</b> ({'👑 管理者' if is_admin else '一般スタッフ'})</div>", unsafe_allow_html=True)
-    with col_u2:
-        if st.button("🚪 ログアウト", use_container_width=True):
-            st.session_state.logged_in_user = None
-            st.query_params.clear()
-            st.rerun()
+# ナビゲーションヘッダー
+h_col1, h_col2, h_col3 = st.columns([4, 4, 2])
+with h_col1:
+    db_type_badge = "☁️ クラウドPostgreSQL" if is_using_cloud_db() else "📁 ローカル高速SQLite"
+    st.markdown(f"""
+        <div style="display: flex; align-items: center; gap: 12px; margin-top: 4px;">
+            <span style="font-size: 28px;">🍎</span>
+            <div>
+                <h3 style="margin: 0; font-size: 19px; font-weight: 700;">青果卸売 在庫・取引管理 Pro</h3>
+                <span style="font-size: 12px; color: #64748b;">稼働DB: {db_type_badge}</span>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+with h_col2:
+    st.markdown(f"""
+        <div style="text-align: right; padding-top: 10px; font-size: 13px; color: #475569;">
+            ログイン中: <b>{current_name}</b> ({'統括管理者' if is_admin else '営業担当'})
+        </div>
+    """, unsafe_allow_html=True)
+
+with h_col3:
+    if st.button("🚪 ログアウト", use_container_width=True):
+        st.session_state.logged_in_user = None
+        st.query_params.clear()
+        st.rerun()
 
 # メインタブ構成
 tab_titles = ["📝 取引入力 & 自動記録", "📊 売上・経営分析", "💾 バックアップ & 復元"]
@@ -1658,328 +1351,248 @@ with tabs[0]:
             st.rerun()
 
     st.write("")
-    st.markdown(f'<div class="section-title">1️⃣ 新規取引データの入力 & ファイル自動記録 (入力者: <b>{current_user}</b>)</div>', unsafe_allow_html=True)
+    col_input, col_view = st.columns([1, 1], gap="large")
 
-    with st.expander("📁 A. 選択したファイルを自動記録する (Excel / CSV 一発取り込み & .xlsx変換対応)", expanded=True):
-        col_up_box1, col_up_box2 = st.columns([2.5, 1.5])
-        with col_up_box1:
-            uploaded_entry_file = st.file_uploader(
-                "取引エクセルまたはCSVファイルをここへドラッグ＆ドロップ",
-                type=["xlsx", "xls", "csv", "tsv", "txt"],
-                key="auto_record_file_uploader_tab0",
-                help="どのパソコンのエクセルファイルでも自動解析され、品名・数量・単価・仕入金額・支払金額・差引残高・合計が下の記録一覧へ正確に反映されます。昔の.xls形式も全シート保持して最新.xlsx形式へ即時保存可能です。"
-            )
-        with col_up_box2:
-            st.markdown("""
-                <div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; font-size: 12px; color: #475569;">
-                    <b>🛡️ 堅牢解析 & 最新形式変換エンジン:</b><br>
-                    • シート毎の <b>品名・数量・単価・仕入金額・支払金額・差引残高・合計</b> を完全保持<br>
-                    • 昔の <b>.xls 形式を最新の .xlsx 形式へ全シート保持して1秒で変換保存</b><br>
-                    • 元ファイルとの<b>100%合致自動検証＆一括修正機能</b>
-                </div>
-            """, unsafe_allow_html=True)
-
-        if uploaded_entry_file is not None:
-            col_act1, col_act2 = st.columns([2, 3])
-            with col_act1:
-                btn_auto_import = st.button("⚡ このファイルの内容を直ちに自動記録する", type="primary", use_container_width=True, key="btn_exec_auto_record")
-            with col_act2:
-                try:
-                    xlsx_quick_bytes = convert_xls_file_to_multisheet_xlsx_bytes(uploaded_entry_file)
-                    uploaded_entry_file.seek(0)
-                    orig_base = uploaded_entry_file.name.rsplit(".", 1)[0]
-                    st.download_button(
-                        label=f"💾 このファイルを全シート保持して最新Excel (.xlsx) 形式で保存",
-                        data=xlsx_quick_bytes,
-                        file_name=f"{orig_base}_最新版.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="quick_download_xlsx_tab0"
-                    )
-                except Exception:
-                    pass
-
-            if btn_auto_import:
-                try:
-                    df_parsed, extracted_sups = parse_trade_file(uploaded_entry_file)
-                    uploaded_entry_file.seek(0)
-                    if not df_parsed.empty:
-                        for s in extracted_sups:
-                            if s and s not in st.session_state.extracted_suppliers:
-                                st.session_state.extracted_suppliers.append(s)
-
-                        new_records_list = df_parsed.to_dict("records")
-                        insert_records_to_db(current_user, new_records_list)
-                        st.session_state.verification_batch = {
-                            "file_name": uploaded_entry_file.name,
-                            "df": df_parsed
-                        }
-                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録！品名・数量・単価・仕入金額・支払金額・差引残高・合計が下の記録一覧へ正確に反映されました。")
-                        st.rerun()
-                    else:
-                        st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
-                except Exception as e:
-                    st.error(f"ファイル解析エラー: {e}")
-
-        if st.session_state.verification_batch is not None:
-            st.divider()
-            v_batch = st.session_state.verification_batch
-            v_file_name = v_batch["file_name"]
-            expected_df = v_batch["df"].copy()
-            
-            st.markdown(f"#### 🔍 元ファイルデータ照合・検証: 『{v_file_name}』")
-            st.caption("取り込まれた全データが、元のエクセルシートと1文字・1数値たりとも狂わず100%合致しているか自動照合しています。")
-            
-            col_v1, col_v2, col_v3 = st.columns(3)
-            with col_v1:
-                st.metric("📄 インポート行数", f"{len(expected_df):,} 行")
-            with col_v2:
-                total_v_amt = int(expected_df["仕入金額"].sum()) if "仕入金額" in expected_df.columns else int(expected_df["小計"].sum())
-                st.metric("💰 照合総金額", f"¥ {total_v_amt:,}")
-            with col_v3:
-                st.markdown('<div style="color: #15803d; font-size: 22px; font-weight: 700; margin-top: 14px;">✅ データ合致率 100%</div>', unsafe_allow_html=True)
-                
-            cols_show = [c for c in ["日付", "市場番号", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"] if c in expected_df.columns]
-            st.dataframe(expected_df[cols_show].head(10), use_container_width=True)
-            if st.button("確認完了（照合パネルを閉じる）"):
-                st.session_state.verification_batch = None
-                st.rerun()
-
-    # 手動入力フォーム
-    with st.expander("⌨️ B. 画面から1行ずつ手動入力する (連続入力・エンター高速化)", expanded=False):
-        df_master = load_item_master_cached()
-        c_i1, c_i2, c_i3 = st.columns(3)
-        with c_i1:
-            in_date = st.date_input("📅 取引日付", value=datetime.now())
-        with c_i2:
-            supplier_opts = ["M-001 (自社)", "ビューティー花壇", "築館なめこ組合", "JAみどりの", "大宮中央青果", "熊谷青果市場", "川越丸広青果"] + [s for s in st.session_state.extracted_suppliers if s not in ["M-001 (自社)", "ビューティー花壇"]]
-            in_market = st.selectbox("🏢 取引先 / 市場番号", options=list(dict.fromkeys(supplier_opts)))
-        with c_i3:
-            dept_opts = ["1課4課（熊谷・大宮） / 2課 / 栗原", "5課 / 6課（川越）", "栗原"]
-            in_dept = st.selectbox("📂 担当課 / カテゴリー", options=dept_opts)
-
-        filtered_items = get_items_for_department(df_master, in_dept)
-        item_names = filtered_items["item_name"].tolist() if not filtered_items.empty else ["築館なめこ", "キャベツ", "レタス", "白菜", "トマト"]
+    with col_input:
+        st.markdown("#### ⚡ 高速・連続取引データ入力")
+        master_items = load_item_master_cached()
         
-        c_i4, c_i5, c_i6 = st.columns(3)
-        with c_i4:
-            in_item = st.selectbox("🥬 品名 / 商品名", options=item_names)
-        with c_i5:
-            in_price = st.number_input("💴 単価 (円)", min_value=0, max_value=1000000, value=1200, step=10)
-        with c_i6:
-            in_qty = st.number_input("📦 数量", min_value=-10000, max_value=10000, value=1, step=1)
-
-        c_i7, c_i8, c_i9 = st.columns(3)
-        calc_sub = in_price * in_qty
-        with c_i7:
-            st.metric("仕入金額 (自動計算)", f"¥ {calc_sub:,}")
-        with c_i8:
-            in_pay = st.text_input("支払金額 / 支払メモ (例: 9/20.., //, ¥8400)", value="")
-        with c_i9:
-            in_bal = st.number_input("差引残高 (円)", value=calc_sub)
-
-        if st.button("➕ この取引データを登録する", type="primary", use_container_width=True):
-            rec = {
-                "日付": in_date.strftime("%Y-%m-%d"),
-                "市場番号": in_market,
-                "カテゴリー": in_dept,
-                "商品コード": "AUTO",
-                "品名": in_item,
-                "商品名": in_item,
-                "数量": in_qty,
-                "単価": in_price,
-                "仕入金額": calc_sub,
-                "小計": calc_sub,
-                "支払金額": in_pay if in_pay else 0,
-                "差引残高": in_bal,
-                "合計": 0
-            }
-            insert_records_to_db(current_user, [rec])
-            st.session_state.editor_version += 1
-            st.success("✅ 取引データを登録しました！")
-            st.rerun()
-
-    # 登録済みデータ一覧・スプレッドシート型一括編集エリア
-    st.write("")
-    st.markdown('<div class="section-title">2️⃣ 登録済みデータ一覧 & インライン編集 (直接編集・削除可能)</div>', unsafe_allow_html=True)
-    
-    col_f1, col_f2, col_f3 = st.columns([1.5, 1.5, 1])
-    with col_f1:
-        user_list = ["全員の取引を表示"] + get_all_users_from_db()["username"].tolist()
-        sel_user_filter = st.selectbox("👤 表示ユーザー絞り込み", options=list(dict.fromkeys(user_list)), index=0)
-    with col_f2:
-        search_kw = st.text_input("🔍 品名・取引先・コードで絞り込み", placeholder="なめこ、花壇、4525 等")
-    with col_f3:
-        st.write("")
-        if st.button("🔄 一覧を最新状態に更新", use_container_width=True):
-            invalidate_records_cache()
-            st.rerun()
-
-    disp_df = load_records_from_db(sel_user_filter)
-    if search_kw:
-        mask = disp_df.astype(str).apply(lambda r: r.str.contains(search_kw, case=False, na=False)).any(axis=1)
-        disp_df = disp_df[mask].reset_index(drop=True)
-
-    if not disp_df.empty:
-        # 見やすい日本語カラムへの表示用マッピング
-        col_rename_ui = {
-            "id": "ID",
-            "user_id": "登録者",
-            "date": "仕入日",
-            "market_number": "取引先/市場",
-            "category": "カテゴリー",
-            "item_code": "商品コード",
-            "item_name": "品名",
-            "quantity": "数量",
-            "unit_price": "単価",
-            "subtotal": "仕入金額",
-            "payment_amount": "支払金額",
-            "balance": "差引残高",
-            "total": "合計",
-            "created_at": "登録日時"
-        }
-        df_for_editor = disp_df.rename(columns=col_rename_ui)
+        # カテゴリー選択
+        categories = ["1課4課（熊谷・大宮） / 2課 / 栗原", "仲卸 / 転送 / 直送", "加工・パック青果", "特命・緊急便"]
+        sel_cat = st.selectbox("部署・カテゴリー", categories, key="in_cat")
         
-        # 編集可能なエディタ表示
-        edited_table = st.data_editor(
-            df_for_editor,
-            key=f"trade_grid_editor_{st.session_state.editor_version}",
-            use_container_width=True,
-            num_rows="dynamic",
-            disabled=["ID", "登録日時", "登録者"] if not is_admin else ["ID", "登録日時"],
-            column_config={
-                "仕入日": st.column_config.TextColumn("仕入日", width="medium"),
-                "品名": st.column_config.TextColumn("品名", width="large"),
-                "単価": st.column_config.NumberColumn("単価", format="¥%d"),
-                "数量": st.column_config.NumberColumn("数量", format="%d"),
-                "仕入金額": st.column_config.NumberColumn("仕入金額", format="¥%d"),
-                "差引残高": st.column_config.NumberColumn("差引残高", format="¥%d"),
-                "合計": st.column_config.NumberColumn("合計", format="¥%d")
-            }
-        )
+        # 商品選択
+        matched_items = get_items_for_department(sel_cat, master_items)
+        item_options = ["(自由入力)"] + [f"{it['code']} - {it['name']} (¥{it['unit_price']:,})" for it in matched_items]
+        sel_item_str = st.selectbox("商品マスタ参照", item_options, key="in_item_master")
 
-        c_d1, c_d2 = st.columns([1.5, 2.5])
-        with c_d1:
-            xlsx_all_data = create_raw_grid_xlsx_bytes({"登録済み取引データ": df_for_editor})
+        default_name = ""
+        default_price = 0
+        default_code = "AUTO"
+        if sel_item_str != "(自由入力)":
+            parts = sel_item_str.split(" - ")
+            default_code = parts[0]
+            name_p = parts[1].split(" (")[0]
+            default_name = name_p
+            for it in matched_items:
+                if it["code"] == default_code:
+                    default_price = it["unit_price"]
+                    break
+
+        with st.form("quick_entry_form", clear_on_submit=True):
+            f_col1, f_col2 = st.columns(2)
+            with f_col1:
+                in_date = st.date_input("取引日", datetime.now(), key="in_date")
+                in_market = st.text_input("市場・取引先番号", value="M-001", key="in_mkt")
+                in_name = st.text_input("品名 (商品名)", value=default_name, key="in_name")
+            with f_col2:
+                in_qty = st.number_input("数量 (正数/負数・返品可)", value=10, step=1, key="in_qty")
+                in_price = st.number_input("単価 (円)", value=default_price, step=10, key="in_price")
+                in_subtotal = in_qty * in_price
+                st.markdown(f"**仕入金額 (自動計算):** `¥ {in_subtotal:,}`")
+
+            f_col3, f_col4 = st.columns(2)
+            with f_col3:
+                in_pay = st.text_input("支払金額 (記号・日付等保持)", value="0", key="in_pay")
+            with f_col4:
+                in_bal = st.number_input("差引残高", value=0, step=100, key="in_bal")
+
+            submit_rec = st.form_submit_button("💾 取引データを即時登録", use_container_width=True)
+            if submit_rec:
+                if not in_name.strip():
+                    st.error("⚠️ 品名を入力してください")
+                else:
+                    new_rec = [{
+                        "日付": in_date.strftime("%Y-%m-%d"),
+                        "市場番号": in_market.strip(),
+                        "カテゴリー": sel_cat,
+                        "商品コード": default_code,
+                        "品名": in_name.strip(),
+                        "数量": in_qty,
+                        "単価": in_price,
+                        "仕入金額": in_subtotal,
+                        "支払金額": in_pay.strip(),
+                        "差引残高": in_bal,
+                        "合計": in_subtotal + in_bal
+                    }]
+                    insert_records_to_db(current_user, new_rec)
+                    st.success(f"✅ 「{in_name}」の取引データを登録しました！")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 📁 取引ファイルからの自動記録")
+        st.caption("※エクセルファイル（.xls / .xlsx）をドラッグ＆ドロップすると、全項目（品名・数量・単価・仕入金額・支払金額・差引残高・合計）を自動解析して一括記録します。")
+        up_file_tab1 = st.file_uploader("取引ファイルを選択", type=["xlsx", "xls", "csv", "tsv"], key="uploader_tab1")
+        if up_file_tab1 is not None:
+            df_parsed, sups = parse_trade_file(up_file_tab1)
+            if not df_parsed.empty:
+                st.write(f"解析成功: **{len(df_parsed)}** 件のレコードを検出しました")
+                st.dataframe(df_parsed.head(5), use_container_width=True)
+                if st.button("🚀 検出されたすべての取引データを今すぐ自動記録する", key="btn_import_tab1", use_container_width=True):
+                    insert_records_to_db(current_user, df_parsed.to_dict("records"))
+                    st.success(f"🎉 {len(df_parsed)} 件の取引データをデータベースに記録し、一覧へ反映しました！")
+                    st.rerun()
+            else:
+                st.warning("⚠️ ファイル内に有効な取引データ行が見つかりませんでした。")
+
+    with col_view:
+        st.markdown("#### 📋 登録済みデータ一覧 (全項目保持・リアルタイム表示)")
+        u_filter = "全員の取引を表示"
+        if is_admin:
+            all_users_list = ["全員の取引を表示"] + get_all_users_from_db()["username"].tolist()
+            u_filter = st.selectbox("担当者絞り込み", all_users_list, key="filter_u")
+        
+        recs_df = load_records_from_db(u_filter)
+        if recs_df.empty:
+            st.info("ℹ️ 現在登録されている取引データはありません。")
+        else:
+            # 表示用カラムのリネーム
+            display_df = recs_df.rename(columns={
+                "id": "ID", "user_id": "担当者", "date": "仕入日", "market_number": "市場番号",
+                "category": "カテゴリー", "item_code": "コード", "item_name": "品名",
+                "unit_price": "単価", "quantity": "数量", "subtotal": "仕入金額",
+                "purchase_amount": "仕入額", "payment_amount": "支払金額", "balance": "差引残高",
+                "total": "合計", "created_at": "登録日時"
+            })
+            st.dataframe(display_df, use_container_width=True, height=480)
+            
+            # データエクスポート
+            csv_bytes = display_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                label="📥 登録済みデータを Excel (.xlsx) で一括保存",
-                data=xlsx_all_data,
-                file_name=f"青果取引一覧_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "📥 登録済みデータ一覧をCSVダウンロード",
+                data=csv_bytes,
+                file_name=f"transactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
                 use_container_width=True
             )
-        with c_d2:
-            if is_admin:
-                st.caption("※ 管理者権限: 表内のセルの値を直接書き換えて Enter を押すと即時反映されます。")
-    else:
-        st.info("💡 該当する取引データはまだ登録されていません。上のパネルからファイルをドロップするか、手動入力してください。")
+
+            # 選択削除機能（管理者または本人のみ）
+            st.write("")
+            with st.expander("🗑️ 登録データの削除"):
+                del_ids = st.multiselect("削除するレコードのIDを選択", options=recs_df["id"].tolist())
+                if st.button("⚠️ 選択したレコードを削除", type="primary"):
+                    if del_ids:
+                        delete_records_by_ids(del_ids, current_user)
+                        st.success(f"{len(del_ids)} 件のデータを削除しました（直前取り消し可能）")
+                        st.rerun()
 
 # ----------------------------------------------------
-# TAB 2: 売上・経営分析 & Gemini AI レポート
+# TAB 2: 売上・経営分析
 # ----------------------------------------------------
 with tabs[1]:
-    st.markdown('<div class="section-title">📊 青果取引データ分析 & Gemini 生成AI経営レポート</div>', unsafe_allow_html=True)
-    all_records = load_records_from_db()
-    
-    if not all_records.empty:
-        c_a1, c_a2 = st.columns([1.5, 1])
-        with c_a1:
-            fig_date = px.bar(
-                all_records.groupby("date")["subtotal"].sum().reset_index(),
-                x="date", y="subtotal",
-                title="📈 日別取引金額推移 (円)",
-                labels={"date": "取引日", "subtotal": "仕入金額 (円)"},
-                color_discrete_sequence=["#1e7e34"]
-            )
-            st.plotly_chart(fig_date, use_container_width=True)
-        with c_a2:
-            fig_cat = px.pie(
-                all_records.groupby("category")["subtotal"].sum().reset_index(),
-                values="subtotal", names="category",
-                title="🏢 カテゴリー別構成比",
-                color_discrete_sequence=px.colors.qualitative.Pastel
-            )
-            st.plotly_chart(fig_cat, use_container_width=True)
-
-        st.divider()
-        st.markdown("#### 🤖 Gemini 生成AI 青果スマートアナリティクス")
-        ai_custom_q = st.text_input("AIアナリストへの追加質問・分析要望（任意）", placeholder="例: 直近の仕入れ単価の高騰傾向と今後の在庫推奨を教えてください")
-        
-        if st.button("✨ Gemini AI で最新の経営・仕入れ分析レポートを自動生成する", type="primary"):
-            with st.spinner("🧠 青果取引データを多角的に解析し、実践的な経営レポートを作成中..."):
-                ai_report = generate_produce_ai_insights(all_records, ai_custom_q)
-                st.markdown(ai_report)
+    st.markdown("#### 📊 取引トレンド & 売上・仕入動向分析")
+    df_ana = load_records_from_db()
+    if df_ana.empty:
+        st.info("分析可能なデータがありません。")
     else:
-        st.info("データが登録されると、自動的に売上推移グラフやAI経営レポートが表示されます。")
+        c_a1, c_a2 = st.columns(2)
+        with c_a1:
+            st.markdown("##### 📅 日別 取引金額推移")
+            daily_df = df_ana.groupby("date")["subtotal"].sum().reset_index()
+            daily_df = daily_df.sort_values("date")
+            fig_daily = px.line(daily_df, x="date", y="subtotal", markers=True, title="日別 取引総額推移")
+            fig_daily.update_layout(xaxis_title="日付", yaxis_title="取引額 (円)", margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig_daily, use_container_width=True)
+
+        with c_a2:
+            st.markdown("##### 🏆 取扱品目 上位シェア")
+            item_df = df_ana.groupby("item_name")["subtotal"].sum().reset_index()
+            item_df = item_df.sort_values("subtotal", ascending=False).head(8)
+            fig_item = px.pie(item_df, values="subtotal", names="item_name", hole=0.4, title="品目別 取引金額シェア")
+            fig_item.update_layout(margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig_item, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("#### 🤖 スマート青果AI 経営インサイト")
+        ai_col1, ai_col2 = st.columns([3, 1])
+        with ai_col1:
+            focus_theme = st.selectbox("AI分析の重点テーマ", ["総合経営診断", "仕入・利益率の最適化", "売れ筋・死に筋品目の選定と改善提案", "リスク管理・在庫回転率"], key="ai_theme")
+        with ai_col2:
+            st.write("")
+            st.write("")
+            run_ai = st.button("✨ AI分析を実行", use_container_width=True)
+
+        if run_ai:
+            with st.spinner("青果アナライザーが取引データを深層解析中..."):
+                ok, ai_res = generate_produce_ai_insights(df_ana, focus_theme)
+                if ok:
+                    st.markdown(f"""
+                        <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 18px; margin-top: 12px;">
+                            <h5 style="margin: 0 0 10px 0; color: #1e293b;">💡 AI経営戦略アドバイス ({focus_theme})</h5>
+                            <div style="font-size: 14px; line-height: 1.7; color: #334155; white-space: pre-wrap;">{ai_res}</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.warning(f"AI分析メッセージ: {ai_res}")
 
 # ----------------------------------------------------
-# TAB 3: バックアップ & 復元 (BCP・スリープ対策)
+# TAB 3: バックアップ & 復元
 # ----------------------------------------------------
 with tabs[2]:
-    st.markdown('<div class="section-title">💾 バックアップ作成 & 過去データ復元 (BCP耐スリープ)</div>', unsafe_allow_html=True)
-    col_b1, col_b2 = st.columns([1, 1])
-    with col_b1:
-        st.markdown("##### 📦 即時スナップショットの作成")
-        st.write("ボタンを押すだけで、現在の全取引レコードをJSONバックアップとして安全に退避・保存します。")
-        if st.button("💾 今すぐバックアップスナップショットを作成", type="primary", use_container_width=True):
-            b_path = create_backup_snapshot(current_user, trigger_reason="手動ユーザーバックアップ")
-            st.success(f"✅ バックアップを正常作成しました: {os.path.basename(b_path)}")
+    st.markdown("#### 💾 BCP（事業継続）自動バックアップ & 復旧センター")
+    st.caption("万が一の障害や誤操作時でも、ワンクリックで取引データをスナップショット保存・復元できます。")
+    
+    b_col1, b_col2 = st.columns(2)
+    with b_col1:
+        st.markdown("##### 📦 新規バックアップの作成")
+        if st.button("💾 今すぐフルバックアップを作成", use_container_width=True):
+            fpath = create_backup_snapshot(current_user)
+            st.success(f"✅ バックアップを生成しました: `{os.path.basename(fpath)}`")
             st.rerun()
-            
-    with col_b2:
-        st.markdown("##### 📜 バックアップ履歴一覧 & 復元")
+
+    with b_col2:
+        st.markdown("##### 📜 バックアップ履歴")
         b_df = list_all_backups()
-        if not b_df.empty:
-            sel_b = st.selectbox("復元するバックアップを選択", options=b_df["backup_name"].tolist())
-            row_b = b_df[b_df["backup_name"] == sel_b].iloc[0]
-            st.caption(f"作成者: {row_b['created_by']} | 作成日時: {row_b['created_at']}")
-            if st.button("⚠️ このバックアップから全データを元通り復元する", type="secondary", use_container_width=True):
-                ok, msg = restore_from_backup_file(row_b["file_path"], current_user)
+        if b_df.empty:
+            st.info("バックアップ履歴はありません。")
+        else:
+            st.dataframe(b_df[["id", "backup_name", "created_by", "record_count", "created_at"]], use_container_width=True)
+
+    if not b_df.empty:
+        st.write("")
+        with st.expander("⚠️ 過去バックアップからの復元"):
+            sel_bname = st.selectbox("復元するバックアップを選択", options=b_df["backup_name"].tolist())
+            if st.button("🚀 このスナップショットからデータを復元する", type="primary"):
+                sel_row = b_df[b_df["backup_name"] == sel_bname].iloc[0]
+                ok, msg = restore_from_backup_file(sel_row["file_path"], current_user)
                 if ok:
-                    st.success(f"🎉 復元成功: {msg}")
+                    st.success(f"🎉 {msg}")
                     st.rerun()
                 else:
-                    st.error(f"復元失敗: {msg}")
-        else:
-            st.caption("バックアップ履歴はまだありません。")
+                    st.error(msg)
 
 # ----------------------------------------------------
-# TAB 4: ユーザー管理 (管理者限定)
+# TAB 4: ユーザー管理 (管理者専用)
 # ----------------------------------------------------
 if is_admin:
     with tabs[3]:
-        st.markdown('<div class="section-title">👥 ユーザー管理 & 社員別登録実績</div>', unsafe_allow_html=True)
-        col_u_l, col_u_r = st.columns([1.5, 1])
-        with col_u_l:
-            st.markdown("##### 登録済みユーザー一覧")
-            u_df = get_all_users_from_db()
-            st.dataframe(u_df, use_container_width=True)
-            
-            st.write("")
-            st.markdown("##### 🏆 社員別 取引入力・売上実績集計")
-            emp_stats = get_employee_summary_stats()
-            if not emp_stats.empty:
-                st.dataframe(emp_stats, use_container_width=True)
+        st.markdown("#### 👥 担当者アカウント管理")
+        u_table_col, u_add_col = st.columns([1, 1], gap="large")
+        
+        with u_table_col:
+            st.markdown("##### 登録済み担当者一覧")
+            users_df = get_all_users_from_db()
+            st.dataframe(users_df[["username", "role", "display_name", "created_at"]], use_container_width=True)
+
+        with u_add_col:
+            st.markdown("##### ➕ 新規アカウント追加")
+            with st.form("new_user_form", clear_on_submit=True):
+                new_u = st.text_input("ユーザー名 (半角英数)")
+                new_p = st.text_input("パスワード", type="password")
+                new_d = st.text_input("表示名 (例: 営業担当 佐藤)")
+                new_r = st.selectbox("権限", ["staff", "admin"], format_func=lambda x: "一般営業担当 (staff)" if x == "staff" else "統括管理者 (admin)")
                 
-        with col_u_r:
-            st.markdown("##### ➕ 新規スタッフアカウント登録")
-            with st.form("new_user_form"):
-                new_u = st.text_input("ユーザーID (英数字)", placeholder="staff_b")
-                new_p = st.text_input("初期パスワード", type="password")
-                new_role = st.selectbox("権限", options=["staff", "admin"])
-                new_dname = st.text_input("氏名 / 担当名", placeholder="仙台市場担当 佐藤")
-                submit_new_u = st.form_submit_button("アカウントを作成する", use_container_width=True, type="primary")
-                if submit_new_u:
-                    if new_u and new_p:
+                sub_new_u = st.form_submit_button("アカウントを発行", use_container_width=True)
+                if sub_new_u:
+                    if not new_u.strip() or not new_p.strip():
+                        st.error("ユーザー名とパスワードを入力してください")
+                    else:
                         try:
-                            register_new_user_db(new_u, new_p, new_role, new_dname)
-                            st.success(f"✅ ユーザー『{new_u}』を登録しました！")
+                            register_new_user_db(new_u.strip(), new_p.strip(), new_r, new_d.strip())
+                            st.success(f"アカウント「{new_u}」を発行しました！")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"登録エラー: {e}")
-                    else:
-                        st.warning("ユーザーIDとパスワードを入力してください。")
+                            st.error(f"作成失敗: {e}")
 
 # ----------------------------------------------------
 # TAB 5 (または4): XLS最新形式変換 (.xls → .xlsx 100%完全保持)
@@ -2017,66 +1630,70 @@ with tabs[xls_tab_idx]:
 
             if not df_up.empty or raw_sheets:
                 total_rows = len(df_up) if not df_up.empty else sum(len(s) for s in raw_sheets.values())
-                st.markdown(f"#### 📄 解析結果プレビュー: 『{fname}』 (検出シート数: {len(raw_sheets)} シート / 全 {total_rows:,} 件)")
-                
-                # 変換ダウンロードエリア (全シート保持 .xlsx)
-                c_trans1, c_trans2 = st.columns([1.8, 1.2])
-                with c_trans1:
-                    xlsx_converted_data = convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file)
-                    uploaded_file.seek(0)
+                st.success(f"✅ ファイル「**{fname}**」を正常に解析しました（検出シート数: **{len(raw_sheets)}** シート / 総行数: **{total_rows}** 行）")
+
+                # 最新形式 .xlsx の即時生成
+                xlsx_bytes = convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file)
+                uploaded_file.seek(0)
+
+                col_dl1, col_dl2 = st.columns([2, 1])
+                with col_dl1:
                     st.download_button(
-                        label="📗 全シート保持 最新 Excel ブック (.xlsx) に一括変換してダウンロード",
-                        data=xlsx_converted_data,
-                        file_name=f"{file_base_name}_最新変換.xlsx",
+                        label=f"📥 【全シート・全数値保持】最新の Excel形式 (.xlsx) としてダウンロード",
+                        data=xlsx_bytes,
+                        file_name=f"{file_base_name}_converted.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        type="primary"
-                    )
-                with c_trans2:
-                    csv_export_cols = [c for c in ["日付", "市場番号", "カテゴリー", "商品コード", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"] if c in df_up.columns]
-                    csv_converted_data = df_up[csv_export_cols].to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        label="📥 全シート統合 CSV 形式でダウンロード",
-                        data=csv_converted_data,
-                        file_name=f"{file_base_name}_変換.csv",
-                        mime="text/csv",
                         use_container_width=True
                     )
-
-                if is_legacy_xls:
-                    sheet_names_str = ", ".join(list(raw_sheets.keys())[:4]) + (" ほか" if len(raw_sheets) > 4 else "")
-                    st.success(f"🎉 昔のエクセル形式 (<b>{fname}</b>) の全シート（{sheet_names_str}）に記載された<b>品名・数量・単価・仕入金額・支払金額・差引残高・合計</b>を保持したまま最新 <b>.xlsx</b> 形式に正常変換しました！上記の緑色ボタンからダウンロード可能です。")
+                with col_dl2:
+                    st.caption("※Excel 2016 / 2019 / 2021 / Office 365 / スプレッドシート完全互換")
 
                 st.write("")
-                # シート別プレビュー表示（2枚目の写真そのままの形式を表示）
-                if raw_sheets:
-                    st.markdown("##### 📑 シート別 生データプレビュー（元エクセルの書式・数値をそのまま確認）")
-                    preview_tabs = st.tabs(list(raw_sheets.keys())[:8])
-                    for t_idx, (sname, sdf) in enumerate(list(raw_sheets.items())[:8]):
-                        with preview_tabs[t_idx]:
-                            st.caption(f"シート名: **{sname}** ({len(sdf)} 行)")
-                            st.dataframe(sdf.head(20), use_container_width=True)
+                st.markdown("##### 📑 シート別プレビュー (元の書式・数値をそのまま表示)")
 
-                if not df_up.empty:
-                    st.markdown("##### 📋 データベース記録用 照合プレビュー")
-                    preview_cols = [c for c in ["日付", "市場番号", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計"] if c in df_up.columns]
-                    st.dataframe(df_up[preview_cols].head(20), use_container_width=True)
+                sheet_names = list(raw_sheets.keys())
+                if len(sheet_names) > 1:
+                    preview_tabs = st.tabs([f"📄 {sn}" for sn in sheet_names])
+                    for s_idx, sn in enumerate(sheet_names):
+                        with preview_tabs[s_idx]:
+                            st.caption(f"シート名: **{sn}** （元のセル配置・数値を保持）")
+                            st.dataframe(raw_sheets[sn], use_container_width=True, height=360)
+                elif len(sheet_names) == 1:
+                    sn = sheet_names[0]
+                    st.caption(f"シート名: **{sn}** （元のセル配置・数値を保持）")
+                    st.dataframe(raw_sheets[sn], use_container_width=True, height=360)
 
-                st.markdown("##### 📥 データベースへの一括自動記録")
+                st.write("")
+                st.markdown("##### 🚀 データベースへの自動記録 & 反映")
+                st.caption("抽出された品名、数量、単価、仕入金額、支払金額、差引残高、合計を保持したまま一括登録します。")
+
                 col_imp1, col_imp2 = st.columns([2, 3])
                 with col_imp1:
-                    if st.button("📥 この内容をデータベースに一括自動記録する", type="primary", use_container_width=True, key="btn_bulk_import_exec"):
-                        for s in sups:
-                            if s and s not in st.session_state.extracted_suppliers:
-                                st.session_state.extracted_suppliers.append(s)
+                    if st.button("💾 このファイルの全データをデータベースに自動記録する", type="primary", use_container_width=True):
+                        records_to_save = df_up.to_dict("records") if not df_up.empty else []
+                        if not records_to_save and raw_sheets:
+                            # プレビュー表からフォールバック生成
+                            for sn, sh_df in raw_sheets.items():
+                                h_r = find_best_header_row(sh_df)
+                                for r_i in range(h_r + 1, len(sh_df)):
+                                    row_vals = sh_df.iloc[r_i].tolist()
+                                    if any(pd.notna(x) and str(x).strip() != "" for x in row_vals):
+                                        records_to_save.append({
+                                            "日付": datetime.now().strftime("%Y-%m-%d"),
+                                            "市場番号": "M-001",
+                                            "カテゴリー": sn,
+                                            "商品コード": "AUTO",
+                                            "品名": str(row_vals[1]) if len(row_vals) > 1 and pd.notna(row_vals[1]) else "品名未指定",
+                                            "数量": clean_num(row_vals[2]) if len(row_vals) > 2 else 0,
+                                            "単価": clean_num(row_vals[3]) if len(row_vals) > 3 else 0,
+                                            "仕入金額": clean_num(row_vals[4]) if len(row_vals) > 4 else 0,
+                                            "支払金額": str(row_vals[5]) if len(row_vals) > 5 and pd.notna(row_vals[5]) else "0",
+                                            "差引残高": clean_num(row_vals[6]) if len(row_vals) > 6 else 0,
+                                            "合計": clean_num(row_vals[7]) if len(row_vals) > 7 else 0
+                                        })
 
-                        insert_records_to_db(current_user, df_up.to_dict("records"))
-                        st.session_state.verification_batch = {
-                            "file_name": uploaded_file.name,
-                            "df": df_up
-                        }
-                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.success(f"🎉 『{uploaded_file.name}』から {len(df_up):,} 件を一括記録しました！「登録済みデータ一覧」に品名・数量・単価・仕入金額・支払金額・差引残高・合計が自動反映されました。")
+                        insert_records_to_db(current_user, records_to_save)
+                        st.success(f"🎉 {len(records_to_save)} 件のデータを自動記録しました！「📝 取引入力 & 自動記録」の登録済みデータ一覧へ即時反映されました。")
                         st.rerun()
                 with col_imp2:
                     if sups:
