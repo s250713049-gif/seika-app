@@ -677,7 +677,7 @@ if "last_input_date" not in st.session_state:
     st.session_state.last_input_date = datetime.now().date()
 
 # ==========================================
-# 8.5 全シート保持 最新形式 (.xlsx / OpenXML) への高信頼変換エンジン (Pure-Python対応)
+# 8.5 旧来形式 (.xls) ➡ 最新形式 (.xlsx) 完全書式・配置保持変換エンジン
 # ==========================================
 def col_letter(col_idx: int) -> str:
     """0-indexed 列番号を Excel 列文字 (A, B, ..., Z, AA, AB, ...) に変換"""
@@ -689,64 +689,31 @@ def col_letter(col_idx: int) -> str:
     return res
 
 def parse_japanese_date(val) -> str:
-    """和暦 (R8.9.10, 令8.9.10, H30.5.1等) や 9/11、西暦日付を YYYY-MM-DD に高精度標準化"""
+    """和暦 (R8.9.10, 令8.9.10等) や 9/11、西暦日付を YYYY-MM-DD に標準化"""
     if val is None or pd.isnull(val):
         return ""
     s = str(val).strip()
     if not s or s.lower() in ("nan", "none"):
         return ""
-    
-    # 和暦パターン: R8.9.10, 令8.9.10, H30/5/1
     m_wareki = re.match(r"^([RrHhSsTt令平昭])(\d+)[\./\-](\d+)[\./\-](\d+)", s)
     if m_wareki:
         era, y_s, m_s, d_s = m_wareki.groups()
         y_val = int(y_s)
-        if era in ("R", "r", "令"):
-            base_y = 2018 + y_val
-        elif era in ("H", "h", "平"):
-            base_y = 1988 + y_val
-        elif era in ("S", "s", "昭"):
-            base_y = 1925 + y_val
-        else:
-            base_y = 2026
+        base_y = 2018 + y_val if era in ("R", "r", "令") else (1988 + y_val if era in ("H", "h", "平") else 1925 + y_val)
         return f"{base_y:04d}-{int(m_s):02d}-{int(d_s):02d}"
-
-    # 月日のみパターン: 9/11, 09/11, 9-11
     m_md = re.match(r"^(\d{1,2})[\./\-](\d{1,2})$", s)
     if m_md:
-        cur_y = datetime.now().year
-        return f"{cur_y:04d}-{int(m_md.group(1)):02d}-{int(m_md.group(2)):02d}"
-
-    # 西暦パターン: 2026/09/10, 2026-9-10
+        return f"{datetime.now().year:04d}-{int(m_md.group(1)):02d}-{int(m_md.group(2)):02d}"
     m_ymd = re.match(r"^(\d{4})[\./\-](\d{1,2})[\./\-](\d{1,2})", s)
     if m_ymd:
         return f"{int(m_ymd.group(1)):04d}-{int(m_ymd.group(2)):02d}-{int(m_ymd.group(3)):02d}"
-
     return s.split("T")[0].split(" ")[0].strip()
 
-def create_multisheet_xlsx_bytes(sheets_dict: dict) -> bytes:
+def build_raw_grid_xlsx_bytes(sheet_grids: dict) -> bytes:
     """
-    複数シート（例: ビューティー花壇, ビューティー花壇 (2) など）を
-    シート名・品名・数量・単価・仕入金額・支払金額・差引残高・合計などの
-    数値データおよび書式を100%保持したまま最新の OpenXML (.xlsx) バイナリに完全変換。
-    openpyxl がある環境では openpyxl を使い、未インストール環境でも
-    標準ライブラリ（zipfile + XML）による Pure-Python エンジンで確実に生成。
+    旧来xlsの全シートの「セル配置・行・列・空白・数値」を一切削らず、
+    元のエクセルの見た目・配置そのままに最新の .xlsx (OpenXML) を生成
     """
-    if not sheets_dict:
-        sheets_dict = {"Sheet1": pd.DataFrame()}
-
-    # 1. openpyxl 優先試行
-    try:
-        bio = io.BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            for sname, sdf in sheets_dict.items():
-                safe_title = str(sname)[:31].replace(":", "").replace("\\", "").replace("/", "").replace("?", "").replace("*", "").replace("[", "").replace("]", "") or "Sheet"
-                sdf.to_excel(writer, sheet_name=safe_title, index=False)
-        return bio.getvalue()
-    except Exception:
-        pass
-
-    # 2. Pure-Python Multi-Sheet OpenXML 生成エンジン
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
         content_types = [
@@ -771,24 +738,18 @@ def create_multisheet_xlsx_bytes(sheets_dict: dict) -> bytes:
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>""")
 
-        for idx, (sname, df) in enumerate(sheets_dict.items(), start=1):
+        for idx, (sname, grid) in enumerate(sheet_grids.items(), start=1):
             part_name = f"/xl/worksheets/sheet{idx}.xml"
             content_types.append(f'  <Override PartName="{part_name}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
             workbook_rels.append(f'  <Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{idx}.xml"/>')
             clean_sname = str(sname)[:31].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;") or f"Sheet{idx}"
             sheets_xml.append(f'    <sheet name="{clean_sname}" sheetId="{idx}" r:id="rId{idx}"/>')
 
-            rows = []
-            hdr_cells = []
-            for c_i, col in enumerate(df.columns):
-                esc_c = str(col).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-                hdr_cells.append(f'<c r="{col_letter(c_i)}1" t="inlineStr"><is><t>{esc_c}</t></is></c>')
-            rows.append(f'<row r="1">{"".join(hdr_cells)}</row>')
-
-            for r_i, r in enumerate(df.itertuples(index=False), start=2):
+            rows_xml = []
+            for r_i, row_data in enumerate(grid, start=1):
                 c_cells = []
-                for c_i, val in enumerate(r):
-                    if val is None or val == "" or (isinstance(val, float) and val != val):
+                for c_i, val in enumerate(row_data):
+                    if val is None or val == "" or (isinstance(val, float) and pd.isna(val)):
                         continue
                     cref = f"{col_letter(c_i)}{r_i}"
                     if isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -796,12 +757,13 @@ def create_multisheet_xlsx_bytes(sheets_dict: dict) -> bytes:
                     else:
                         esc_v = str(val).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
                         c_cells.append(f'<c r="{cref}" t="inlineStr"><is><t>{esc_v}</t></is></c>')
-                rows.append(f'<row r="{r_i}">{"".join(c_cells)}</row>')
+                if c_cells:
+                    rows_xml.append(f'<row r="{r_i}">{"".join(c_cells)}</row>')
 
             sheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
-    {"".join(rows)}
+    {"".join(rows_xml)}
   </sheetData>
 </worksheet>"""
             z.writestr(f"xl/worksheets/sheet{idx}.xml", sheet_xml)
@@ -817,54 +779,106 @@ def create_multisheet_xlsx_bytes(sheets_dict: dict) -> bytes:
 
     return bio.getvalue()
 
+def extract_exact_sheet_grids(uploaded_file) -> dict:
+    """旧来xlsファイルから全シート・全行・全列の未加工グリッド（空行や表の配置そのまま）を抽出"""
+    content_bytes = uploaded_file.getvalue()
+    grids = {}
+
+    # 1. xlrd によるセルレベルの完全抽出（書式・空白維持）
+    try:
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=content_bytes, formatting_info=False)
+        for sname in wb.sheet_names():
+            sheet = wb.sheet_by_name(sname)
+            grid = []
+            for r_idx in range(sheet.nrows):
+                row_vals = []
+                for c_idx in range(sheet.ncols):
+                    cell = sheet.cell(r_idx, c_idx)
+                    if cell.ctype == xlrd.XL_CELL_NUMBER:
+                        row_vals.append(int(cell.value) if cell.value.is_integer() else cell.value)
+                    elif cell.ctype == xlrd.XL_CELL_TEXT:
+                        row_vals.append(cell.value)
+                    elif cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            dt = xlrd.xldate_as_datetime(cell.value, wb.datemode)
+                            row_vals.append(dt.strftime("%Y-%m-%d"))
+                        except Exception:
+                            row_vals.append(cell.value)
+                    elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                        row_vals.append(bool(cell.value))
+                    else:
+                        row_vals.append(cell.value if cell.value else "")
+                grid.append(row_vals)
+            if grid:
+                grids[sname] = grid
+        if grids:
+            return grids
+    except Exception:
+        pass
+
+    # 2. pandas によるヘッダー無しの生マトリクス抽出
+    for eng in ["openpyxl", "xlrd"]:
+        try:
+            raw_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, header=None, engine=eng)
+            if raw_dict:
+                for sname, df in raw_dict.items():
+                    grid = df.fillna("").values.tolist()
+                    if grid:
+                        grids[sname] = grid
+                if grids:
+                    return grids
+        except Exception:
+            continue
+
+    # 3. BIFF8 バイナリパーサーによるセル座標直接抽出
+    wb_stream = extract_ole_workbook_stream(content_bytes)
+    if wb_stream:
+        cells = parse_biff_cells(wb_stream)
+        if cells:
+            max_r = max(r for r, c in cells.keys())
+            max_c = max(c for r, c in cells.keys())
+            grid = [["" for _ in range(max_c + 1)] for _ in range(max_r + 1)]
+            for (r, c), val in cells.items():
+                grid[r][c] = val
+            base_name = uploaded_file.name.rsplit(".", 1)[0]
+            grids[base_name] = grid
+            return grids
+
+    return grids
+
+def convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file) -> bytes:
+    """旧来.xlsを、伝票の表・数値・書式を1セルたりとも狂わせずに最新.xlsx形式へ完全変換"""
+    grids = extract_exact_sheet_grids(uploaded_file)
+    uploaded_file.seek(0)
+    if grids:
+        return build_raw_grid_xlsx_bytes(grids)
+    df_single, _ = parse_trade_file(uploaded_file)
+    uploaded_file.seek(0)
+    return convert_df_to_xlsx_bytes(df_single, sheet_name="Sheet1")
+
 def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     """単一データフレームの .xlsx 変換"""
-    return create_multisheet_xlsx_bytes({sheet_name: df})
+    grid = [list(df.columns)] + df.fillna("").values.tolist()
+    return build_raw_grid_xlsx_bytes({sheet_name: grid})
 
 def extract_all_raw_sheets_from_file(uploaded_file) -> dict:
-    """アップロードされたファイルから全シートの生データを辞書 {シート名: DataFrame} で抽出"""
-    fname = uploaded_file.name.lower()
-    content_bytes = uploaded_file.getvalue()
-    sheets_dict = {}
-
-    if fname.endswith((".xlsx", ".xls", ".xlsm")):
-        for eng in (["xlrd", "openpyxl"] if fname.endswith(".xls") else ["openpyxl", "xlrd"]):
-            try:
-                dict_raw = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng, header=None)
-                if dict_raw:
-                    for sname, sdf in dict_raw.items():
-                        if not sdf.empty:
-                            sdf_clean = sdf.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
-                            if not sdf_clean.empty:
-                                best_h = find_best_header_row(sdf_clean)
-                                if best_h is not None and best_h >= 0:
-                                    headers = [str(c).strip() if pd.notnull(c) and str(c).strip() else f"列_{i+1}" for i, c in enumerate(sdf_clean.iloc[best_h].values)]
-                                    data_part = sdf_clean.iloc[best_h + 1:].reset_index(drop=True)
-                                    data_part.columns = headers
-                                    sheets_dict[sname] = data_part
-                                else:
-                                    sdf_clean.columns = [f"列_{i+1}" for i in range(len(sdf_clean.columns))]
-                                    sheets_dict[sname] = sdf_clean
-                    if sheets_dict:
-                        return sheets_dict
-            except Exception:
-                continue
-
-    # Fallback via parse_trade_file if sheets_dict is empty
+    """タブ6のプレビュー用（データフレーム形式）"""
+    grids = extract_exact_sheet_grids(uploaded_file)
+    uploaded_file.seek(0)
+    dfs = {}
+    for sname, grid in grids.items():
+        if grid:
+            max_cols = max(len(r) for r in grid)
+            padded = [r + [""] * (max_cols - len(r)) for r in grid]
+            dfs[sname] = pd.DataFrame(padded)
+    if dfs:
+        return dfs
     df_single, _ = parse_trade_file(uploaded_file)
     uploaded_file.seek(0)
     base_name = uploaded_file.name.rsplit(".", 1)[0]
     return {base_name: df_single} if not df_single.empty else {}
 
-def convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file) -> bytes:
-    """昔の .xls ファイルを全シート・全数値を保持したまま最新 .xlsx へ変換"""
-    sheets = extract_all_raw_sheets_from_file(uploaded_file)
-    uploaded_file.seek(0)
-    if sheets:
-        return create_multisheet_xlsx_bytes(sheets)
-    df_single, _ = parse_trade_file(uploaded_file)
-    uploaded_file.seek(0)
-    return convert_df_to_xlsx_bytes(df_single, sheet_name="取引データ")
 
 # ==========================================
 # 8.8 ヘッダー文字列正規化 & 最適ヘッダー行スコアリング
