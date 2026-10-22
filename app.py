@@ -1843,6 +1843,62 @@ def parse_trade_file(uploaded_file):
     if all_sheet_records:
         return pd.DataFrame(all_sheet_records), extracted_suppliers
     return pd.DataFrame(), extracted_suppliers
+        except Exception:
+            pass
+
+    # 2. .xls (BIFF8 / OLE2バイナリ): Pure-Python BIFF8 パーサーで全シート解析
+    if content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" or fname.endswith(".xls"):
+        try:
+            raw_grids = extract_exact_sheet_grids(uploaded_file)
+            uploaded_file.seek(0)
+            if raw_grids:
+                for sname, grid in raw_grids.items():
+                    if grid:
+                        df_sheet = pd.DataFrame(grid)
+                        s_recs, s_sup = parse_single_sheet_dataframe(df_sheet, str(sname), uploaded_file.name)
+                        if s_sup and s_sup not in extracted_suppliers:
+                            extracted_suppliers.append(s_sup)
+                        if s_recs:
+                            all_sheet_records.extend(s_recs)
+                if all_sheet_records:
+                    return pd.DataFrame(all_sheet_records), extracted_suppliers
+        except Exception:
+            pass
+
+    # 3. pandas / xlrd / openpyxl が利用可能な場合のフォールバック走査
+    for eng in ["openpyxl", "xlrd"]:
+        try:
+            excel_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng, header=None)
+            if excel_dict:
+                for sname, sdf_raw in excel_dict.items():
+                    s_recs, s_sup = parse_single_sheet_dataframe(sdf_raw, str(sname), uploaded_file.name)
+                    if s_sup and s_sup not in extracted_suppliers:
+                        extracted_suppliers.append(s_sup)
+                    if s_recs:
+                        all_sheet_records.extend(s_recs)
+                if all_sheet_records:
+                    return pd.DataFrame(all_sheet_records), extracted_suppliers
+        except Exception:
+            continue
+
+    # 4. CSV / TSV (※バイナリファイル PK / OLE2 の場合は絶対にテキストデコードしない)
+    is_binary = (content_bytes[:4] == b"PK\x03\x04" or content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    if not is_binary:
+        for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
+            try:
+                df_csv = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python", header=None)
+                if not df_csv.empty:
+                    s_recs, s_sup = parse_single_sheet_dataframe(df_csv, uploaded_file.name.rsplit(".", 1)[0], uploaded_file.name)
+                    if s_sup and s_sup not in extracted_suppliers:
+                        extracted_suppliers.append(s_sup)
+                    if s_recs:
+                        return pd.DataFrame(s_recs), extracted_suppliers
+            except Exception:
+                continue
+
+    if all_sheet_records:
+        return pd.DataFrame(all_sheet_records), extracted_suppliers
+    return pd.DataFrame(), extracted_suppliers
     except Exception:
             continue
 
