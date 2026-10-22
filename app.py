@@ -1843,7 +1843,7 @@ def parse_trade_file(uploaded_file):
     if all_sheet_records:
         return pd.DataFrame(all_sheet_records), extracted_suppliers
     return pd.DataFrame(), extracted_suppliers
-        except Exception:
+    except Exception:
             continue
 
     # 4. CSV / TSV (※バイナリファイル PK / OLE2 の場合は絶対にテキストデコードしない)
