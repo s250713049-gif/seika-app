@@ -801,7 +801,6 @@ def parse_japanese_date(val, base_year=None) -> str:
         return f"{cur_y:04d}-{int(m_md.group(1)):02d}-{int(m_md.group(2)):02d}"
 
     return s.split("T")[0].split(" ")[0].strip()
-
 def format_excel_date_serial(serial_val, is_first_row=False, fmt_str="", col_idx=0):
     """
     Excelシリアル値（20000〜65000: 1954年〜2077年）を、
