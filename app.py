@@ -1824,8 +1824,7 @@ def parse_trade_file(uploaded_file):
                     return pd.DataFrame(all_sheet_records), extracted_suppliers
         except Exception:
             continue
-
-    # 4. CSV / TSV (※バイナリファイル PK / OLE2 の場合は絶対にテキストデコードしない)
+　　# 4. CSV / TSV (※バイナリファイル PK / OLE2 の場合は絶対にテキストデコードしない)
     is_binary = (content_bytes[:4] == b"PK\x03\x04" or content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
     if not is_binary:
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
@@ -1843,6 +1842,7 @@ def parse_trade_file(uploaded_file):
     if all_sheet_records:
         return pd.DataFrame(all_sheet_records), extracted_suppliers
     return pd.DataFrame(), extracted_suppliers
+   
         except Exception:
             pass
 
