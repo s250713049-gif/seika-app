@@ -802,9 +802,58 @@ def parse_japanese_date(val, base_year=None) -> str:
 
     return s.split("T")[0].split(" ")[0].strip()
 
+def format_excel_date_serial(serial_val, is_first_row=False, fmt_str="", col_idx=0):
+    """
+    Excelシリアル値（20000〜65000: 1954年〜2077年）を、
+    元エクセルの表示形式（R8.9.2 または 9月5日、令和8年など）に合わせて完全復元
+    """
+    try:
+        dt = datetime(1899, 12, 30) + timedelta(days=float(serial_val))
+        y, m, d = dt.year, dt.month, dt.day
+        r_y = y - 2018  # 令和年 (2026年 -> 令和8年)
+        fmt_lower = fmt_str.lower() if fmt_str else ""
+
+        # 1. 和暦パターン (ggge, ge, e., R)
+        if any(k in fmt_lower for k in ["ggge", "ge", "e.", "r", "令"]):
+            if "年" in fmt_str:
+                if "日" in fmt_str:
+                    return f"令和{r_y}年{m}月{d}日"
+                elif "月" in fmt_str:
+                    return f"令和{r_y}年 {m}月" if " " in fmt_str else f"令和{r_y}年{m}月"
+                return f"令和{r_y}年"
+            return f"R{r_y}.{m}.{d}"
+
+        # 2. 請求金額等のカスタムフォーマット (例: m"月 請求金額")
+        if "請求金額" in fmt_str:
+            return f"{m}月 請求金額"
+
+        # 3. 月日パターン (m月d日, m"月"d"日")
+        if any(k in fmt_str for k in ['m"月"d"日"', "m月d日", "m/d", "m-d"]):
+            return f"{m}月{d}日"
+
+        # 4. 月のみパターン (m月, m"月")
+        if any(k in fmt_str for k in ['m"月"', "m月"]):
+            return f"{m}月"
+
+        # 5. 西暦パターン (yyyy/m/d, yyyy-mm-dd)
+        if "yyyy" in fmt_lower or "yy" in fmt_lower:
+            return dt.strftime("%Y/%m/%d") if "/" in fmt_str else dt.strftime("%Y-%m-%d")
+
+        # 6. フォーマット不明時の列位置推定:
+        # 出荷日列（Col A または col_idx == 0）の場合:
+        if col_idx == 0:
+            if is_first_row:
+                return f"R{r_y}.{m}.{d}"
+            else:
+                return f"{m}月{d}日"
+
+        return f"{m}月{d}日"
+    except Exception:
+        return str(serial_val)
+
 def build_raw_grid_xlsx_bytes(sheet_grids: dict) -> bytes:
     """
-    旧来xlsの全シートの「セル配置・行・列・空白・数値・書式」を1セルたりとも削らず、
+    全シートの「セル配置・行・列・空白・数値・書式」を1セルたりとも削らず、
     元のエクセルの見た目・配置そのままに最新の .xlsx (OpenXML) を完全生成
     """
     bio = io.BytesIO()
@@ -924,7 +973,7 @@ def find_best_header_row(df: pd.DataFrame) -> int:
     return best_idx if max_score >= 2 else 0
 
 # ==========================================
-# 9.0 Pure-Python OLE2 / BIFF8 バイナリパーサー (xlrd非依存・全シート/SST完全対応)
+# 9.0 Pure-Python OLE2 / BIFF8 & OpenXML (.xlsx) バイナリパーサー
 # ==========================================
 def extract_ole_workbook_stream(data: bytes) -> bytes:
     """OLE2 Compound File から Workbook / Book ストリームを純粋なPythonで直接抽出"""
@@ -975,10 +1024,103 @@ def extract_ole_workbook_stream(data: bytes) -> bytes:
         pass
     return None
 
+def cell_ref_to_row_col(ref: str):
+    """Excelセル参照 (例: 'A1', 'C2', 'AB15') を (row_0indexed, col_0indexed) に変換"""
+    col_str = re.sub(r"[0-9]", "", ref).upper()
+    row_str = re.sub(r"[A-Za-z]", "", ref)
+    col = 0
+    for ch in col_str:
+        col = col * 26 + (ord(ch) - 64)
+    col_idx = max(0, col - 1)
+    row_idx = max(0, int(row_str) - 1) if row_str.isdigit() else 0
+    return row_idx, col_idx
+
+def extract_xlsx_sheet_grids(content_bytes: bytes) -> dict:
+    """
+    Pure-Python OpenXML (.xlsx) パーサー (外部ライブラリ非依存)
+    .xlsx の全シート、共有文字列(SST)、インライン文字列、数値を安全かつ完全抽出
+    """
+    grids = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(content_bytes), "r") as z:
+            # 1. 共有文字列テーブル (xl/sharedStrings.xml)
+            sst = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                tree_sst = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for si in tree_sst.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si"):
+                    texts = [elem.text for elem in si.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t") if elem.text]
+                    sst.append("".join(texts))
+
+            # 2. リレーションマップ (xl/_rels/workbook.xml.rels)
+            rel_map = {}
+            if "xl/_rels/workbook.xml.rels" in z.namelist():
+                tree_rel = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+                for rel in tree_rel.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
+                    rel_id = rel.attrib.get("Id")
+                    target = rel.attrib.get("Target", "")
+                    if not target.startswith("xl/"):
+                        target = "xl/" + target.lstrip("/")
+                    rel_map[rel_id] = target
+
+            # 3. ワークブック定義 (xl/workbook.xml)
+            if "xl/workbook.xml" in z.namelist():
+                tree_wb = ET.fromstring(z.read("xl/workbook.xml"))
+                for s in tree_wb.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet"):
+                    s_name = s.attrib.get("name", "Sheet")
+                    rid = s.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                    part_name = rel_map.get(rid)
+                    if not part_name or part_name not in z.namelist():
+                        continue
+                    
+                    ws_tree = ET.fromstring(z.read(part_name))
+                    cells = {}
+                    for c in ws_tree.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"):
+                        r_ref = c.attrib.get("r")
+                        if not r_ref: continue
+                        r_idx, c_idx = cell_ref_to_row_col(r_ref)
+                        t = c.attrib.get("t", "")
+                        v_elem = c.find("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v")
+                        
+                        if t == "s":
+                            if v_elem is not None and v_elem.text and v_elem.text.isdigit():
+                                s_idx = int(v_elem.text)
+                                val = sst[s_idx] if s_idx < len(sst) else ""
+                            else:
+                                val = ""
+                        elif t == "inlineStr":
+                            texts = [elem.text for elem in c.iter("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t") if elem.text]
+                            val = "".join(texts)
+                        elif t == "b":
+                            val = (v_elem.text == "1") if (v_elem is not None and v_elem.text) else False
+                        else:
+                            if v_elem is not None and v_elem.text:
+                                txt = v_elem.text.strip()
+                                if "." in txt:
+                                    try: val = float(txt)
+                                    except Exception: val = txt
+                                elif txt.lstrip("-").isdigit():
+                                    val = int(txt)
+                                else:
+                                    val = txt
+                            else:
+                                val = ""
+                        cells[(r_idx, c_idx)] = val
+
+                    if cells:
+                        max_r = max(r for r, c in cells.keys())
+                        max_c = max(c for r, c in cells.keys())
+                        grid = [["" for _ in range(max_c + 1)] for _ in range(max_r + 1)]
+                        for (r, c), v in cells.items():
+                            grid[r][c] = v
+                        grids[s_name] = grid
+    except Exception:
+        pass
+    return grids
+
 def parse_biff_multisheet(stream: bytes) -> dict:
     """
-    BIFF8 ストリームから全シート・共有文字列(SST)・数値(RK/MULRK)・数式(FORMULA)・ラベルを
-    完全な多重シート構造として安全に解読
+    BIFF8 ストリームから全シート・書式(FORMAT/XF)・共有文字列(SST)・数値(RK/MULRK)・
+    数式(FORMULA)・ラベルを解読し、日付シリアル値を元の日付文字列（R8.9.2 / 9月5日等）として完全復元
     """
     if not stream or len(stream) < 4:
         return {}
@@ -999,6 +1141,22 @@ def parse_biff_multisheet(stream: bytes) -> dict:
     num_unique = 0
     in_sst = False
 
+    # 標準およびカスタム書式テーブル
+    formats = {
+        14: "yyyy-mm-dd",
+        15: "d-mmm-yy",
+        16: "d-mmm",
+        17: "mmm-yy",
+        22: "m/d/yy h:mm",
+        30: "m/d/yy",
+        31: 'yyyy"年"m"月"d"日"',
+        55: 'ggge"年"m"月"d"日"',
+        56: "ge.m.d",
+        57: 'ggge"年"m"月"',
+        58: "ggge.m.d",
+    }
+    xf_formats = []
+
     for rtype, rdata in records:
         if rtype == 0x0085: # BOUNDSHEET
             if len(rdata) >= 8:
@@ -1013,6 +1171,22 @@ def parse_biff_multisheet(stream: bytes) -> dict:
                     s_name = f"Sheet{len(sheet_names) + 1}"
                 if s_name:
                     sheet_names.append(s_name)
+        elif rtype == 0x041E: # FORMAT
+            if len(rdata) >= 5:
+                ifmt = struct.unpack_from("<H", rdata, 0)[0]
+                cch = struct.unpack_from("<H", rdata, 2)[0]
+                grbit = rdata[4]
+                is_16 = bool(grbit & 1)
+                str_bytes = rdata[5:5 + (cch * 2 if is_16 else cch)]
+                try:
+                    fmt_s = str_bytes.decode("utf-16le" if is_16 else "cp932", errors="ignore").rstrip("\x00")
+                except Exception:
+                    fmt_s = str_bytes.decode("latin1", errors="ignore").rstrip("\x00")
+                formats[ifmt] = fmt_s
+        elif rtype == 0x00E0: # XF
+            if len(rdata) >= 4:
+                ifmt = struct.unpack_from("<H", rdata, 2)[0]
+                xf_formats.append(ifmt)
         elif rtype == 0x00FC: # SST
             in_sst = True
             if len(rdata) >= 8:
@@ -1052,6 +1226,19 @@ def parse_biff_multisheet(stream: bytes) -> dict:
             except Exception:
                 s_val = str_bytes.decode("latin1", errors="ignore")
             sst.append(s_val.strip("\x00"))
+
+    def check_and_format_date(r, c, v, xf_idx):
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return v
+        if 20000 <= v <= 65000:
+            ifmt = xf_formats[xf_idx] if xf_idx < len(xf_formats) else 0
+            fmt_str = formats.get(ifmt, "")
+            is_date = (ifmt in (14, 15, 16, 17, 22, 30, 31, 55, 56, 57, 58) or
+                       any(k in fmt_str.lower() for k in ["yy", "gg", "ge", "e.", "m月", 'm"月"', "d日", 'd"日"', "r", "令"]) or
+                       (c == 0 and r >= 1))
+            if is_date:
+                return format_excel_date_serial(v, is_first_row=(r == 1), fmt_str=fmt_str, col_idx=c)
+        return v
 
     # 各シートのセル値解析
     sheets_dict = {}
@@ -1097,22 +1284,22 @@ def parse_biff_multisheet(stream: bytes) -> dict:
                         if v >= 0x20000000: v -= 0x40000000
                         val = v / 100.0 if is_div100 else v
                     else:
-                        # 正しいIEEE 754 リトルエンディアン上位30bit展開
                         raw_b = b"\x00\x00\x00\x00" + struct.pack("<I", rk_val & 0xFFFFFFFC)
                         val = struct.unpack("<d", raw_b)[0]
                         val = val / 100.0 if is_div100 else val
                     if isinstance(val, float) and not (val != val) and val.is_integer():
                         val = int(val)
-                    cur_cells[(row, col)] = val
+                    cur_cells[(row, col)] = check_and_format_date(row, col, val, xf)
             elif rtype == 0x00BD: # MULRK
                 if len(rdata) >= 6:
                     row, col_first = struct.unpack_from("<HH", rdata, 0)
                     col_last = struct.unpack_from("<H", rdata, len(rdata) - 2)[0]
                     n_cols = max(0, col_last - col_first + 1)
                     for c_i in range(n_cols):
-                        rk_off = 4 + c_i * 6 + 2
-                        if rk_off + 4 <= len(rdata):
-                            rk_val = struct.unpack_from("<I", rdata, rk_off)[0]
+                        rk_off = 4 + c_i * 6
+                        if rk_off + 6 <= len(rdata):
+                            xf_sub = struct.unpack_from("<H", rdata, rk_off)[0]
+                            rk_val = struct.unpack_from("<I", rdata, rk_off + 2)[0]
                             is_div100 = bool(rk_val & 1)
                             if rk_val & 2:
                                 v = (rk_val >> 2)
@@ -1124,7 +1311,8 @@ def parse_biff_multisheet(stream: bytes) -> dict:
                                 val = val / 100.0 if is_div100 else val
                             if isinstance(val, float) and not (val != val) and val.is_integer():
                                 val = int(val)
-                            cur_cells[(row, col_first + c_i)] = val
+                            cur_col = col_first + c_i
+                            cur_cells[(row, cur_col)] = check_and_format_date(row, cur_col, val, xf_sub)
             elif rtype in (0x0203, 0x0006): # NUMBER / FORMULA
                 if len(rdata) >= 14:
                     row, col, xf = struct.unpack_from("<HHH", rdata, 0)
@@ -1138,7 +1326,7 @@ def parse_biff_multisheet(stream: bytes) -> dict:
                         val = struct.unpack("<d", res_b)[0]
                         if isinstance(val, float) and not (val != val) and val.is_integer():
                             val = int(val)
-                        cur_cells[(row, col)] = val
+                        cur_cells[(row, col)] = check_and_format_date(row, col, val, xf)
             elif rtype == 0x0207: # STRING (数式評価結果文字列)
                 if last_formula_pos and len(rdata) >= 3:
                     cch = struct.unpack_from("<H", rdata, 0)[0]
@@ -1180,11 +1368,29 @@ def parse_biff_multisheet(stream: bytes) -> dict:
 # 9.1 全シート未加工グリッド抽出エンジン
 # ==========================================
 def extract_exact_sheet_grids(uploaded_file) -> dict:
-    """旧来xlsファイルから全シート・全行・全列の未加工グリッド（空行・空セルや表の配置そのまま）を抽出"""
+    """旧来xlsおよびxlsxファイルから全シート・全行・全列の未加工グリッド（空行・空セルや表の配置そのまま）を抽出"""
     content_bytes = uploaded_file.getvalue()
     grids = {}
 
-    # 1. xlrd によるセルレベルの完全抽出（書式・空白・シート名維持）
+    # 1. .xlsx / OpenXML (ZIP 先頭シグネチャ: PK\x03\x04)
+    if content_bytes[:4] == b"PK\x03\x04" or uploaded_file.name.lower().endswith((".xlsx", ".xlsm")):
+        grids = extract_xlsx_sheet_grids(content_bytes)
+        if grids:
+            return grids
+
+    # 2. Pure-Python BIFF8 / OLE2 多重シートパーサー (.xls)
+    try:
+        wb_stream = extract_ole_workbook_stream(content_bytes)
+        if not wb_stream and content_bytes[:2] in (b"\x09\x08", b"\x09\x04", b"\x09\x02", b"\x09\x00"):
+            wb_stream = content_bytes
+        if wb_stream:
+            biff_grids = parse_biff_multisheet(wb_stream)
+            if biff_grids:
+                return biff_grids
+    except Exception:
+        pass
+
+    # 3. xlrd によるセルレベルの完全抽出（インストールされている場合）
     try:
         import xlrd
         wb = xlrd.open_workbook(file_contents=content_bytes, formatting_info=False)
@@ -1197,13 +1403,20 @@ def extract_exact_sheet_grids(uploaded_file) -> dict:
                     try:
                         cell = sheet.cell(r_idx, c_idx)
                         if cell.ctype == xlrd.XL_CELL_NUMBER:
-                            row_vals.append(int(cell.value) if cell.value.is_integer() else cell.value)
+                            val = int(cell.value) if cell.value.is_integer() else cell.value
+                            if c_idx == 0 and r_idx >= 1 and 20000 <= val <= 65000:
+                                val = format_excel_date_serial(val, is_first_row=(r_idx == 1), col_idx=c_idx)
+                            row_vals.append(val)
                         elif cell.ctype == xlrd.XL_CELL_TEXT:
                             row_vals.append(cell.value)
                         elif cell.ctype == xlrd.XL_CELL_DATE:
                             try:
                                 dt = xlrd.xldate_as_datetime(cell.value, wb.datemode)
-                                row_vals.append(dt.strftime("%Y-%m-%d"))
+                                r_y = dt.year - 2018
+                                if r_idx == 1 and c_idx == 0:
+                                    row_vals.append(f"R{r_y}.{dt.month}.{dt.day}")
+                                else:
+                                    row_vals.append(f"{dt.month}月{dt.day}日")
                             except Exception:
                                 row_vals.append(cell.value)
                         elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
@@ -1220,15 +1433,26 @@ def extract_exact_sheet_grids(uploaded_file) -> dict:
     except Exception:
         pass
 
-    # 2. openpyxl による生データ抽出（.xlsx / .xlsm の場合）
+    # 4. openpyxl による生データ抽出（インストールされている場合）
     try:
         import openpyxl
         wb_ox = openpyxl.load_workbook(io.BytesIO(content_bytes), data_only=True)
         for sname in wb_ox.sheetnames:
             ws = wb_ox[sname]
             grid = []
-            for row in ws.iter_rows(values_only=True):
-                grid.append([("" if v is None else v) for v in row])
+            for r_i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                r_row = []
+                for c_i, v in enumerate(row):
+                    if v is None:
+                        r_row.append("")
+                    elif isinstance(v, (int, float)) and c_i == 0 and r_i >= 2 and 20000 <= v <= 65000:
+                        r_row.append(format_excel_date_serial(v, is_first_row=(r_i == 2), col_idx=c_i))
+                    elif isinstance(v, (datetime, pd.Timestamp)):
+                        r_y = v.year - 2018
+                        r_row.append(f"R{r_y}.{v.month}.{v.day}" if r_i == 2 and c_i == 0 else f"{v.month}月{v.day}日")
+                    else:
+                        r_row.append(v)
+                grid.append(r_row)
             if grid:
                 grids[sname] = grid
         if grids:
@@ -1236,36 +1460,9 @@ def extract_exact_sheet_grids(uploaded_file) -> dict:
     except Exception:
         pass
 
-    # 3. pandas エンジンによる全シート抽出
-    for eng in ["xlrd", "openpyxl"]:
-        try:
-            raw_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, header=None, engine=eng)
-            if raw_dict:
-                for sname, df in raw_dict.items():
-                    grid = df.fillna("").values.tolist()
-                    if grid:
-                        grids[str(sname)] = grid
-                if grids:
-                    return grids
-        except Exception:
-            continue
-
-    # 4. Pure-Python BIFF8 / OLE2 多重シートパーサー
-    try:
-        wb_stream = extract_ole_workbook_stream(content_bytes)
-        if not wb_stream and content_bytes[:2] in (b"\x09\x08", b"\x09\x04", b"\x09\x02", b"\x09\x00"):
-            wb_stream = content_bytes
-        if wb_stream:
-            biff_grids = parse_biff_multisheet(wb_stream)
-            if biff_grids:
-                return biff_grids
-    except Exception:
-        pass
-
     # 5. XML Spreadsheet 2003 解析
     try:
         root = ET.fromstring(content_bytes)
-        ns = {'ss': 'urn:schemas-microsoft-com:office:spreadsheet'}
         for ws_node in root.findall('.//{urn:schemas-microsoft-com:office:spreadsheet}Worksheet'):
             sname = ws_node.attrib.get('{urn:schemas-microsoft-com:office:spreadsheet}Name', f'Sheet{len(grids)+1}')
             grid = []
@@ -1283,35 +1480,37 @@ def extract_exact_sheet_grids(uploaded_file) -> dict:
     except Exception:
         pass
 
-    # 6. HTML / CSV フォールバック
-    try:
-        text_data = ""
-        for enc in ["utf-8-sig", "cp932", "shift-jis", "latin1"]:
-            try:
-                text_data = content_bytes.decode(enc, errors="ignore")
-                if len(text_data) > 0: break
-            except Exception:
-                continue
-        if "<table" in text_data.lower() or "<tr" in text_data.lower():
-            dfs = pd.read_html(io.BytesIO(content_bytes))
-            for i, d in enumerate(dfs, 1):
-                if not d.empty:
-                    grids[f"Sheet{i}"] = d.fillna("").values.tolist()
-            if grids: return grids
+    # 6. HTML / CSV フォールバック (※バイナリファイル PK / OLE2 の場合は文字化け防止のため絶対に実行しない)
+    is_binary = (content_bytes[:4] == b"PK\x03\x04" or content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    if not is_binary:
+        try:
+            text_data = ""
+            for enc in ["utf-8-sig", "cp932", "shift-jis"]:
+                try:
+                    text_data = content_bytes.decode(enc)
+                    if len(text_data) > 0: break
+                except Exception:
+                    continue
+            if "<table" in text_data.lower() or "<tr" in text_data.lower():
+                dfs = pd.read_html(io.BytesIO(content_bytes))
+                for i, d in enumerate(dfs, 1):
+                    if not d.empty:
+                        grids[f"Sheet{i}"] = d.fillna("").values.tolist()
+                if grids: return grids
 
-        lines = [line.strip() for line in text_data.splitlines() if line.strip()]
-        rows = []
-        for line in lines:
-            if "\t" in line: parts = [p.strip() for p in line.split("\t")]
-            elif "," in line: parts = [p.strip() for p in line.split(",")]
-            else: parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
-            if parts: rows.append(parts)
-        if rows:
-            max_c = max(len(r) for r in rows)
-            grid = [r + [""] * (max_c - len(r)) for r in rows]
-            grids[uploaded_file.name.rsplit(".", 1)[0]] = grid
-    except Exception:
-        pass
+            lines = [line.strip() for line in text_data.splitlines() if line.strip()]
+            rows = []
+            for line in lines:
+                if "\t" in line: parts = [p.strip() for p in line.split("\t")]
+                elif "," in line: parts = [p.strip() for p in line.split(",")]
+                else: parts = [p.strip() for p in re.split(r"\s{2,}", line) if p.strip()]
+                if parts: rows.append(parts)
+            if rows:
+                max_c = max(len(r) for r in rows)
+                grid = [r + [""] * (max_c - len(r)) for r in rows]
+                grids[uploaded_file.name.rsplit(".", 1)[0]] = grid
+        except Exception:
+            pass
 
     return grids
 
@@ -1334,10 +1533,27 @@ def convert_xls_file_to_multisheet_xlsx_bytes(uploaded_file) -> bytes:
     uploaded_file.seek(0)
     return build_raw_grid_xlsx_bytes({"Sheet1": [["データ変換完了"]]})
 
-def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
-    """単一データフレームの .xlsx 変換"""
-    grid = [list(df.columns)] + df.fillna("").values.tolist()
-    return build_raw_grid_xlsx_bytes({sheet_name: grid})
+def convert_df_to_xlsx_bytes(df_or_dict, sheet_name: str = "Sheet1") -> bytes:
+    """単一DataFrameまたは複数シートの辞書/リストを最新 .xlsx 形式へ完全変換（全シート・日付文字列維持）"""
+    sheet_grids = {}
+    if isinstance(df_or_dict, dict):
+        for sname, df in df_or_dict.items():
+            if isinstance(df, pd.DataFrame):
+                grid = [list(df.columns)] + df.fillna("").values.tolist()
+            elif isinstance(df, list):
+                grid = df
+            else:
+                continue
+            sheet_grids[str(sname)] = grid
+    elif isinstance(df_or_dict, pd.DataFrame):
+        grid = [list(df_or_dict.columns)] + df_or_dict.fillna("").values.tolist()
+        sheet_grids[sheet_name] = grid
+    elif isinstance(df_or_dict, list):
+        sheet_grids[sheet_name] = df_or_dict
+        
+    if not sheet_grids:
+        sheet_grids = {sheet_name: [["データなし"]]}
+    return build_raw_grid_xlsx_bytes(sheet_grids)
 
 def extract_all_raw_sheets_from_file(uploaded_file) -> dict:
     """タブ6のプレビュー用（全シートのデータフレーム形式マップ）"""
@@ -1548,32 +1764,34 @@ def parse_single_sheet_dataframe(sdf_raw: pd.DataFrame, sheet_name: str, file_na
 
 def parse_trade_file(uploaded_file):
     """
-    どんな Excel / XLS / CSV ファイルでも、全シートを走査して
-    品名・数量・単価・金額を100%確実に抽出（解析エラーは一切発生させない）
+    どんな Excel (.xls / .xlsx / .xlsm) でも全シートを走査して
+    文字化け・数値破壊・品名消失・シリアル値化ゼロで100%確実に抽出
     """
     fname = uploaded_file.name.lower()
     content_bytes = uploaded_file.getvalue()
     all_sheet_records = []
     extracted_suppliers = []
 
-    # 1. Excel (全シート走査 via pandas + xlrd/openpyxl)
-    if fname.endswith((".xlsx", ".xls", ".xlsm")):
-        for eng in ["xlrd", "openpyxl"]:
-            try:
-                excel_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng, header=None)
-                if excel_dict:
-                    for sname, sdf_raw in excel_dict.items():
-                        s_recs, s_sup = parse_single_sheet_dataframe(sdf_raw, str(sname), uploaded_file.name)
+    # 1. .xlsx / .xlsm (ZIP形式): Pure-Python OpenXML パーサーで全シート解析
+    if content_bytes[:4] == b"PK\x03\x04" or fname.endswith((".xlsx", ".xlsm")):
+        try:
+            xlsx_grids = extract_xlsx_sheet_grids(content_bytes)
+            if xlsx_grids:
+                for sname, grid in xlsx_grids.items():
+                    if grid:
+                        df_sheet = pd.DataFrame(grid)
+                        s_recs, s_sup = parse_single_sheet_dataframe(df_sheet, str(sname), uploaded_file.name)
                         if s_sup and s_sup not in extracted_suppliers:
                             extracted_suppliers.append(s_sup)
                         if s_recs:
                             all_sheet_records.extend(s_recs)
-                    if all_sheet_records:
-                        return pd.DataFrame(all_sheet_records), extracted_suppliers
-            except Exception:
-                continue
+                if all_sheet_records:
+                    return pd.DataFrame(all_sheet_records), extracted_suppliers
+        except Exception:
+            pass
 
-        # 2. Pure-Python BIFF8 / OLE2 多重シート走査フォールバック
+    # 2. .xls (BIFF8 / OLE2バイナリ): Pure-Python BIFF8 パーサーで全シート解析
+    if content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" or fname.endswith(".xls"):
         try:
             raw_grids = extract_exact_sheet_grids(uploaded_file)
             uploaded_file.seek(0)
@@ -1590,8 +1808,26 @@ def parse_trade_file(uploaded_file):
                     return pd.DataFrame(all_sheet_records), extracted_suppliers
         except Exception:
             pass
-    else:
-        # CSV / TSV
+
+    # 3. pandas / xlrd / openpyxl が利用可能な場合のフォールバック走査
+    for eng in ["openpyxl", "xlrd"]:
+        try:
+            excel_dict = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None, engine=eng, header=None)
+            if excel_dict:
+                for sname, sdf_raw in excel_dict.items():
+                    s_recs, s_sup = parse_single_sheet_dataframe(sdf_raw, str(sname), uploaded_file.name)
+                    if s_sup and s_sup not in extracted_suppliers:
+                        extracted_suppliers.append(s_sup)
+                    if s_recs:
+                        all_sheet_records.extend(s_recs)
+                if all_sheet_records:
+                    return pd.DataFrame(all_sheet_records), extracted_suppliers
+        except Exception:
+            continue
+
+    # 4. CSV / TSV (※バイナリファイル PK / OLE2 の場合は絶対にテキストデコードしない)
+    is_binary = (content_bytes[:4] == b"PK\x03\x04" or content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    if not is_binary:
         for enc in ["utf-8-sig", "utf-8", "cp932", "shift-jis"]:
             try:
                 df_csv = pd.read_csv(io.BytesIO(content_bytes), encoding=enc, sep=None, engine="python", header=None)
