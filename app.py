@@ -1094,7 +1094,7 @@ def extract_ole_workbook_stream(ole_bytes: bytes) -> bytes:
 
 def cell_ref_to_row_col(cell_ref: str) -> Tuple[int, int]:
     """A1 -> (1, 1), Z10 -> (10, 26) の 1-based インデックスに変換"""
-    match = re.match(r"([A-Za-z]+)(\d+)", cell_ref)
+    match = re.match(r"([A-Za-z]+)(\d+)", str(cell_ref))
     if not match:
         return 0, 0
     col_str, row_str = match.groups()
@@ -1104,52 +1104,61 @@ def cell_ref_to_row_col(cell_ref: str) -> Tuple[int, int]:
     return int(row_str), col
 
 
+def _extract_text_from_xml_elem(elem: ET.Element) -> str:
+    """XML要素内のテキストを再帰的に全走査して結合抽出"""
+    texts = [t.text or "" for t in elem.iter() if t.tag.split("}")[-1] == "t"]
+    return "".join(texts)
+
+
 def extract_xlsx_sheet_grids(zip_file: zipfile.ZipFile) -> Dict[str, Dict[Tuple[int, int], str]]:
     """
-    OpenXML (.xlsx) から全ワークシートのセル文字列辞書を抽出。
-    XMLの名前空間プレフィックスの違いや大文字小文字の差異に完全対応し、
-    共有文字列（sharedStrings）やインライン文字列（is/t）の文字化け・脱落を防止します。
+    OpenXML (.xlsx) から全ワークシートのセル文字列辞書を1セルも漏らさず抽出。
+    inlineStr (<is><t>), 共有文字列 (sharedStrings), 数値 (<v>), 数式文字列 (<c t="str">)
+    のすべてを完全に文字・数値として復元します。
     """
     sheet_grids: Dict[str, Dict[Tuple[int, int], str]] = {}
     
     # 1. sharedStrings の抽出
     shared_strings: List[str] = []
-    sst_files = [n for n in zip_file.namelist() if n.lower() == "xl/sharedstrings.xml"]
+    sst_files = [n for n in zip_file.namelist() if n.lower().endswith("sharedstrings.xml")]
     if sst_files:
         try:
             tree = ET.fromstring(zip_file.read(sst_files[0]))
             for si in tree.iter():
                 if si.tag.split("}")[-1] == "si":
-                    texts = [t.text or "" for t in si.iter() if t.tag.split("}")[-1] == "t"]
-                    shared_strings.append("".join(texts))
+                    shared_strings.append(_extract_text_from_xml_elem(si))
         except Exception:
             pass
 
-    # 2. シート名とワークシートファイルパスのマッピング解析
-    sheet_info: List[Tuple[str, str, str]] = []  # (rId, name, state)
-    wb_files = [n for n in zip_file.namelist() if n.lower() == "xl/workbook.xml"]
+    # 2. workbook.xml からシート名と r:id のマッピング抽出
+    sheet_info: List[Tuple[str, str]] = []  # (name, rId)
+    wb_files = [n for n in zip_file.namelist() if n.lower().endswith("workbook.xml")]
     if wb_files:
         try:
             tree = ET.fromstring(zip_file.read(wb_files[0]))
             for elem in tree.iter():
                 if elem.tag.split("}")[-1] == "sheet":
                     s_name = elem.attrib.get("name", "")
-                    s_rid = elem.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id", "")
-                    s_state = elem.attrib.get("state", "visible")
-                    if s_name and s_rid:
-                        sheet_info.append((s_rid, s_name, s_state))
+                    r_id = ""
+                    for k, v in elem.attrib.items():
+                        if k.endswith("id") or k == "id":
+                            r_id = v
+                            break
+                    if s_name:
+                        sheet_info.append((s_name, r_id))
         except Exception:
             pass
 
+    # 3. workbook.xml.rels からリレーション先XMLパスを解決
     rid_to_target: Dict[str, str] = {}
-    wb_rels = [n for n in zip_file.namelist() if n.lower() == "xl/_rels/workbook.xml.rels"]
+    wb_rels = [n for n in zip_file.namelist() if n.lower().endswith("workbook.xml.rels")]
     if wb_rels:
         try:
             tree = ET.fromstring(zip_file.read(wb_rels[0]))
             for elem in tree.iter():
                 if elem.tag.split("}")[-1] == "Relationship":
                     r_id = elem.attrib.get("Id", "")
-                    target = elem.attrib.get("Target", "")
+                    target = elem.attrib.get("Target", "").replace("\\", "/")
                     if r_id and target:
                         if not target.startswith("xl/"):
                             target = "xl/" + target.lstrip("/")
@@ -1157,93 +1166,101 @@ def extract_xlsx_sheet_grids(zip_file: zipfile.ZipFile) -> Dict[str, Dict[Tuple[
         except Exception:
             pass
 
-    # 3. 各ワークシート XML のパース
-    matched_targets = set()
-    for s_rid, s_name, _ in sheet_info:
-        target_path = rid_to_target.get(s_rid)
-        if target_path and target_path in zip_file.namelist():
-            matched_targets.add(target_path)
-            grid = _parse_single_openxml_sheet(zip_file.read(target_path), shared_strings)
-            sheet_grids[s_name] = grid
+    namelist_map = {n.lower(): n for n in zip_file.namelist()}
+    processed_targets = set()
 
-    # マッピングできなかったシートのフォールバック
-    sheet_xmls = sorted([n for n in zip_file.namelist() if re.match(r"^xl/worksheets/sheet\d+\.xml$", n, re.I)])
-    for s_xml in sheet_xmls:
-        if s_xml not in matched_targets:
+    for s_name, r_id in sheet_info:
+        target = rid_to_target.get(r_id, "")
+        real_path = namelist_map.get(target.lower())
+        if real_path:
+            processed_targets.add(real_path)
+            sheet_grids[s_name] = _parse_single_openxml_sheet(zip_file.read(real_path), shared_strings)
+
+    # リレーションで拾えなかったシートXMLの自動補完
+    sheet_files = sorted([n for n in zip_file.namelist() if re.search(r"worksheets/sheet\d+\.xml$", n, re.I)])
+    for sf in sheet_files:
+        if sf not in processed_targets:
             s_name = f"Sheet{len(sheet_grids) + 1}"
-            grid = _parse_single_openxml_sheet(zip_file.read(s_xml), shared_strings)
-            sheet_grids[s_name] = grid
+            sheet_grids[s_name] = _parse_single_openxml_sheet(zip_file.read(sf), shared_strings)
 
     return sheet_grids
 
 
 def _parse_single_openxml_sheet(sheet_xml_bytes: bytes, shared_strings: List[str]) -> Dict[Tuple[int, int], str]:
-    """ワークシートXMLから (row, col) -> 文字列 のマッピングを生成"""
+    """ワークシートXMLから (row, col) -> 文字列 のマッピングを生成（r属性欠落時も位置追跡）"""
     cells: Dict[Tuple[int, int], str] = {}
     try:
         root = ET.fromstring(sheet_xml_bytes)
-        for c in root.iter():
-            if c.tag.split("}")[-1] == "c":
-                r_ref = c.attrib.get("r", "")
-                if not r_ref:
-                    continue
-                r_idx, c_idx = cell_ref_to_row_col(r_ref)
+        cur_row = 0
+
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1]
+            if tag == "row":
+                r_attr = elem.attrib.get("r")
+                if r_attr and r_attr.isdigit():
+                    cur_row = int(r_attr)
+                else:
+                    cur_row += 1
+                cur_col = 0
+            elif tag == "c":
+                r_ref = elem.attrib.get("r", "")
+                if r_ref:
+                    r_idx, c_idx = cell_ref_to_row_col(r_ref)
+                else:
+                    r_idx = cur_row
+                    cur_col += 1
+                    c_idx = cur_col
+
                 if r_idx == 0 or c_idx == 0:
                     continue
 
-                cell_type = c.attrib.get("t", "")
+                cell_type = elem.attrib.get("t", "")
                 val = ""
-                if cell_type == "s":
-                    # 共有文字列
-                    v_elem = next((child for child in c if child.tag.split("}")[-1] == "v"), None)
-                    if v_elem is not None and v_elem.text:
-                        try:
-                            s_idx = int(v_elem.text.strip())
-                            if 0 <= s_idx < len(shared_strings):
-                                val = shared_strings[s_idx]
-                        except ValueError:
-                            pass
-                elif cell_type == "inlineStr":
-                    # インライン文字列
-                    t_elems = [child.text or "" for child in c.iter() if child.tag.split("}")[-1] == "t"]
+
+                # 1. インライン文字列 (<is><t>) または リッチテキスト (<r><t>)
+                t_elems = [child.text or "" for child in elem.iter() if child.tag.split("}")[-1] == "t"]
+                if t_elems and (cell_type in ("inlineStr", "str") or not cell_type):
                     val = "".join(t_elems)
-                else:
-                    v_elem = next((child for child in c if child.tag.split("}")[-1] == "v"), None)
+
+                # 2. 値要素 (<v>) の取得
+                if not val:
+                    v_elem = next((child for child in elem if child.tag.split("}")[-1] == "v"), None)
                     if v_elem is not None and v_elem.text:
-                        val = v_elem.text.strip()
+                        raw_v = v_elem.text.strip()
+                        if cell_type == "s":  # 共有文字列
+                            try:
+                                s_idx = int(raw_v)
+                                if 0 <= s_idx < len(shared_strings):
+                                    val = shared_strings[s_idx]
+                            except ValueError:
+                                val = raw_v
+                        elif cell_type == "b":  # 真偽値
+                            val = "1" if raw_v == "1" else "0"
+                        else:
+                            val = raw_v
 
                 if val:
-                    # 制御文字除去 & サニタイズ
-                    val_clean = "".join(ch for ch in val if ord(ch) >= 32 or ch in "\n\t")
-                    cells[(r_idx, c_idx)] = val_clean
+                    val_clean = "".join(ch for ch in val if ord(ch) >= 32 or ch in "\n\t").strip()
+                    if val_clean:
+                        cells[(r_idx, c_idx)] = val_clean
     except Exception:
         pass
     return cells
 
 
 def parse_biff_multisheet(wb_stream: bytes) -> Dict[str, Dict[Tuple[int, int], str]]:
-    """
-    BIFF8 / BIFF5 完全対応マルチシートパーサー。
-    【不具合解決のポイント】
-    1. BOUNDSHEET (0x0085) から全シート（非表示属性含む）のシート名・BOFストリーム位置(lbPos)を完全抽出。
-    2. 和暦・日付を含む全セルを文字列（str）として純粋保持。
-    3. 各ワークシートの EOF (0x000A) や BOF (0x0809) を正確に追跡し、先頭シート以外のシート（「JAみどりのYZ」等）
-       のデータ・配置を1セルたりとも欠落させずに抽出します。
-    """
+    """BIFF8 / BIFF5 完全対応マルチシートパーサー"""
     sheets_dict: Dict[str, Dict[Tuple[int, int], str]] = {}
     if len(wb_stream) < 16:
         return sheets_dict
 
     pos = 0
     stream_len = len(wb_stream)
-    
-    # ワークシート定義リスト: [(lbPos, sheet_name, sheet_type, hidden_state)]
     boundsheets: List[Tuple[int, str, int, int]] = []
     sst: List[str] = []
     xf_index_to_format_str: Dict[int, str] = {}
     format_records: Dict[int, str] = {}
 
-    # === PASS 1: グローバルレコード（BOUNDSHEET, SST, XF, FORMAT）の先行スキャン ===
     while pos < stream_len - 4:
         rtype, rlen = struct.unpack_from("<HH", wb_stream, pos)
         pos += 4
@@ -1257,25 +1274,22 @@ def parse_biff_multisheet(wb_stream: bytes) -> Dict[str, Dict[Tuple[int, int], s
                 lb_pos = struct.unpack_from("<I", rdata, 0)[0]
                 hs_state = rdata[4]
                 dt_type = rdata[5]
-                # dt_type == 0x00: Worksheet
                 cch = rdata[6]
                 name = ""
                 if len(rdata) >= 8:
                     flag = rdata[7]
-                    if flag & 0x01:  # UTF-16LE
+                    if flag & 0x01:
                         if len(rdata) >= 8 + cch * 2:
                             name = rdata[8:8 + cch * 2].decode("utf-16le", errors="ignore")
-                    else:  # CP932 / Latin-1
+                    else:
                         if len(rdata) >= 8 + cch:
                             name = rdata[8:8 + cch].decode("cp932", errors="ignore")
                 elif len(rdata) >= 7 + cch:
-                    # BIFF5 / BIFF7
                     name = rdata[7:7 + cch].decode("cp932", errors="ignore")
 
                 if not name:
                     name = f"Sheet{len(boundsheets) + 1}"
                 
-                # 重複シート名の連番ユニーク化
                 base_name = name
                 suffix = 2
                 while name in [b[1] for b in boundsheets]:
@@ -1284,7 +1298,7 @@ def parse_biff_multisheet(wb_stream: bytes) -> Dict[str, Dict[Tuple[int, int], s
 
                 boundsheets.append((lb_pos, name, dt_type, hs_state))
 
-        elif rtype == 0x00FC:  # SST (Shared String Table)
+        elif rtype == 0x00FC:  # SST
             if len(rdata) >= 8:
                 try:
                     num_strings = struct.unpack_from("<I", rdata, 4)[0]
@@ -1302,18 +1316,15 @@ def parse_biff_multisheet(wb_stream: bytes) -> Dict[str, Dict[Tuple[int, int], s
                         is_ext = bool(flag & 0x04)
 
                         cb_rich = struct.unpack_from("<H", rdata, s_pos)[0] if is_rich else 0
-                        if is_rich:
-                            s_pos += 2
+                        if is_rich: s_pos += 2
                         cb_ext = struct.unpack_from("<I", rdata, s_pos)[0] if is_ext else 0
-                        if is_ext:
-                            s_pos += 4
+                        if is_ext: s_pos += 4
 
                         str_bytes_len = cch * 2 if is_16bit else cch
                         if s_pos + str_bytes_len <= len(rdata):
                             raw_str = rdata[s_pos:s_pos + str_bytes_len]
                             encoding = "utf-16le" if is_16bit else "cp932"
-                            s_text = raw_str.decode(encoding, errors="ignore")
-                            sst.append(s_text)
+                            sst.append(raw_str.decode(encoding, errors="ignore"))
                             s_pos += str_bytes_len + (cb_rich * 4) + cb_ext
                         else:
                             break
@@ -1331,28 +1342,22 @@ def parse_biff_multisheet(wb_stream: bytes) -> Dict[str, Dict[Tuple[int, int], s
                     fmt_str = rdata[5:5 + cch].decode("cp932", errors="ignore")
                 format_records[fmt_idx] = fmt_str
 
-        elif rtype == 0x00E0:  # XF (Extended Format)
+        elif rtype == 0x00E0:  # XF
             if len(rdata) >= 4:
                 fmt_idx = struct.unpack_from("<H", rdata, 2)[0]
                 xf_index = len(xf_index_to_format_str)
-                fmt_str = format_records.get(fmt_idx, "")
-                xf_index_to_format_str[xf_index] = fmt_str
+                xf_index_to_format_str[xf_index] = format_records.get(fmt_idx, "")
 
-    # BOUNDSHEET が存在しない場合（古いBIFFや簡易エクセル）、1シートを初期登録
     if not boundsheets:
         boundsheets.append((0, "Sheet1", 0, 0))
 
-    # 全シートを辞書に登録（空シートであっても欠落を防ぐ）
     for _, s_name, _, _ in boundsheets:
         sheets_dict[s_name] = {}
 
-    # === PASS 2: ワークシートストリームの個別解析 ===
-    # boundsheet の lbPos に基づいて各シートのセルを抽出
     for idx, (lb_pos, sheet_name, dt_type, _) in enumerate(boundsheets):
-        if dt_type != 0:  # 0以外はマクロシートやグラフシートなのでスキップ
+        if dt_type != 0:
             continue
 
-        # 探索開始位置の決定
         cur_pos = lb_pos if (0 <= lb_pos < stream_len - 4) else 0
         if cur_pos == 0 and idx > 0:
             continue
@@ -1368,97 +1373,70 @@ def parse_biff_multisheet(wb_stream: bytes) -> Dict[str, Dict[Tuple[int, int], s
             rdata = wb_stream[cur_pos:cur_pos + rlen]
             cur_pos += rlen
 
-            if rtype == 0x0809:  # BOF
+            if rtype == 0x0809:
                 bof_type = struct.unpack_from("<H", rdata, 2)[0] if len(rdata) >= 4 else 0
                 if bof_type in (0x0010, 0x0020, 0x0000, 0x0100):
                     inside_sheet = True
-                elif bof_type == 0x0005:  # Globals
+                elif bof_type == 0x0005:
                     inside_sheet = False
-
-            elif rtype == 0x000A:  # EOF
+            elif rtype == 0x000A:
                 if inside_sheet:
                     inside_sheet = False
-                    break  # 当該シートの終了
+                    break
 
             if not inside_sheet:
                 continue
 
-            # --- セルレコードの解析 ---
-            # 1. LABELSST (0x00FD)
-            if rtype == 0x00FD and len(rdata) >= 10:
+            if rtype == 0x00FD and len(rdata) >= 10:  # LABELSST
                 row = struct.unpack_from("<H", rdata, 0)[0] + 1
                 col = struct.unpack_from("<H", rdata, 2)[0] + 1
                 sst_idx = struct.unpack_from("<I", rdata, 6)[0]
                 if 0 <= sst_idx < len(sst):
                     val = sst[sst_idx].strip()
-                    if val:
-                        sheet_cells[(row, col)] = val
-
-            # 2. LABEL (0x0204)
-            elif rtype == 0x0204 and len(rdata) >= 8:
+                    if val: sheet_cells[(row, col)] = val
+            elif rtype == 0x0204 and len(rdata) >= 8:  # LABEL
                 row = struct.unpack_from("<H", rdata, 0)[0] + 1
                 col = struct.unpack_from("<H", rdata, 2)[0] + 1
                 cch = struct.unpack_from("<H", rdata, 6)[0]
-                raw_str = rdata[8:8 + cch]
-                val = raw_str.decode("cp932", errors="ignore").strip()
-                if val:
-                    sheet_cells[(row, col)] = val
-
-            # 3. NUMBER (0x0203)
-            elif rtype == 0x0203 and len(rdata) >= 14:
+                val = rdata[8:8 + cch].decode("cp932", errors="ignore").strip()
+                if val: sheet_cells[(row, col)] = val
+            elif rtype == 0x0203 and len(rdata) >= 14:  # NUMBER
                 row = struct.unpack_from("<H", rdata, 0)[0] + 1
                 col = struct.unpack_from("<H", rdata, 2)[0] + 1
                 xf_idx = struct.unpack_from("<H", rdata, 4)[0]
                 num_val = struct.unpack_from("<d", rdata, 6)[0]
                 fmt_str = xf_index_to_format_str.get(xf_idx, "")
-
-                val_str = ""
-                # 日付・和暦フォーマットの判定
                 if any(k in fmt_str.lower() for k in ("yy", "mm", "dd", "ge", "gg", "m月", "d日")):
                     val_str = format_excel_date_serial(num_val, fmt_str)
                 elif 30000 <= num_val <= 60000 and col in (1, 2) and not fmt_str:
-                    # A列〜B列の日付シリアル値候補
                     val_str = format_excel_date_serial(num_val, "yyyy-mm-dd")
                 else:
                     val_str = f"{int(num_val)}" if num_val.is_integer() else f"{num_val:.4f}".rstrip("0").rstrip(".")
-
-                if val_str:
-                    sheet_cells[(row, col)] = val_str
-
-            # 4. RK (0x027E)
-            elif rtype == 0x027E and len(rdata) >= 10:
+                if val_str: sheet_cells[(row, col)] = val_str
+            elif rtype == 0x027E and len(rdata) >= 10:  # RK
                 row = struct.unpack_from("<H", rdata, 0)[0] + 1
                 col = struct.unpack_from("<H", rdata, 2)[0] + 1
-                rk_val = struct.unpack_from("<I", rdata, 6)[0]
-                num_val = _parse_biff_rk(rk_val)
+                num_val = _parse_biff_rk(struct.unpack_from("<I", rdata, 6)[0])
                 if num_val is not None:
                     val_str = f"{int(num_val)}" if float(num_val).is_integer() else f"{num_val:.4f}".rstrip("0").rstrip(".")
                     sheet_cells[(row, col)] = val_str
-
-            # 5. MULRK (0x00BD)
-            elif rtype == 0x00BD and len(rdata) >= 6:
+            elif rtype == 0x00BD and len(rdata) >= 6:  # MULRK
                 row = struct.unpack_from("<H", rdata, 0)[0] + 1
                 col_first = struct.unpack_from("<H", rdata, 2)[0] + 1
                 col_last = struct.unpack_from("<H", rdata, len(rdata) - 2)[0] + 1
                 num_rks = (len(rdata) - 6) // 6
                 for i in range(num_rks):
                     c_idx = col_first + i
-                    if c_idx > col_last:
-                        break
+                    if c_idx > col_last: break
                     rk_val = struct.unpack_from("<I", rdata, 4 + i * 6 + 2)[0]
                     num_val = _parse_biff_rk(rk_val)
                     if num_val is not None:
                         val_str = f"{int(num_val)}" if float(num_val).is_integer() else f"{num_val:.4f}".rstrip("0").rstrip(".")
                         sheet_cells[(row, c_idx)] = val_str
-
-            # 6. FORMULA (0x0006)
-            elif rtype == 0x0006 and len(rdata) >= 16:
+            elif rtype == 0x0006 and len(rdata) >= 16:  # FORMULA
                 row = struct.unpack_from("<H", rdata, 0)[0] + 1
                 col = struct.unpack_from("<H", rdata, 2)[0] + 1
-                if rdata[12] == 0xFF and rdata[13] == 0xFF:
-                    # 文字列結果等の特殊フラグ（次のSTRINGレコード等）
-                    pass
-                else:
+                if not (rdata[12] == 0xFF and rdata[13] == 0xFF):
                     try:
                         num_val = struct.unpack_from("<d", rdata, 6)[0]
                         val_str = f"{int(num_val)}" if num_val.is_integer() else f"{num_val:.4f}".rstrip("0").rstrip(".")
@@ -1466,7 +1444,6 @@ def parse_biff_multisheet(wb_stream: bytes) -> Dict[str, Dict[Tuple[int, int], s
                     except Exception:
                         pass
 
-        # 抽出したセル群を辞書に格納
         sheets_dict[sheet_name] = sheet_cells
 
     return sheets_dict
@@ -1492,10 +1469,7 @@ def _parse_biff_rk(rk: int) -> Optional[float]:
 # 9.1 全シート保持 .xlsx 生成 & 生グリッド抽出
 
 def _extract_bytes_from_file(file_or_bytes: Any) -> bytes:
-    """
-    Streamlit の UploadedFile、BytesIO、または純粋な bytes 型のいずれが渡されても、
-    安全にバイナリ bytes 列を取り出して返却するヘルパー関数。
-    """
+    """Streamlit UploadedFile / BytesIO / bytes を安全に byte列として抽出"""
     if file_or_bytes is None:
         return b""
     if isinstance(file_or_bytes, bytes):
@@ -1515,10 +1489,7 @@ def _extract_bytes_from_file(file_or_bytes: Any) -> bytes:
 
 
 def extract_exact_sheet_grids(file_or_bytes: Any) -> Dict[str, Dict[Tuple[int, int], str]]:
-    """
-    ファイルバイナリまたは UploadedFile から全シートのセルデータ（(row, col) -> 文字列）を完全抽出。
-    .xls (BIFF8 / BIFF5) および .xlsx (OpenXML) の両方に完全対応します。
-    """
+    """ファイルバイナリまたは UploadedFile から全シートのセルデータ（(row, col) -> 文字列）を完全抽出"""
     content_bytes = _extract_bytes_from_file(file_or_bytes)
     if not content_bytes or len(content_bytes) < 4:
         return {}
@@ -1545,11 +1516,7 @@ def extract_exact_sheet_grids(file_or_bytes: Any) -> Dict[str, Dict[Tuple[int, i
 
 
 def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
-    """
-    旧 .xls ファイル内の全シートを完全保持し、全セルを元の日付文字列・品名・数値のまま
-    最新 .xlsx ファイルのバイナリ（bytes）へと完全変換して直接返却します。
-    （st.download_button にそのまま渡せる純粋な bytes を返します）
-    """
+    """旧 .xls 内の全シート・セル配置を保持して最新 .xlsx バイナリ（bytes）へ完全変換"""
     content_bytes = _extract_bytes_from_file(file_or_bytes)
     sheet_grids = extract_exact_sheet_grids(content_bytes)
     if not sheet_grids:
@@ -1559,7 +1526,6 @@ def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
     sheet_names = list(sheet_grids.keys())
 
     with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        # 1. [Content_Types].xml
         ct_parts = [
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
@@ -1572,7 +1538,6 @@ def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
         ct_parts.append('</Types>')
         zf.writestr("[Content_Types].xml", "".join(ct_parts))
 
-        # 2. _rels/.rels
         zf.writestr("_rels/.rels",
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -1580,7 +1545,6 @@ def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
             '</Relationships>'
         )
 
-        # 3. xl/_rels/workbook.xml.rels
         wb_rels_parts = [
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -1590,7 +1554,6 @@ def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
         wb_rels_parts.append('</Relationships>')
         zf.writestr("xl/_rels/workbook.xml.rels", "".join(wb_rels_parts))
 
-        # 4. xl/workbook.xml
         wb_parts = [
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
             '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
@@ -1602,7 +1565,6 @@ def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
         wb_parts.append('</sheets></workbook>')
         zf.writestr("xl/workbook.xml", "".join(wb_parts))
 
-        # 5. 各ワークシート XML の生成
         for i, s_name in enumerate(sheet_names, 1):
             grid = sheet_grids[s_name]
             rows_dict: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
@@ -1620,11 +1582,9 @@ def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
                 ws_parts.append(f'<row r="{r}">')
                 for c, val in sorted(rows_dict[r], key=lambda x: x[0]):
                     c_ref = f"{_col_idx_to_str(c)}{r}"
-                    # 数値判定（符号付き整数または小数）
                     if re.match(r"^-?\d+(\.\d+)?$", val) and not val.startswith("0") and len(val) <= 15:
                         ws_parts.append(f'<c r="{c_ref}"><v>{val}</v></c>')
                     else:
-                        # 日付文字列・品名・記号はインライン文字列としてそのまま保持
                         esc_val = val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
                         ws_parts.append(f'<c r="{c_ref}" t="inlineStr"><is><t>{esc_val}</t></is></c>')
                 ws_parts.append('</row>')
@@ -1656,7 +1616,6 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
             if pd.notna(val):
                 grid[(row_idx, col_idx)] = str(val).strip()
 
-    single_dict = {sheet_name: grid}
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("[Content_Types].xml",
@@ -1711,10 +1670,7 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
 
 
 def extract_all_raw_sheets_from_file(file_or_bytes: Any) -> Dict[str, pd.DataFrame]:
-    """
-    ファイル（UploadedFile または bytes）から全シートの生スプレッドシートデータを抽出し、
-    シート名 -> pd.DataFrame の辞書として返却します。
-    """
+    """ファイルから全シートの生データを抽出し、シート名 -> DataFrame の辞書を生成"""
     content_bytes = _extract_bytes_from_file(file_or_bytes)
     sheet_grids = extract_exact_sheet_grids(content_bytes)
     result: Dict[str, pd.DataFrame] = {}
@@ -1727,29 +1683,89 @@ def extract_all_raw_sheets_from_file(file_or_bytes: Any) -> Dict[str, pd.DataFra
         max_r = max(r for r, _ in grid.keys())
         max_c = max(c for _, c in grid.keys())
 
-        # 行・列の二次元配列構築
         data_matrix = [["" for _ in range(max_c)] for _ in range(max_r)]
         for (r, c), val in grid.items():
             data_matrix[r - 1][c - 1] = val
 
         df = pd.DataFrame(data_matrix)
-        # 空白行のクレンジング
         df = df.dropna(how="all")
         result[s_name] = df
 
     return result
 
-# 9.2 DBインポート解析エンジン（文字化け・値破壊完全排除）
+
+# 9.2 DBインポート解析エンジン（文字化け・値破壊完全排除 & 厳密判定）
+
+def _is_strictly_date_str(val: Any) -> str:
+    """
+    真の日付・和暦・Excelシリアル値のみを YYYY-MM-DD に変換。
+    「築館なめこ」「キャベツ」などの一般文字列は絶対に日付判定せず、空文字（""）を返します。
+    """
+    if val is None or pd.isnull(val):
+        return ""
+    if isinstance(val, (datetime, pd.Timestamp)):
+        return val.strftime("%Y-%m-%d")
+
+    s = unicodedata.normalize("NFKC", str(val)).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return ""
+
+    # Excelシリアル数値 (20000〜65000: 1954年〜2077年)
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        if 20000 <= val <= 65000:
+            try:
+                dt = datetime(1899, 12, 30) + timedelta(days=float(val))
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+    if s.isdigit() and 20000 <= int(s) <= 65000:
+        try:
+            dt = datetime(1899, 12, 30) + timedelta(days=int(s))
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # 和暦パターン: R8.9.2, 令8.9.10, H30.5.1, 令和8年9月2日 等
+    m_wareki = re.match(r"^([RrHhSsTt令平昭]|令和|平成|昭和)?\s*(\d{1,2})[\.年/\-](\d{1,2})[\.月/\-](\d{1,2})日?", s)
+    if m_wareki:
+        era, y_s, m_s, d_s = m_wareki.groups()
+        y_val = int(y_s)
+        era = era or "R"
+        if any(k in era for k in ("R", "r", "令")):
+            base_y = 2018 + y_val
+        elif any(k in era for k in ("H", "h", "平")):
+            base_y = 1988 + y_val
+        elif any(k in era for k in ("S", "s", "昭")):
+            base_y = 1925 + y_val
+        else:
+            base_y = 2018 + y_val if y_val < 50 else (1900 + y_val)
+        return f"{base_y:04d}-{int(m_s):02d}-{int(d_s):02d}"
+
+    # 西暦年月日パターン: 2026-09-02, 2026/9/2, 2026.9.2
+    m_ymd = re.match(r"^(\d{4})[\.年/\-](\d{1,2})[\.月/\-](\d{1,2})日?", s)
+    if m_ymd:
+        return f"{int(m_ymd.group(1)):04d}-{int(m_ymd.group(2)):02d}-{int(m_ymd.group(3)):02d}"
+
+    # 月日パターン: 9月5日, 9/5 (1 <= 月 <= 12, 1 <= 日 <= 31)
+    m_md = re.match(r"^(\d{1,2})[\.月/\-](\d{1,2})日?$", s)
+    if m_md:
+        m_val, d_val = int(m_md.group(1)), int(m_md.group(2))
+        if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+            cur_y = datetime.now().year
+            return f"{cur_y:04d}-{m_val:02d}-{d_val:02d}"
+
+    return ""
+
 
 def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str = "") -> Tuple[pd.DataFrame, str]:
     """
-    1枚のシートのDataFrameから取引データ（DB用明細）を高精度に抽出・パース。
-    文字化けトークン（FL]]やバイナリ制御コード）を厳密に排除し、値の0化を防止します。
+    1枚のシートのDataFrameから取引明細（出荷日・品名・数量・単価・仕入金額）を高精度抽出。
+    品名の誤除外を防ぎ、元エクセルに記載された全行を確実に復元します。
     """
     extracted_rows: List[Dict[str, Any]] = []
     supplier_name = default_supplier
 
-    if df_sheet.empty:
+    if df_sheet is None or df_sheet.empty:
         return pd.DataFrame(), supplier_name
 
     num_rows = len(df_sheet)
@@ -1761,7 +1777,6 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
         for v in row_vals:
             if not v or len(v) < 2:
                 continue
-            # 文字化けチェック
             if "FL]]" in v or any(ord(ch) < 32 for ch in v if ch not in "\t\n"):
                 continue
             if any(k in v for k in ("御中", "組合", "農協", "青果", "出荷組合", "会社", "園芸")):
@@ -1769,100 +1784,154 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
                 if len(clean_sup) >= 3 and not supplier_name:
                     supplier_name = clean_sup
 
-    # 2. 明細行の探索とデータ復元
+    # 2. 列ヘッダー行の特定（出荷日、品名、数量、単価、金額等の列インデックスを検出）
+    col_map = {"date": -1, "item": -1, "qty": -1, "price": -1, "subtotal": -1, "code": -1, "market": -1}
+    start_row = 0
+
+    for r in range(min(25, num_rows)):
+        row_vals = [normalize_header(df_sheet.iloc[r, c]) for c in range(num_cols)]
+        found_keys = 0
+        temp_map = {}
+        for c, v in enumerate(row_vals):
+            if not v: continue
+            if any(k in v for k in ["出荷日", "日付", "年月日", "伝票日", "取引日"]) and "date" not in temp_map:
+                temp_map["date"] = c; found_keys += 1
+            elif any(k in v for k in ["品名", "商品名", "品目", "規格", "品種", "品名規格"]) and "item" not in temp_map:
+                temp_map["item"] = c; found_keys += 1
+            elif any(k in v for k in ["数量", "箱数", "個数", "受入", "納品数", "バラ", "ケース"]) and "qty" not in temp_map:
+                temp_map["qty"] = c; found_keys += 1
+            elif any(k in v for k in ["単価", "仕入単価", "売価", "価格"]) and "price" not in temp_map:
+                temp_map["price"] = c; found_keys += 1
+            elif any(k in v for k in ["仕入金額", "金額", "小計", "売上金額", "計", "販売金額"]) and "subtotal" not in temp_map:
+                temp_map["subtotal"] = c; found_keys += 1
+            elif any(k in v for k in ["商品コード", "品番", "コード"]) and "code" not in temp_map:
+                temp_map["code"] = c
+            elif any(k in v for k in ["市場番号", "市場", "取引先"]) and "market" not in temp_map:
+                temp_map["market"] = c
+
+        if found_keys >= 2:
+            col_map.update(temp_map)
+            start_row = r + 1
+            break
+
     current_date = ""
 
-    for r in range(num_rows):
-        row_vals = [str(df_sheet.iloc[r, c]).strip() for c in range(num_cols)]
-        row_str = " ".join([v for v in row_vals if v])
+    # 3. 明細行の精密スキャン
+    for r in range(start_row, num_rows):
+        row_raw = [str(df_sheet.iloc[r, c]).strip() for c in range(num_cols)]
+        row_str = " ".join([v for v in row_raw if v])
 
-        # 合計行・集計行・文字化け行のスキップ
-        if any(term in row_str for term in ("合計", "総合計", "消費税", "手数料", "差引金額", "販売金額合計")):
+        if not row_str:
+            continue
+        # 集計・合計行のスキップ
+        if any(term in row_str for term in ("総合計", "消費税", "手数料", "差引金額", "販売金額合計", "総計")):
             continue
         if "FL]]" in row_str:
             continue
 
-        # 日付の検出
+        # 日付の探索（見つかった場合は current_date を更新して下位行へ引き継ぎ）
         date_candidate = ""
-        for c in range(min(4, num_cols)):
-            cell_v = row_vals[c]
-            norm_d = normalize_date_cell(cell_v)
-            if norm_d:
-                date_candidate = norm_d
-                break
-
+        if col_map["date"] >= 0:
+            date_candidate = _is_strictly_date_str(row_raw[col_map["date"]])
+        if not date_candidate:
+            for c in range(min(5, num_cols)):
+                d_test = _is_strictly_date_str(row_raw[c])
+                if d_test:
+                    date_candidate = d_test
+                    break
         if date_candidate:
             current_date = date_candidate
 
-        # 品名・数量・単価・小計の探索
+        # 品名・数量・単価・小計の抽出
         item_name = ""
-        qty: Optional[float] = None
-        price: Optional[float] = None
-        subtotal: Optional[float] = None
+        qty_val: Optional[float] = None
+        price_val: Optional[float] = None
+        subtotal_val: Optional[float] = None
 
-        # 品名候補の探索
-        for c in range(num_cols):
-            val = row_vals[c]
-            if not val or val in ("0", "0.0", "-"):
-                continue
-            # 文字化け判定
-            if "FL]]" in val or any(ord(ch) < 32 for ch in val if ch not in "\t\n"):
-                continue
-            # 日付セルはスキップ
-            if normalize_date_cell(val):
-                continue
-            # 明らかな数値や記号を除外
-            if re.match(r"^[\d\,\.\-\+\*\/\￥\\¥\%\(\)]+$", val):
-                continue
-            if len(val) >= 2 and not any(k in val for k in ("小計", "合計", "頁", "ページ", "出荷日", "品名", "数量", "単価", "金額")):
+        # A. ヘッダー列マップが存在する場合の優先抽出
+        if col_map["item"] >= 0 and col_map["item"] < num_cols:
+            c_val = row_raw[col_map["item"]]
+            if c_val and not _is_strictly_date_str(c_val) and not re.match(r"^[\d\,\.\-\+\*\/\￥\\¥\%\(\)]+$", c_val):
+                if not any(k in c_val for k in ("小計", "合計", "出荷日", "品名", "数量", "単価", "金額", "頁")):
+                    item_name = c_val
+
+        if col_map["qty"] >= 0 and col_map["qty"] < num_cols:
+            q_clean = re.sub(r"[^\d\.]", "", row_raw[col_map["qty"]])
+            if q_clean:
+                try: qty_val = float(q_clean)
+                except ValueError: pass
+
+        if col_map["price"] >= 0 and col_map["price"] < num_cols:
+            p_clean = re.sub(r"[^\d\.]", "", row_raw[col_map["price"]])
+            if p_clean:
+                try: price_val = float(p_clean)
+                except ValueError: pass
+
+        if col_map["subtotal"] >= 0 and col_map["subtotal"] < num_cols:
+            s_clean = re.sub(r"[^\d\.]", "", row_raw[col_map["subtotal"]])
+            if s_clean:
+                try: subtotal_val = float(s_clean)
+                except ValueError: pass
+
+        # B. 位置推定によるフォールバック抽出
+        if not item_name:
+            for c in range(num_cols):
+                val = row_raw[c]
+                if not val or val in ("0", "0.0", "-"):
+                    continue
+                if "FL]]" in val or any(ord(ch) < 32 for ch in val if ch not in "\t\n"):
+                    continue
+                # 真の日付セルはスキップ
+                if _is_strictly_date_str(val):
+                    continue
+                # 純粋な数値や記号のみはスキップ
+                if re.match(r"^[\d\,\.\-\+\*\/\￥\\¥\%\(\)]+$", val):
+                    continue
+                if any(k in val for k in ("小計", "合計", "頁", "出荷日", "品名", "数量", "単価", "金額", "消費税", "手数料")):
+                    continue
+                # 有効な品名（「築館なめこ」「桃」など）
                 item_name = val
                 break
 
-        # 数値（数量・単価・小計）の探索
-        numeric_candidates: List[float] = []
-        for c in range(num_cols):
-            val = row_vals[c]
-            if not val:
-                continue
-            cleaned = re.sub(r"[\,\s\￥\\¥]", "", val)
-            if re.match(r"^-?\d+(\.\d+)?$", cleaned):
-                try:
-                    num_f = float(cleaned)
-                    # 年号や極端に大きいコード・シリアル値を除外
-                    if num_f not in (46267.0, 46270.0) and num_f != 0.0:
-                        numeric_candidates.append(num_f)
-                except ValueError:
-                    pass
+        # 数値リストの再スキャン（欠損時）
+        if qty_val is None or (price_val is None and subtotal_val is None):
+            numeric_vals: List[float] = []
+            for c in range(num_cols):
+                val = row_raw[c]
+                if not val: continue
+                # 日付形式のシリアル値は数値候補から除外
+                if _is_strictly_date_str(val): continue
+                c_clean = re.sub(r"[\,\s\￥\\¥]", "", val)
+                if re.match(r"^-?\d+(\.\d+)?$", c_clean):
+                    try:
+                        n_f = float(c_clean)
+                        if n_f not in (46267.0, 46270.0) and n_f != 0.0:
+                            numeric_vals.append(n_f)
+                    except ValueError:
+                        pass
 
-        # 数量・単価・小計の割当
-        if numeric_candidates:
-            if len(numeric_candidates) >= 3:
-                # 数量, 単価, 小計
-                qty = numeric_candidates[0]
-                price = numeric_candidates[1]
-                subtotal = numeric_candidates[2]
-            elif len(numeric_candidates) == 2:
-                # 数量, 単価 または 単価, 小計
-                v1, v2 = numeric_candidates[0], numeric_candidates[1]
-                if v1 <= 500 and v2 >= 100:
-                    qty = v1
-                    price = v2
-                    subtotal = qty * price
-                else:
-                    price = v1
-                    subtotal = v2
-                    qty = round(subtotal / price, 2) if price > 0 else 1.0
-            elif len(numeric_candidates) == 1:
-                subtotal = numeric_candidates[0]
-                qty = 1.0
-                price = subtotal
+            if numeric_vals:
+                if len(numeric_vals) >= 3:
+                    if qty_val is None: qty_val = numeric_vals[0]
+                    if price_val is None: price_val = numeric_vals[1]
+                    if subtotal_val is None: subtotal_val = numeric_vals[2]
+                elif len(numeric_vals) == 2:
+                    v1, v2 = numeric_vals[0], numeric_vals[1]
+                    if v1 <= 500 and v2 >= 100:
+                        if qty_val is None: qty_val = v1
+                        if price_val is None: price_val = v2
+                    else:
+                        if price_val is None: price_val = v1
+                        if subtotal_val is None: subtotal_val = v2
+                elif len(numeric_vals) == 1:
+                    if subtotal_val is None: subtotal_val = numeric_vals[0]
 
-        # 明細レコードとして有効か判定（品名があり、かつ金額または数量が存在すること）
-        if item_name and (subtotal is not None or price is not None):
+        # 明細レコードの成立判定（品名があり、数量または金額・単価のいずれかが存在すること）
+        if item_name and (qty_val is not None or price_val is not None or subtotal_val is not None):
             final_date = current_date or datetime.now().strftime("%Y-%m-%d")
-            final_qty = qty if (qty is not None and qty > 0) else 1.0
-            final_price = price if (price is not None and price > 0) else ((subtotal / final_qty) if subtotal else 0.0)
-            final_subtotal = subtotal if (subtotal is not None and subtotal > 0) else (final_qty * final_price)
+            final_qty = qty_val if (qty_val is not None and qty_val > 0) else 1.0
+            final_price = price_val if (price_val is not None and price_val > 0) else ((subtotal_val / final_qty) if subtotal_val else 0.0)
+            final_subtotal = subtotal_val if (subtotal_val is not None and subtotal_val > 0) else (final_qty * final_price)
 
             extracted_rows.append({
                 "日付": final_date,
@@ -1870,9 +1939,11 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
                 "カテゴリー": "青果",
                 "商品コード": "",
                 "商品名": item_name,
+                "品名": item_name,
                 "単価": round(final_price, 2),
                 "数量": round(final_qty, 2),
-                "小計": round(final_subtotal, 2)
+                "小計": round(final_subtotal, 2),
+                "仕入金額": round(final_subtotal, 2)
             })
 
     if not extracted_rows:
@@ -1885,13 +1956,9 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
 def parse_trade_file(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
     """
     アップロードされた伝票ファイル（.xls, .xlsx, .csv 等）をパースし、
-    全シートの取引データを統合したDataFrameと仕入先リストを返却します。
+    全シートの取引データを統合した DataFrame と仕入先リストを返却します。
     """
-    try:
-        content_bytes = uploaded_file.getvalue()
-    except Exception:
-        return pd.DataFrame(), []
-
+    content_bytes = _extract_bytes_from_file(uploaded_file)
     if not content_bytes:
         return pd.DataFrame(), []
 
@@ -1902,7 +1969,7 @@ def parse_trade_file(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
     sheet_raw_dfs = extract_all_raw_sheets_from_file(content_bytes)
     if sheet_raw_dfs:
         for s_name, df_sheet in sheet_raw_dfs.items():
-            if df_sheet.empty:
+            if df_sheet is None or df_sheet.empty:
                 continue
             parsed_df, sup_name = parse_single_sheet_dataframe(df_sheet, default_supplier=s_name)
             if not parsed_df.empty:
@@ -1915,7 +1982,8 @@ def parse_trade_file(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
             return final_df, extracted_suppliers
 
     # 2. CSV / テキストのフォールバック
-    is_binary = (content_bytes[:4] == b"PK\x03\x04" or content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    is_binary = (len(content_bytes) >= 4 and content_bytes[:4] == b"PK\x03\x04") or \
+                (len(content_bytes) >= 8 and content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
     if not is_binary:
         for enc in ("cp932", "utf-8", "euc-jp", "shift_jis"):
             try:
