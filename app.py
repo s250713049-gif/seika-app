@@ -1491,11 +1491,38 @@ def _parse_biff_rk(rk: int) -> Optional[float]:
 
 # 9.1 全シート保持 .xlsx 生成 & 生グリッド抽出
 
-def extract_exact_sheet_grids(content_bytes: bytes) -> Dict[str, Dict[Tuple[int, int], str]]:
+def _extract_bytes_from_file(file_or_bytes: Any) -> bytes:
     """
-    ファイルバイナリから全シートのセルデータ（(row, col) -> 文字列）を完全抽出。
+    Streamlit の UploadedFile、BytesIO、または純粋な bytes 型のいずれが渡されても、
+    安全にバイナリ bytes 列を取り出して返却するヘルパー関数。
+    """
+    if file_or_bytes is None:
+        return b""
+    if isinstance(file_or_bytes, bytes):
+        return file_or_bytes
+    if hasattr(file_or_bytes, "getvalue"):
+        return file_or_bytes.getvalue()
+    if hasattr(file_or_bytes, "read"):
+        try:
+            pos = file_or_bytes.tell() if hasattr(file_or_bytes, "tell") else None
+            data = file_or_bytes.read()
+            if pos is not None and hasattr(file_or_bytes, "seek"):
+                file_or_bytes.seek(pos)
+            return data
+        except Exception:
+            return b""
+    return b""
+
+
+def extract_exact_sheet_grids(file_or_bytes: Any) -> Dict[str, Dict[Tuple[int, int], str]]:
+    """
+    ファイルバイナリまたは UploadedFile から全シートのセルデータ（(row, col) -> 文字列）を完全抽出。
     .xls (BIFF8 / BIFF5) および .xlsx (OpenXML) の両方に完全対応します。
     """
+    content_bytes = _extract_bytes_from_file(file_or_bytes)
+    if not content_bytes or len(content_bytes) < 4:
+        return {}
+
     # 1. .xlsx (PK zip)
     if content_bytes[:4] == b"PK\x03\x04":
         try:
@@ -1505,7 +1532,7 @@ def extract_exact_sheet_grids(content_bytes: bytes) -> Dict[str, Dict[Tuple[int,
             pass
 
     # 2. .xls (OLE2 CFBF)
-    if content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+    if len(content_bytes) >= 8 and content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
         wb_stream = extract_ole_workbook_stream(content_bytes)
         if wb_stream:
             return parse_biff_multisheet(wb_stream)
@@ -1517,14 +1544,16 @@ def extract_exact_sheet_grids(content_bytes: bytes) -> Dict[str, Dict[Tuple[int,
     return {}
 
 
-def convert_xls_file_to_multisheet_xlsx_bytes(content_bytes: bytes) -> Tuple[bytes, List[str]]:
+def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
     """
     旧 .xls ファイル内の全シートを完全保持し、全セルを元の日付文字列・品名・数値のまま
-    最新 .xlsx ファイルのバイナリへと完全変換します。
+    最新 .xlsx ファイルのバイナリ（bytes）へと完全変換して直接返却します。
+    （st.download_button にそのまま渡せる純粋な bytes を返します）
     """
+    content_bytes = _extract_bytes_from_file(file_or_bytes)
     sheet_grids = extract_exact_sheet_grids(content_bytes)
     if not sheet_grids:
-        return b"", []
+        return b""
 
     output_zip = io.BytesIO()
     sheet_names = list(sheet_grids.keys())
@@ -1603,7 +1632,7 @@ def convert_xls_file_to_multisheet_xlsx_bytes(content_bytes: bytes) -> Tuple[byt
             ws_parts.append('</sheetData></worksheet>')
             zf.writestr(f"xl/worksheets/sheet{i}.xml", "".join(ws_parts))
 
-    return output_zip.getvalue(), sheet_names
+    return output_zip.getvalue()
 
 
 def _col_idx_to_str(col_idx: int) -> str:
@@ -1681,11 +1710,12 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
     return out.getvalue()
 
 
-def extract_all_raw_sheets_from_file(content_bytes: bytes) -> Dict[str, pd.DataFrame]:
+def extract_all_raw_sheets_from_file(file_or_bytes: Any) -> Dict[str, pd.DataFrame]:
     """
-    ファイルから全シートの生スプレッドシートデータを抽出し、
+    ファイル（UploadedFile または bytes）から全シートの生スプレッドシートデータを抽出し、
     シート名 -> pd.DataFrame の辞書として返却します。
     """
+    content_bytes = _extract_bytes_from_file(file_or_bytes)
     sheet_grids = extract_exact_sheet_grids(content_bytes)
     result: Dict[str, pd.DataFrame] = {}
 
@@ -1708,7 +1738,6 @@ def extract_all_raw_sheets_from_file(content_bytes: bytes) -> Dict[str, pd.DataF
         result[s_name] = df
 
     return result
-
 
 # 9.2 DBインポート解析エンジン（文字化け・値破壊完全排除）
 
