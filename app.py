@@ -1693,8 +1693,10 @@ def parse_single_sheet_dataframe(sdf_raw: pd.DataFrame, sheet_name: str, file_na
         item_str = ""
         if pd.notnull(raw_name):
             item_s = unicodedata.normalize("NFKC", str(raw_name)).strip()
-            if item_s and item_s.lower() not in ("nan", "none", "null", "0", "0.0"):
-                item_str = item_s
+            # 制御文字やバイナリ文字化け（FL]] 等）の検出時は除外
+            if item_s and item_s.lower() not in ("nan", "none", "null", "0", "0.0") and not any(ord(ch) < 32 and ch not in "\t\n\r" for ch in item_s):
+                if not re.search(r"(FL\]\]|[xX]:/[sS][fF])", item_s):
+                    item_str = item_s
 
         if item_str and re.match(r"^(消費税|税額|地方消費税|差引合計|総合計|総計|合計|販売金額|販売手数料|計)$", item_str):
             continue
@@ -1842,7 +1844,6 @@ def parse_trade_file(uploaded_file):
     if all_sheet_records:
         return pd.DataFrame(all_sheet_records), extracted_suppliers
     return pd.DataFrame(), extracted_suppliers
-
 # ==========================================
 # 9.5 生成AI (Gemini 4 Argon & スマート青果アナライザー) エンジン
 # ==========================================
