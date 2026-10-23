@@ -2690,25 +2690,103 @@ with tabs[0]:
                 st.toast(f"🎉 「{final_item_name}」 (¥{subtotal_calc:,}) を高速登録しました！下の記録一覧へ正確に反映されました。")
                 st.rerun()
 
-    # 📋 記録済みデータ一覧（リアルタイム反映テーブル）
+  # 📋 記録済みデータ一覧（リアルタイム反映・全件表示 & 種類別タブ分類）
     st.write("")
-    st.markdown('<div class="section-title">📋 登録済み取引データ一覧（即時反映・最新順）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📋 登録済み取引データ一覧（即時反映・最新順・全件完全表示）</div>', unsafe_allow_html=True)
 
     if df_current is not None and not df_current.empty:
-        total_sum = int(df_current["仕入金額"].sum()) if "仕入金額" in df_current.columns else 0
-        total_q = int(df_current["数量"].sum()) if "数量" in df_current.columns else 0
+        # 1. 過去の文字化け・破損レコード（FL]] や 1X:/ 等）の自動検出
+        mojibake_mask = df_current.apply(
+            lambda r: any(
+                "FL]]" in str(r[c]) or "1X:/" in str(r[c]) or any(ord(ch) < 32 for ch in str(r[c]) if ch not in "\t\n")
+                for c in ["日付", "品名", "商品名", "市場番号"] if c in r.index and pd.notnull(r[c])
+            ),
+            axis=1
+        )
+        mojibake_count = int(mojibake_mask.sum())
+        clean_df = df_current[~mojibake_mask].copy()
+
+        # 2. サマリー集計指標の算出（正常データ基準で算出）
+        summary_source = clean_df if not clean_df.empty else df_current
+        total_sum = int(summary_source["仕入金額"].sum()) if "仕入金額" in summary_source.columns else 0
+        total_q = int(summary_source["数量"].sum()) if "数量" in summary_source.columns else 0
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("総取引件数", f"{len(df_current):,} 件")
+        m1.metric("総取引件数", f"{len(df_current):,} 件" + (f" (正常: {len(clean_df):,}件)" if mojibake_count > 0 else ""))
         m2.metric("総数量", f"{total_q:,} 個")
         m3.metric("総仕入金額", f"¥ {total_sum:,}")
         m4.metric("平均単価", f"¥ {int(total_sum / total_q):,}" if total_q > 0 else "¥ 0")
 
-        display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "登録担当者"] if c in df_current.columns]
-        st.dataframe(df_current[display_cols].head(30), use_container_width=True)
-    else:
-        st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。")
+        # 3. 過去の破損データに対するアラート & ワンクリック一括清掃（クリーンアップ）機能
+        if mojibake_count > 0:
+            c_warn1, c_warn2 = st.columns([3.5, 1.5])
+            with c_warn1:
+                st.warning(f"⚠️ 過去に登録されたデータ内に {mojibake_count} 件の文字化け・破損データ（`FL]]...` 等）が含まれています。下のボタンで安全に一括削除できます。")
+            with c_warn2:
+                if st.button(f"🧹 破損データ({mojibake_count}件)を一括清掃・削除", key="clean_mojibake_records_btn", use_container_width=True, type="secondary"):
+                    bad_ids = df_current[mojibake_mask]["id"].dropna().astype(int).tolist()
+                    delete_records_by_ids(bad_ids, deleted_by=current_user)
+                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                    st.toast(f"✅ {len(bad_ids)} 件の文字化け破損データを安全に一掃・清掃しました！")
+                    st.rerun()
 
+        display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "登録担当者"] if c in df_current.columns]
+
+        # 4. 「ALL全件」「カテゴリー別（課別）」「取引先別（市場番号別）」タブ分類表示
+        t_view_all, t_view_cat, t_view_sup = st.tabs([
+            f"🌐 ALL 全データ表示 ({len(df_current):,}件)",
+            "🏢 カテゴリー別（課別表示）",
+            "🤝 取引先別（市場番号別表示）"
+        ])
+
+        with t_view_all:
+            # 件数制限（.head）を完全撤廃し、全件スクロール表示
+            if mojibake_count > 0:
+                hide_bad = st.checkbox("破損・文字化けデータを非表示にして正常データのみ表示する", value=True, key="chk_hide_bad_records_tab1")
+                target_all_df = clean_df if hide_bad else df_current
+            else:
+                target_all_df = df_current
+
+            st.caption(f"※ 件数制限（.head）を撤廃し、登録されている全 **{len(target_all_df):,} 件** を完全に表示しています。")
+            st.dataframe(target_all_df[display_cols], use_container_width=True, height=520)
+
+        with t_view_cat:
+            all_cats = [str(x) for x in summary_source["カテゴリー"].dropna().unique() if str(x).strip()]
+            if all_cats:
+                col_sel_cat, col_sp_cat = st.columns([2.5, 1.5])
+                with col_sel_cat:
+                    chosen_view_cat = st.selectbox("表示したいカテゴリー（課）を選択:", ["（全カテゴリー一覧）"] + all_cats, key="sel_cat_filter_tab1")
+
+                cat_filtered_df = summary_source if chosen_view_cat == "（全カテゴリー一覧）" else summary_source[summary_source["カテゴリー"] == chosen_view_cat]
+
+                c_cat_s1, c_cat_s2, c_cat_s3 = st.columns(3)
+                c_cat_s1.metric(f"選択区分: {chosen_view_cat}", f"{len(cat_filtered_df):,} 件")
+                c_cat_s2.metric("数量合計", f"{int(cat_filtered_df['数量'].sum()):,} 個" if "数量" in cat_filtered_df.columns else "0 個")
+                c_cat_s3.metric("仕入金額合計", f"¥ {int(cat_filtered_df['仕入金額'].sum()):,}" if "仕入金額" in cat_filtered_df.columns else "¥ 0")
+
+                st.dataframe(cat_filtered_df[display_cols], use_container_width=True, height=450)
+            else:
+                st.info("カテゴリーデータがありません。")
+
+        with t_view_sup:
+            all_sups = [str(x) for x in summary_source["市場番号"].dropna().unique() if str(x).strip()]
+            if all_sups:
+                col_sel_sup, col_sp_sup = st.columns([2.5, 1.5])
+                with col_sel_sup:
+                    chosen_view_sup = st.selectbox("表示したい取引先（市場番号）を選択:", ["（全取引先一覧）"] + all_sups, key="sel_sup_filter_tab1")
+
+                sup_filtered_df = summary_source if chosen_view_sup == "（全取引先一覧）" else summary_source[summary_source["市場番号"] == chosen_view_sup]
+
+                c_sup_s1, c_sup_s2, c_sup_s3 = st.columns(3)
+                c_sup_s1.metric(f"選択取引先: {chosen_view_sup}", f"{len(sup_filtered_df):,} 件")
+                c_sup_s2.metric("数量合計", f"{int(sup_filtered_df['数量'].sum()):,} 個" if "数量" in sup_filtered_df.columns else "0 個")
+                c_sup_s3.metric("仕入金額合計", f"¥ {int(sup_filtered_df['仕入金額'].sum()):,}" if "仕入金額" in sup_filtered_df.columns else "¥ 0")
+
+                st.dataframe(sup_filtered_df[display_cols], use_container_width=True, height=450)
+            else:
+                st.info("取引先データがありません。")
+    else:
+        st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。") 
 # ==========================================
 # タブ 2: 取引一覧・インライン編集
 # ==========================================
