@@ -17,6 +17,9 @@ import requests
 import time
 import unicodedata
 import struct
+import ctypes
+from collections import defaultdict
+from typing import Dict, Tuple, List, Optional, Any
 
 # ==========================================
 # ページ基本設定 & セキュリティヘッダーCSS (高速描画対応)
@@ -801,6 +804,10 @@ def parse_japanese_date(val, base_year=None) -> str:
         return f"{cur_y:04d}-{int(m_md.group(1)):02d}-{int(m_md.group(2)):02d}"
 
     return s.split("T")[0].split(" ")[0].strip()
+
+# normalize_date_cell のエイリアス宣言（インポートエンジンとの完全互換）
+normalize_date_cell = parse_japanese_date
+
 def format_excel_date_serial(serial_val, is_first_row=False, fmt_str="", col_idx=0):
     """
     Excelシリアル値（20000〜65000: 1954年〜2077年）を、
