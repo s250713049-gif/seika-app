@@ -3262,36 +3262,139 @@ with tabs[0]:
     else:
         st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。")
 # ==========================================
-# タブ 2: 取引一覧・インライン編集（シート毎タブ編集・削除対応）
+# タブ 2: 取引一覧・インライン編集（元エクセル配置グリッド完全保持 & 双方向同期）
 # ==========================================
 with tabs[1]:
-    st.markdown('<div class="section-title">📊 登録データの一覧・直接編集・選択削除（シート別タブ対応）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📊 登録データの一覧・直接編集・選択削除（元エクセル配置保持）</div>', unsafe_allow_html=True)
 
-    if df_current is not None and not df_current.empty:
-        col_ctrl1, col_ctrl2 = st.columns([2.5, 1.5])
-        with col_ctrl1:
-            st.caption("※ テーブル内のセルを直接クリックして数値を変更し、下の「変更をデータベースに保存」を押すと即時反映されます。行をゴミ箱で消去した場合も保存ボタンで完全にDB反映されます。")
-        with col_ctrl2:
-            st.caption("※ 一番左の「選択」チェックボックスを入れて「選択したデータを削除」を押すと安全に一括削除できます。")
+    # 1. 未加工生グリッドデータの読み込み（セッション & 永続ストレージ）
+    RAW_SHEETS_CACHE_FILE = os.path.join(DATA_DIR, "latest_imported_raw_sheets.json")
+    raw_sheets = st.session_state.get("last_imported_raw_sheets")
+    if not raw_sheets and os.path.exists(RAW_SHEETS_CACHE_FILE):
+        try:
+            with open(RAW_SHEETS_CACHE_FILE, "r", encoding="utf-8") as f:
+                saved_raw = json.load(f)
+                raw_sheets = {s: pd.DataFrame(d["data"], columns=d["columns"], index=d["index"]) for s, d in saved_raw.items()}
+                st.session_state.last_imported_raw_sheets = raw_sheets
+        except Exception:
+            pass
 
-        # ↩️ 誤削除データのワンクリック復元（UNDO）バナー
-        if st.session_state.get("last_deleted_records"):
-            del_count_now = len(st.session_state.last_deleted_records)
-            st.markdown(f"""
-                <div class="restore-box" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <span>🛡️ 直前に削除されたデータが <b>{del_count_now} 件</b> 安全に退避保管されています。誤って削除した場合は即座に元通り戻せます。</span>
-                </div>
-            """, unsafe_allow_html=True)
-            col_undo, _ = st.columns([2.5, 3.5])
-            with col_undo:
-                if st.button(f"↩️ 直前に削除した {del_count_now} 件のデータを元通り復元する", type="primary", use_container_width=True, key="btn_undo_last_deleted_records"):
-                    restored_cnt = restore_last_deleted_records_db(st.session_state.last_deleted_records, restored_by=current_user)
-                    st.session_state.last_deleted_records = []
-                    st.toast(f"🎉 {restored_cnt} 件のデータを元通り復元しました！")
-                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.rerun()
+    # ↩️ 誤削除データのワンクリック復元（UNDO）バナー
+    if st.session_state.get("last_deleted_records"):
+        del_count_now = len(st.session_state.last_deleted_records)
+        st.markdown(f"""
+            <div class="restore-box" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span>🛡️ 直前に削除されたデータが <b>{del_count_now} 件</b> 安全に退避保管されています。誤って削除した場合は即座に元通り戻せます。</span>
+            </div>
+        """, unsafe_allow_html=True)
+        col_undo, _ = st.columns([2.5, 3.5])
+        with col_undo:
+            if st.button(f"↩️ 直前に削除した {del_count_now} 件のデータを元通り復元する", type="primary", use_container_width=True, key="btn_undo_last_deleted_tab1"):
+                restored_cnt = restore_last_deleted_records_db(st.session_state.last_deleted_records, restored_by=current_user)
+                st.session_state.last_deleted_records = []
+                st.toast(f"🎉 {restored_cnt} 件のデータを元通り復元しました！")
+                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                st.rerun()
 
-        # 登録データ内のシート名リスト
+    # 操作案内 & モード切替ラジオボタン
+    col_c1, col_c2 = st.columns([3, 2])
+    with col_c1:
+        st.caption("※ テーブル内のセルをクリックして数値を直接変更・空行追加入力できます。「変更をデータベースに保存する」を押すと、元エクセル配置とDB集計データの両方に即時反映されます。")
+    with col_c2:
+        edit_mode = st.radio(
+            "編集モード切り替え:",
+            ["📑 元エクセル配置グリッド編集（推奨）", "📊 DB正規化リスト編集"],
+            horizontal=True,
+            key="tab1_editor_mode_radio"
+        )
+
+    # ==========================================
+    # A. 【元エクセル配置・全シート完全保持】グリッド直接編集モード（写真1枚目スタイル）
+    # ==========================================
+    if edit_mode == "📑 元エクセル配置グリッド編集（推奨）" and raw_sheets:
+        sheet_names = list(raw_sheets.keys())
+        grid_edit_tabs = st.tabs(sheet_names)
+
+        for t_idx, sname in enumerate(sheet_names):
+            with grid_edit_tabs[t_idx]:
+                cur_raw_df = raw_sheets[sname].copy()
+                st.caption(f"シート名: **{sname}** (全 **{len(cur_raw_df)} 行** × **{len(cur_raw_df.columns)} 列**) — 元のエクセルの配置・空白セル位置をそのまま保持して直接編集できます。")
+
+                # 生グリッドを直接編集可能な st.data_editor として展開
+                edited_raw_df = st.data_editor(
+                    cur_raw_df,
+                    use_container_width=True,
+                    height=540,
+                    num_rows="dynamic",
+                    key=f"raw_grid_editor_{t_idx}_v_{st.session_state.get('editor_version', 0)}"
+                )
+
+                col_save_raw, col_reset_raw, col_dl_raw = st.columns([2.5, 1.5, 2])
+
+                with col_save_raw:
+                    if st.button(f"💾 『{sname}』の変更をデータベースに保存する", type="primary", use_container_width=True, key=f"save_raw_btn_{t_idx}"):
+                        # 1. 編集後生グリッドをセッション＆永続JSONへ保存
+                        raw_sheets[sname] = edited_raw_df
+                        st.session_state.last_imported_raw_sheets = raw_sheets
+                        try:
+                            serializable_dict = {s: sdf.to_dict(orient="split") for s, sdf in raw_sheets.items()}
+                            with open(RAW_SHEETS_CACHE_FILE, "w", encoding="utf-8") as f:
+                                json.dump(serializable_dict, f, ensure_ascii=False)
+                        except Exception:
+                            pass
+
+                        # 2. 編集後グリッドから明細を自動抽出し、DB（transactions）を完全同期
+                        parsed_df, _ = parse_single_sheet_dataframe(edited_raw_df, default_supplier=sname)
+                        engine = get_engine()
+                        with engine.begin() as conn:
+                            # 旧レコードを退避テーブルへ移動
+                            conn.execute(
+                                text("""
+                                    INSERT INTO deleted_transactions
+                                    (original_id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, deleted_by)
+                                    SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, :db
+                                    FROM transactions WHERE sheet_name = :sn
+                                """),
+                                {"db": current_user, "sn": sname}
+                            )
+                            # 旧レコード削除
+                            conn.execute(text("DELETE FROM transactions WHERE sheet_name = :sn"), {"sn": sname})
+
+                        # 新明細をDBへ登録
+                        if not parsed_df.empty:
+                            records_list = parsed_df.to_dict("records")
+                            for r in records_list:
+                                r["sheet_name"] = sname
+                            insert_records_to_db(current_user, records_list, auto_backup=False)
+
+                        create_backup_snapshot(current_user, trigger_reason=f"シート『{sname}』元グリッド編集同期保存")
+                        invalidate_records_cache()
+                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                        st.toast(f"✅ シート『{sname}』の元配置グリッドおよびDB取引データを完全保存しました！")
+                        st.rerun()
+
+                with col_reset_raw:
+                    if st.button("🔄 編集を元に戻す", use_container_width=True, key=f"reset_raw_btn_{t_idx}"):
+                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                        st.rerun()
+
+                with col_dl_raw:
+                    fname_base = st.session_state.get("last_imported_file_name", "trade_file").rsplit(".", 1)[0]
+                    single_sheet_dict = {sname: edited_raw_df}
+                    raw_xlsx_bytes = export_raw_sheets_to_xlsx_bytes(single_sheet_dict)
+                    st.download_button(
+                        label=f"📗 『{sname}』を Excel 出力",
+                        data=raw_xlsx_bytes,
+                        file_name=f"{fname_base}_{sname}_編集済.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key=f"dl_single_raw_xlsx_{t_idx}"
+                    )
+
+    # ==========================================
+    # B. 【フォールバック / DB正規化リスト編集モード】（固定カラム・選択一括削除対応）
+    # ==========================================
+    elif df_current is not None and not df_current.empty:
         if "シート名" in df_current.columns:
             all_edit_sheets = [str(s).strip() for s in df_current["シート名"].dropna().unique() if str(s).strip()]
         else:
@@ -3302,7 +3405,6 @@ with tabs[1]:
         edit_tab_labels = [f"🌐 ALL 全件 ({len(df_current):,}件)"] + [f"📑 {s}" for s in all_edit_sheets]
         edit_tabs = st.tabs(edit_tab_labels)
 
-        # 共通のColumnConfig
         column_config = {
             "選択": st.column_config.CheckboxColumn("選択", help="削除対象として選択"),
             "id": st.column_config.NumberColumn("ID", disabled=True),
@@ -3337,7 +3439,6 @@ with tabs[1]:
                 if "シート名" not in current_tab_df.columns:
                     current_tab_df["シート名"] = "Sheet1"
 
-                # 編集前のID一覧を保持（ゴミ箱削除の検出用）
                 initial_row_ids = set(current_tab_df["id"].dropna().astype(int).tolist())
 
                 edited_df = st.data_editor(
@@ -3352,7 +3453,6 @@ with tabs[1]:
 
                 with col_save:
                     if st.button("💾 変更をデータベースに保存する", type="primary", use_container_width=True, key=f"save_edited_btn_{t_idx}"):
-                        # 1. ゴミ箱アイコン（行削除）で画面から消えたIDを検出してDBから完全削除
                         remaining_row_ids = set(edited_df["id"].dropna().astype(int).tolist())
                         missing_ids = list(initial_row_ids - remaining_row_ids)
                         auto_del_cnt = 0
@@ -3360,7 +3460,6 @@ with tabs[1]:
                         if missing_ids:
                             auto_del_cnt, auto_skip_cnt, _ = delete_records_by_ids(missing_ids, deleted_by=current_user, operator_role=user_role)
 
-                        # 2. 残存行の更新処理
                         changes_count = 0
                         blocked_count = 0
                         for _, row in edited_df.iterrows():
@@ -3427,7 +3526,7 @@ with tabs[1]:
                         key=f"dl_xlsx_btn_{t_idx}"
                     )
     else:
-        st.info("表示する取引データがありません。")
+        st.info("💡 表示する取引データがありません。")
 # ==========================================
 # タブ 3: 売上分析 & グラフ可視化
 # ==========================================
