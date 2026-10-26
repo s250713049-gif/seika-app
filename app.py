@@ -474,17 +474,19 @@ def update_single_record_in_db(record_dict: dict, operator_user: str = "admin", 
     invalidate_records_cache()
     return True, "更新が完了しました"
 
-def delete_records_by_ids(ids: list, deleted_by: str, operator_role: str = "admin") -> Tuple[int, int]:
+def delete_records_by_ids(ids: list, deleted_by: str, operator_role: str = "admin") -> Tuple[int, int, List[dict]]:
     """
     ③ 部署・ロール別アクセス権限（RBAC）ガード付きレコード削除
     staff は自身が登録したレコードのみ削除可能。権限外レコードは安全にスキップ。
-    返り値: (削除成功件数, スキップ件数)
+    退避テーブル `deleted_transactions` に記録し、ワンクリック復元用リストを返却。
+    返り値: (削除成功件数, スキップ件数, 削除レコード辞書リスト)
     """
     if not ids:
-        return 0, 0
+        return 0, 0, []
     engine = get_engine()
     deleted_count = 0
     skipped_count = 0
+    deleted_records = []
 
     with engine.begin() as conn:
         for rid in ids:
@@ -499,6 +501,21 @@ def delete_records_by_ids(ids: list, deleted_by: str, operator_role: str = "admi
             if operator_role != "admin" and str(row[9]).strip() != str(deleted_by).strip():
                 skipped_count += 1
                 continue
+
+            rec_dict = {
+                "original_id": row[0],
+                "date": str(row[1]),
+                "market_number": str(row[2]),
+                "category": str(row[3]),
+                "item_code": str(row[4]),
+                "item_name": str(row[5]),
+                "unit_price": int(row[6]),
+                "quantity": int(row[7]),
+                "subtotal": int(row[8]),
+                "user_id": str(row[9]),
+                "sheet_name": str(row[10]) if len(row) > 10 and row[10] else "Sheet1"
+            }
+            deleted_records.append(rec_dict)
 
             conn.execute(
                 text("""
@@ -518,8 +535,59 @@ def delete_records_by_ids(ids: list, deleted_by: str, operator_role: str = "admi
     invalidate_records_cache()
     if deleted_count > 0:
         create_backup_snapshot(deleted_by, trigger_reason=f"データ削除前自動退避 ({deleted_count}件削除)")
-    return deleted_count, skipped_count
+        # セッションに直前の削除レコードを退避保持
+        st.session_state.last_deleted_records = deleted_records
 
+    return deleted_count, skipped_count, deleted_records
+
+def restore_last_deleted_records_db(records_to_restore: list, restored_by: str = "admin") -> int:
+    """
+    誤削除データをDBへ安全に復帰（UNDO復元）
+    退避テーブル（deleted_transactions）からも削除し、完全復元します。
+    """
+    if not records_to_restore:
+        return 0
+    engine = get_engine()
+    now_ts = datetime.now()
+    restored_count = 0
+    with engine.begin() as conn:
+        for r in records_to_restore:
+            p = int(r.get("unit_price", r.get("単価", 0)))
+            q = int(r.get("quantity", r.get("数量", 0)))
+            sub = int(r.get("subtotal", r.get("仕入金額", r.get("小計", p * q))))
+            item_n = str(r.get("item_name", r.get("品名", r.get("商品名", "品名未指定")))).strip() or "品名未指定"
+            sheet_n = str(r.get("sheet_name", r.get("シート名", "Sheet1"))).strip() or "Sheet1"
+            conn.execute(
+                text("""
+                    INSERT INTO transactions 
+                    (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at)
+                    VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, :cat)
+                """),
+                {
+                    "d": str(r.get("date", r.get("日付", now_ts.strftime("%Y-%m-%d")))),
+                    "m": str(r.get("market_number", r.get("市場番号", "M-001"))),
+                    "c": str(r.get("category", r.get("カテゴリー", "1課 (熊谷・大宮)"))),
+                    "ic": str(r.get("item_code", r.get("商品コード", "AUTO"))),
+                    "in": item_n,
+                    "p": p,
+                    "q": q,
+                    "sub": sub,
+                    "u": str(r.get("user_id", r.get("登録担当者", restored_by))),
+                    "sn": sheet_n,
+                    "cat": now_ts
+                }
+            )
+            restored_count += 1
+            orig_id = r.get("original_id", r.get("id"))
+            if orig_id:
+                try:
+                    conn.execute(text("DELETE FROM deleted_transactions WHERE original_id = :oid"), {"oid": orig_id})
+                except Exception:
+                    pass
+    invalidate_records_cache()
+    if restored_count > 0:
+        create_backup_snapshot(restored_by, trigger_reason=f"誤削除データ復元 ({restored_count}件復元)")
+    return restored_count
 def get_employee_summary_stats():
     engine = get_engine()
     with engine.connect() as conn:
