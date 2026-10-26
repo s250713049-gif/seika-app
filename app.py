@@ -2753,11 +2753,11 @@ with tabs[0]:
                 st.toast(f"🎉 「{final_item_name}」 (¥{subtotal_calc:,}) を高速登録しました！下の記録一覧へ正確に反映されました。")
                 st.rerun()
 
-# 📋 登録済み取引データ一覧（元エクセル全シート完全保持グリッド & シート別タブ表示）
+# 📋 登録済み取引データ一覧（元エクセル全シート完全保持グリッド & Excel / PDF一括保存対応）
     st.write("")
     st.markdown('<div class="section-title">📋 登録済み取引データ一覧（元エクセル配置・全シート保持反映）</div>', unsafe_allow_html=True)
 
-    # 永続キャッシュおよびセッションから生グリッドデータをロード
+    # 1. 未加工生グリッドデータのロード（セッション & 永続ファイル）
     RAW_SHEETS_CACHE_FILE = os.path.join(DATA_DIR, "latest_imported_raw_sheets.json")
     raw_sheets = st.session_state.get("last_imported_raw_sheets")
     if not raw_sheets and os.path.exists(RAW_SHEETS_CACHE_FILE):
@@ -2769,7 +2769,163 @@ with tabs[0]:
         except Exception:
             pass
 
-    # A. 自動記録されたエクセルの生グリッド（写真1枚目スタイル）の表示
+    # ==========================================
+    # ヘルパー関数: 元エクセル配置・全シート完全保持 Excel (.xlsx) 生成
+    # ==========================================
+    def export_raw_sheets_to_xlsx_bytes(raw_dict: Dict[str, pd.DataFrame]) -> bytes:
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+            sheet_names = list(raw_dict.keys())
+            # [Content_Types].xml
+            ct = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+                '<Default Extension="xml" ContentType="application/xml"/>',
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            ]
+            for i in range(1, len(sheet_names) + 1):
+                ct.append(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+            ct.append('</Types>')
+            z.writestr("[Content_Types].xml", "".join(ct))
+
+            z.writestr("_rels/.rels",
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                '</Relationships>'
+            )
+
+            wb_rels = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            ]
+            for i in range(1, len(sheet_names) + 1):
+                wb_rels.append(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>')
+            wb_rels.append('</Relationships>')
+            z.writestr("xl/_rels/workbook.xml.rels", "".join(wb_rels))
+
+            wb = [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+                '<sheets>'
+            ]
+            for i, s_name in enumerate(sheet_names, 1):
+                clean_sname = str(s_name).strip()[:31]
+                esc_name = clean_sname.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                wb.append(f'<sheet name="{esc_name}" sheetId="{i}" r:id="rId{i}"/>')
+            wb.append('</sheets></workbook>')
+            z.writestr("xl/workbook.xml", "".join(wb))
+
+            for i, (s_name, sdf) in enumerate(raw_dict.items(), 1):
+                ws = [
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+                    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+                ]
+                rows_data = sdf.values if hasattr(sdf, "values") else sdf
+                for r_idx, row in enumerate(rows_data, 1):
+                    cells_xml = []
+                    for c_idx, val in enumerate(row, 1):
+                        if val is None or pd.isna(val) or val == "":
+                            continue
+                        val_str = str(val).strip()
+                        if not val_str or val_str.lower() in ("nan", "none", "null"):
+                            continue
+                        c_ref = f"{col_letter(c_idx - 1)}{r_idx}"
+                        if re.match(r"^-?\d+(\.\d+)?$", val_str) and not (val_str.startswith("0") and len(val_str) > 1 and not val_str.startswith("0.")) and len(val_str) <= 15:
+                            cells_xml.append(f'<c r="{c_ref}"><v>{val_str}</v></c>')
+                        else:
+                            esc_val = val_str.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+                            cells_xml.append(f'<c r="{c_ref}" t="inlineStr"><is><t>{esc_val}</t></is></c>')
+                    if cells_xml:
+                        ws.append(f'<row r="{r_idx}">{"".join(cells_xml)}</row>')
+                ws.append('</sheetData></worksheet>')
+                z.writestr(f"xl/worksheets/sheet{i}.xml", "".join(ws))
+        return bio.getvalue()
+
+    # ==========================================
+    # ヘルパー関数: 元エクセル配置・全シート完全保持 PDF (.pdf) 生成
+    # ==========================================
+    def export_raw_sheets_to_pdf_bytes(raw_dict: Dict[str, pd.DataFrame], doc_title: str = "") -> bytes:
+        buf = bytearray()
+        offsets = []
+
+        def add_obj(body_bytes: bytes) -> int:
+            offsets.append(len(buf))
+            obj_num = len(offsets)
+            buf.extend(f"{obj_num} 0 obj\n".encode("latin1"))
+            buf.extend(body_bytes)
+            buf.extend(b"\nendobj\n")
+            return obj_num
+
+        buf.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+        # 日本語標準 CID フォント定義 (Adobe HeiseiKakuGo)
+        cid_font = b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /HeiseiKakuGo-W5 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 5 >> >>"
+        cid_num = add_obj(cid_font)
+        type0_font = f"<< /Type /Font /Subtype /Type0 /BaseFont /HeiseiKakuGo-W5 /Encoding /UniJIS-UTF16-H /DescendantFonts [{cid_num} 0 R] >>".encode("latin1")
+        font_num = add_obj(type0_font)
+
+        page_obj_nums = []
+        PAGE_W, PAGE_H = 842, 595  # A4 Landscape (横向き帳票)
+        MARGIN_X, TOP_Y, BOTTOM_Y, ROW_H = 28, 560, 35, 16
+
+        for s_name, sdf in raw_dict.items():
+            if sdf is None or len(sdf) == 0:
+                continue
+            max_r = len(sdf)
+            max_c = len(sdf.columns) if hasattr(sdf, "columns") else (len(sdf[0]) if len(sdf) > 0 else 0)
+            if max_c == 0:
+                continue
+            col_w = max(45, min(95, int((PAGE_W - MARGIN_X * 2) / max_c)))
+            rows_per_page = max(10, int((TOP_Y - 45 - BOTTOM_Y) / ROW_H))
+            rows_data = sdf.values if hasattr(sdf, "values") else sdf
+
+            for p_start in range(0, max_r, rows_per_page):
+                chunk = rows_data[p_start : p_start + rows_per_page]
+                p_idx = p_start // rows_per_page + 1
+
+                stream = bytearray()
+                stream.extend(b"BT\n/F1 12 Tf\n")
+                title_str = f"シート: {s_name} (ページ {p_idx})"
+                stream.extend(f"{MARGIN_X} {TOP_Y} Td <{title_str.encode('utf-16-be').hex().upper()}> Tj\nET\n".encode("latin1"))
+
+                cur_y = TOP_Y - 22
+                for r_i, row in enumerate(chunk):
+                    for c_i in range(min(max_c, len(row))):
+                        val = row[c_i]
+                        if val is not None and str(val).strip() and str(val).strip().lower() not in ("nan", "none", "null"):
+                            text_val = str(val).strip()
+                            x_pos = MARGIN_X + c_i * col_w + 2
+                            y_pos = cur_y - 10
+                            hex_str = text_val[:20].encode("utf-16-be").hex().upper()
+                            stream.extend(f"BT\n/F1 7.5 Tf\n{x_pos} {y_pos} Td <{hex_str}> Tj\nET\n".encode("latin1"))
+                    cur_y -= ROW_H
+                    if cur_y < BOTTOM_Y:
+                        break
+
+                content_num = add_obj(f"<< /Length {len(stream)} >>\nstream\n".encode("latin1") + stream + b"\nendstream")
+                page_dict = f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] /Resources << /Font << /F1 {font_num} 0 R >> >> /Contents {content_num} 0 R >>".encode("latin1")
+                page_obj_nums.append(add_obj(page_dict))
+
+        if not page_obj_nums:
+            stream = b"BT\n/F1 12 Tf\n50 500 Td <" + "データがありません".encode("utf-16-be").hex().upper().encode("latin1") + b"> Tj\nET\n"
+            content_num = add_obj(f"<< /Length {len(stream)} >>\nstream\n".encode("latin1") + stream + b"\nendstream")
+            page_dict = f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_W} {PAGE_H}] /Resources << /Font << /F1 {font_num} 0 R >> >> /Contents {content_num} 0 R >>".encode("latin1")
+            page_obj_nums.append(add_obj(page_dict))
+
+        kids_str = " ".join(f"{p} 0 R" for p in page_obj_nums)
+        pages_num = add_obj(f"<< /Type /Pages /Kids [{kids_str}] /Count {len(page_obj_nums)} >>".encode("latin1"))
+        catalog_num = add_obj(f"<< /Type /Catalog /Pages {pages_num} 0 R >>".encode("latin1"))
+
+        xref_pos = len(buf)
+        buf.extend(f"xref\n0 {len(offsets) + 1}\n0000000000 65535 f \n".encode("latin1"))
+        for off in offsets:
+            buf.extend(f"{off:010d} 00000 n \n".encode("latin1"))
+        buf.extend(f"trailer\n<< /Size {len(offsets) + 1} /Root {catalog_num} 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode("latin1"))
+        return bytes(buf)
+
+    # 2. 画面描画ブロック
     if raw_sheets:
         total_raw_rows = sum(len(sdf) for sdf in raw_sheets.values())
         total_sum = int(df_current["仕入金額"].sum()) if df_current is not None and not df_current.empty and "仕入金額" in df_current.columns else 0
@@ -2781,9 +2937,34 @@ with tabs[0]:
         m3.metric("総仕入金額", f"¥ {total_sum:,}")
         m4.metric("平均単価", f"¥ {int(total_sum / total_q):,}" if total_q > 0 else "¥ 0")
 
+        # 📥 【新設】元配置・全シート完全保持の Excel / PDF 一括ダウンロードボタン群
+        fname_base = st.session_state.get("last_imported_file_name", "trade_file").rsplit(".", 1)[0]
+        col_dl_x, col_dl_p = st.columns(2)
+        with col_dl_x:
+            raw_xlsx_bytes = export_raw_sheets_to_xlsx_bytes(raw_sheets)
+            st.download_button(
+                label="📗 元配置・全シート完全保持 Excel (.xlsx) でダウンロード",
+                data=raw_xlsx_bytes,
+                file_name=f"{fname_base}_全シート元配置保持.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="btn_download_raw_multisheet_xlsx"
+            )
+        with col_dl_p:
+            raw_pdf_bytes = export_raw_sheets_to_pdf_bytes(raw_sheets, doc_title=fname_base)
+            st.download_button(
+                label="📕 元配置・全シート完全保持 PDF (.pdf) でダウンロード",
+                data=raw_pdf_bytes,
+                file_name=f"{fname_base}_全シート帳票.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="btn_download_raw_multisheet_pdf"
+            )
+
+        st.write("")
         c_info1, c_info2 = st.columns([3, 1.2])
         with c_info1:
-            st.caption("※ 写真1枚目と同様、元のエクセルの行列配置・セル位置・独自表記（5%上乗せ等）をそのまま完全保持して表示しています。")
+            st.caption("※ 元のエクセルの行列配置・セル位置・独自表記（5%上乗せ、請求金額等）をそのまま完全保持して表示しています。")
         with c_info2:
             view_switcher = st.radio("表示切り替え", ["📑 元エクセル配置（保持）", "📊 DB集計リスト"], horizontal=True, label_visibility="collapsed")
 
@@ -2794,15 +2975,13 @@ with tabs[0]:
                 with grid_tabs[t_idx]:
                     sdf = raw_sheets[sname]
                     st.caption(f"シート名: **{sname}** (全 {len(sdf)} 行)")
-                    # 写真1枚目と全く同じ 0, 1, 2... の列名＆元配置で全件表示
                     st.dataframe(sdf, use_container_width=True, height=520)
         else:
-            # DB正規化テーブル（必要な場合のみ確認可能）
             if df_current is not None and not df_current.empty:
                 display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "シート名", "登録担当者"] if c in df_current.columns]
                 st.dataframe(df_current[display_cols], use_container_width=True, height=480)
 
-    # B. ファイル未取込（手動入力データのみ）時のフォールバック表示
+    # ファイル未取込時のフォールバック表示
     elif df_current is not None and not df_current.empty:
         total_sum = int(df_current["仕入金額"].sum()) if "仕入金額" in df_current.columns else 0
         total_q = int(df_current["数量"].sum()) if "数量" in df_current.columns else 0
