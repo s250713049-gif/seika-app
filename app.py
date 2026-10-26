@@ -1740,8 +1740,9 @@ def _parse_biff_rk(rk: int) -> Optional[float]:
         return None
 
 
-# 9.1 全シート保持 .xlsx 生成 & 生グリッド抽出
-
+　　# ==========================================
+# 9.1 全シート保持 .xlsx 生成 & 生グリッド高速キャッシュ抽出
+# ==========================================
 def _extract_bytes_from_file(file_or_bytes: Any) -> bytes:
     """Streamlit UploadedFile / BytesIO / bytes を安全に byte列として抽出"""
     if file_or_bytes is None:
@@ -1761,10 +1762,9 @@ def _extract_bytes_from_file(file_or_bytes: Any) -> bytes:
             return b""
     return b""
 
-
-def extract_exact_sheet_grids(file_or_bytes: Any) -> Dict[str, Dict[Tuple[int, int], str]]:
-    """ファイルバイナリまたは UploadedFile から全シートのセルデータ（(row, col) -> 文字列）を完全抽出"""
-    content_bytes = _extract_bytes_from_file(file_or_bytes)
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_extract_exact_sheet_grids(content_bytes: bytes) -> Dict[str, Dict[Tuple[int, int], str]]:
+    """① バイナリハッシュによる完全キャッシュ対応グリッド抽出"""
     if not content_bytes or len(content_bytes) < 4:
         return {}
 
@@ -1788,11 +1788,14 @@ def extract_exact_sheet_grids(file_or_bytes: Any) -> Dict[str, Dict[Tuple[int, i
 
     return {}
 
-
-def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
-    """旧 .xls 内の全シート・セル配置を保持して最新 .xlsx バイナリ（bytes）へ完全変換"""
+def extract_exact_sheet_grids(file_or_bytes: Any) -> Dict[str, Dict[Tuple[int, int], str]]:
     content_bytes = _extract_bytes_from_file(file_or_bytes)
-    sheet_grids = extract_exact_sheet_grids(content_bytes)
+    return _cached_extract_exact_sheet_grids(content_bytes)
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def _cached_convert_xls_file_to_multisheet_xlsx_bytes(content_bytes: bytes) -> bytes:
+    """① 重複生成を排除した .xlsx 変換キャッシュ"""
+    sheet_grids = _cached_extract_exact_sheet_grids(content_bytes)
     if not sheet_grids:
         return b""
 
@@ -1868,18 +1871,18 @@ def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
 
     return output_zip.getvalue()
 
+def convert_xls_file_to_multisheet_xlsx_bytes(file_or_bytes: Any) -> bytes:
+    content_bytes = _extract_bytes_from_file(file_or_bytes)
+    return _cached_convert_xls_file_to_multisheet_xlsx_bytes(content_bytes)
 
 def _col_idx_to_str(col_idx: int) -> str:
-    """1 -> A, 26 -> Z, 27 -> AA"""
     result = []
     while col_idx > 0:
         col_idx, remainder = divmod(col_idx - 1, 26)
         result.append(chr(65 + remainder))
     return "".join(reversed(result))
 
-
 def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
-    """DataFrame を純粋な .xlsx バイナリ（Bytes）に変換"""
     grid: Dict[Tuple[int, int], str] = {}
     cols = list(df.columns)
     for col_idx, col_name in enumerate(cols, 1):
@@ -1942,11 +1945,10 @@ def convert_df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> by
 
     return out.getvalue()
 
-
-def extract_all_raw_sheets_from_file(file_or_bytes: Any) -> Dict[str, pd.DataFrame]:
-    """ファイルから全シートの生データを抽出し、シート名 -> DataFrame の辞書を生成"""
-    content_bytes = _extract_bytes_from_file(file_or_bytes)
-    sheet_grids = extract_exact_sheet_grids(content_bytes)
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_extract_all_raw_sheets(content_bytes: bytes) -> Dict[str, pd.DataFrame]:
+    """② メモリ効率化型・生グリッド抽出キャッシュ"""
+    sheet_grids = _cached_extract_exact_sheet_grids(content_bytes)
     result: Dict[str, pd.DataFrame] = {}
 
     for s_name, grid in sheet_grids.items():
@@ -1967,14 +1969,14 @@ def extract_all_raw_sheets_from_file(file_or_bytes: Any) -> Dict[str, pd.DataFra
 
     return result
 
+def extract_all_raw_sheets_from_file(file_or_bytes: Any) -> Dict[str, pd.DataFrame]:
+    content_bytes = _extract_bytes_from_file(file_or_bytes)
+    return _cached_extract_all_raw_sheets(content_bytes)
 
+# ==========================================
 # 9.2 DBインポート解析エンジン（文字化け・値破壊完全排除 & 厳密判定）
-
+# ==========================================
 def _is_strictly_date_str(val: Any) -> str:
-    """
-    真の日付・和暦・Excelシリアル値のみを YYYY-MM-DD に変換。
-    「築館なめこ」「キャベツ」などの一般文字列は絶対に日付判定せず、空文字（""）を返します。
-    """
     if val is None or pd.isnull(val):
         return ""
     if isinstance(val, (datetime, pd.Timestamp)):
@@ -1984,7 +1986,6 @@ def _is_strictly_date_str(val: Any) -> str:
     if not s or s.lower() in ("nan", "none", "null"):
         return ""
 
-    # Excelシリアル数値 (20000〜65000: 1954年〜2077年)
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         if 20000 <= val <= 65000:
             try:
@@ -1999,7 +2000,6 @@ def _is_strictly_date_str(val: Any) -> str:
         except Exception:
             pass
 
-    # 和暦パターン: R8.9.2, 令8.9.10, H30.5.1, 令和8年9月2日 等
     m_wareki = re.match(r"^([RrHhSsTt令平昭]|令和|平成|昭和)?\s*(\d{1,2})[\.年/\-](\d{1,2})[\.月/\-](\d{1,2})日?", s)
     if m_wareki:
         era, y_s, m_s, d_s = m_wareki.groups()
@@ -2015,12 +2015,10 @@ def _is_strictly_date_str(val: Any) -> str:
             base_y = 2018 + y_val if y_val < 50 else (1900 + y_val)
         return f"{base_y:04d}-{int(m_s):02d}-{int(d_s):02d}"
 
-    # 西暦年月日パターン: 2026-09-02, 2026/9/2, 2026.9.2
     m_ymd = re.match(r"^(\d{4})[\.年/\-](\d{1,2})[\.月/\-](\d{1,2})日?", s)
     if m_ymd:
         return f"{int(m_ymd.group(1)):04d}-{int(m_ymd.group(2)):02d}-{int(m_ymd.group(3)):02d}"
 
-    # 月日パターン: 9月5日, 9/5 (1 <= 月 <= 12, 1 <= 日 <= 31)
     m_md = re.match(r"^(\d{1,2})[\.月/\-](\d{1,2})日?$", s)
     if m_md:
         m_val, d_val = int(m_md.group(1)), int(m_md.group(2))
@@ -2030,12 +2028,7 @@ def _is_strictly_date_str(val: Any) -> str:
 
     return ""
 
-
 def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str = "") -> Tuple[pd.DataFrame, str]:
-    """
-    1枚のシートのDataFrameから取引明細（出荷日・品名・数量・単価・仕入金額）を高精度抽出。
-    品名の誤除外を防ぎ、元エクセルに記載された全行を確実に復元します。
-    """
     extracted_rows: List[Dict[str, Any]] = []
     supplier_name = default_supplier
 
@@ -2045,7 +2038,6 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
     num_rows = len(df_sheet)
     num_cols = len(df_sheet.columns)
 
-    # 1. 伝票ヘッダー領域（上部15行）から仕入先名・市場を自動探索
     for r in range(min(15, num_rows)):
         row_vals = [str(df_sheet.iloc[r, c]).strip() for c in range(num_cols)]
         for v in row_vals:
@@ -2058,7 +2050,6 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
                 if len(clean_sup) >= 3 and not supplier_name:
                     supplier_name = clean_sup
 
-    # 2. 列ヘッダー行の特定（出荷日、品名、数量、単価、金額等の列インデックスを検出）
     col_map = {"date": -1, "item": -1, "qty": -1, "price": -1, "subtotal": -1, "code": -1, "market": -1}
     start_row = 0
 
@@ -2090,20 +2081,17 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
 
     current_date = ""
 
-    # 3. 明細行の精密スキャン
     for r in range(start_row, num_rows):
         row_raw = [str(df_sheet.iloc[r, c]).strip() for c in range(num_cols)]
         row_str = " ".join([v for v in row_raw if v])
 
         if not row_str:
             continue
-        # 集計・合計行のスキップ
         if any(term in row_str for term in ("総合計", "消費税", "手数料", "差引金額", "販売金額合計", "総計")):
             continue
         if "FL]]" in row_str:
             continue
 
-        # 日付の探索（見つかった場合は current_date を更新して下位行へ引き継ぎ）
         date_candidate = ""
         if col_map["date"] >= 0:
             date_candidate = _is_strictly_date_str(row_raw[col_map["date"]])
@@ -2116,13 +2104,11 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
         if date_candidate:
             current_date = date_candidate
 
-        # 品名・数量・単価・小計の抽出
         item_name = ""
         qty_val: Optional[float] = None
         price_val: Optional[float] = None
         subtotal_val: Optional[float] = None
 
-        # A. ヘッダー列マップが存在する場合の優先抽出
         if col_map["item"] >= 0 and col_map["item"] < num_cols:
             c_val = row_raw[col_map["item"]]
             if c_val and not _is_strictly_date_str(c_val) and not re.match(r"^[\d\,\.\-\+\*\/\￥\\¥\%\(\)]+$", c_val):
@@ -2147,7 +2133,6 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
                 try: subtotal_val = float(s_clean)
                 except ValueError: pass
 
-        # B. 位置推定によるフォールバック抽出
         if not item_name:
             for c in range(num_cols):
                 val = row_raw[c]
@@ -2155,25 +2140,20 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
                     continue
                 if "FL]]" in val or any(ord(ch) < 32 for ch in val if ch not in "\t\n"):
                     continue
-                # 真の日付セルはスキップ
                 if _is_strictly_date_str(val):
                     continue
-                # 純粋な数値や記号のみはスキップ
                 if re.match(r"^[\d\,\.\-\+\*\/\￥\\¥\%\(\)]+$", val):
                     continue
                 if any(k in val for k in ("小計", "合計", "頁", "出荷日", "品名", "数量", "単価", "金額", "消費税", "手数料")):
                     continue
-                # 有効な品名（「築館なめこ」「桃」など）
                 item_name = val
                 break
 
-        # 数値リストの再スキャン（欠損時）
         if qty_val is None or (price_val is None and subtotal_val is None):
             numeric_vals: List[float] = []
             for c in range(num_cols):
                 val = row_raw[c]
                 if not val: continue
-                # 日付形式のシリアル値は数値候補から除外
                 if _is_strictly_date_str(val): continue
                 c_clean = re.sub(r"[\,\s\￥\\¥]", "", val)
                 if re.match(r"^-?\d+(\.\d+)?$", c_clean):
@@ -2200,7 +2180,6 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
                 elif len(numeric_vals) == 1:
                     if subtotal_val is None: subtotal_val = numeric_vals[0]
 
-        # 明細レコードの成立判定（品名があり、数量または金額・単価のいずれかが存在すること）
         if item_name and (qty_val is not None or price_val is not None or subtotal_val is not None):
             final_date = current_date or datetime.now().strftime("%Y-%m-%d")
             final_qty = qty_val if (qty_val is not None and qty_val > 0) else 1.0
@@ -2226,15 +2205,53 @@ def parse_single_sheet_dataframe(df_sheet: pd.DataFrame, default_supplier: str =
     res_df = pd.DataFrame(extracted_rows)
     return res_df, supplier_name
 
-
-def parse_trade_file(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    アップロードされた伝票ファイル（.xls, .xlsx, .csv 等）をパースし、
-    全シートの取引データを統合した DataFrame と仕入先リストを返却します。
-    """
-    content_bytes = _extract_bytes_from_file(uploaded_file)
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cached_parse_trade_file(content_bytes: bytes) -> Tuple[pd.DataFrame, List[str]]:
+    """① 多重スキャンを解消したパース結果キャッシュ（生グリッドキャッシュを共用）"""
     if not content_bytes:
         return pd.DataFrame(), []
+
+    all_dfs: List[pd.DataFrame] = []
+    extracted_suppliers: List[str] = []
+
+    # 1. Excel (キャッシュ済み生グリッドを活用し即時処理)
+    sheet_raw_dfs = _cached_extract_all_raw_sheets(content_bytes)
+    if sheet_raw_dfs:
+        for s_name, df_sheet in sheet_raw_dfs.items():
+            if df_sheet is None or df_sheet.empty:
+                continue
+            parsed_df, sup_name = parse_single_sheet_dataframe(df_sheet, default_supplier=s_name)
+            if not parsed_df.empty:
+                all_dfs.append(parsed_df)
+            if sup_name and sup_name not in extracted_suppliers:
+                extracted_suppliers.append(sup_name)
+
+        if all_dfs:
+            final_df = pd.concat(all_dfs, ignore_index=True)
+            return final_df, extracted_suppliers
+
+    # 2. CSV / テキストのフォールバック
+    is_binary = (len(content_bytes) >= 4 and content_bytes[:4] == b"PK\x03\x04") or \
+                (len(content_bytes) >= 8 and content_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+    if not is_binary:
+        for enc in ("cp932", "utf-8", "euc-jp", "shift_jis"):
+            try:
+                text_content = content_bytes.decode(enc)
+                lines = [l for l in text_content.splitlines() if l.strip()]
+                if lines:
+                    matrix = [l.split(",") if "," in l else l.split("\t") for l in lines]
+                    csv_df = pd.DataFrame(matrix)
+                    parsed_df, sup_name = parse_single_sheet_dataframe(csv_df)
+                    if not parsed_df.empty:
+                        return parsed_df, [sup_name] if sup_name else []
+            except Exception:
+                continue
+
+    return pd.DataFrame(), extracted_suppliers
+
+def parse_trade_file(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
+    content_bytes = _extract_bytes_from_file(uploaded_file)
+    return _cached_parse_trade_file(content_bytes)
 
     all_dfs: List[pd.DataFrame] = []
     extracted_suppliers: List[str] = []
