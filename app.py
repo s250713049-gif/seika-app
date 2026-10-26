@@ -8,7 +8,7 @@ import json
 import glob
 import secrets
 import plotly.express as px
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
 import io
 import zipfile
 import xml.etree.ElementTree as ET
@@ -18,9 +18,9 @@ import time
 import unicodedata
 import struct
 import ctypes
+import gc
 from collections import defaultdict
 from typing import Dict, Tuple, List, Optional, Any
-
 # ==========================================
 # ページ基本設定 & セキュリティヘッダーCSS (高速描画対応)
 # ==========================================
@@ -91,7 +91,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 永続ストレージ & DB設定
+# 1. 永続ストレージ & DB設定（WALモード & タイムアウト30秒強化）
 # ==========================================
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -112,7 +112,11 @@ def get_secret(key: str, default: str = None) -> str:
     return default
 
 def get_engine():
-    """データベース接続エンジン取得（PostgreSQL優先、ローカルSQLite完全互換）"""
+    """
+    データベース接続エンジン取得
+    PostgreSQL（Cloud DB）優先接続。
+    SQLite利用時は WALモード (journal_mode=WAL) & busy_timeout=30秒を自動適用し同時書き込みロックを防止。
+    """
     database_url = get_secret("DATABASE_URL")
     if database_url:
         if database_url.startswith("postgres://"):
@@ -124,10 +128,25 @@ def get_engine():
             pool_size=10,
             max_overflow=20
         )
-    return create_engine(
+    
+    # SQLite: 同時書き込みロック回避（timeout=30.0 + WALモードリスナー）
+    sqlite_engine = create_engine(
         f"sqlite:///{SQLITE_DB_PATH}?check_same_thread=False",
-        connect_args={"check_same_thread": False}
+        connect_args={"check_same_thread": False, "timeout": 30.0}
     )
+
+    @event.listens_for(sqlite_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout=30000;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            cursor.close()
+        except Exception:
+            pass
+
+    return sqlite_engine
 
 def is_using_cloud_db() -> bool:
     return bool(get_secret("DATABASE_URL"))
@@ -176,14 +195,17 @@ def verify_session_token(token: str):
     return None
 
 # ==========================================
-# 3. データベーステーブル初期化（sheet_name 完全対応）
+# 3. データベーステーブル初期化（PostgreSQL / SQLite 両対応 & backup_logs 永続化）
 # ==========================================
 def init_db():
     engine = get_engine()
+    is_cloud = is_using_cloud_db()
+    pk_auto = "SERIAL PRIMARY KEY" if is_cloud else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    
     with engine.begin() as conn:
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_auto},
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'staff',
@@ -191,9 +213,9 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_auto},
                 date TEXT NOT NULL,
                 market_number TEXT NOT NULL,
                 category TEXT,
@@ -201,15 +223,15 @@ def init_db():
                 item_name TEXT NOT NULL,
                 unit_price INTEGER NOT NULL DEFAULT 0,
                 quantity INTEGER NOT NULL DEFAULT 0,
-                subtotal INTEGER NOT NULL DEFAULT 0,
+                subtotal BIGINT NOT NULL DEFAULT 0,
                 user_id TEXT NOT NULL,
                 sheet_name TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS deleted_transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {pk_auto},
                 original_id INTEGER,
                 date TEXT,
                 market_number TEXT,
@@ -218,15 +240,29 @@ def init_db():
                 item_name TEXT,
                 unit_price INTEGER,
                 quantity INTEGER,
-                subtotal INTEGER,
+                subtotal BIGINT,
                 user_id TEXT,
                 sheet_name TEXT DEFAULT '',
                 deleted_by TEXT,
                 deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
+        # ④ クラウド永続化用バックアップテーブル（再起動時のデータ消失を防止）
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS backup_logs (
+                id {pk_auto},
+                filename TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                reason TEXT,
+                record_count INTEGER DEFAULT 0,
+                total_subtotal BIGINT DEFAULT 0,
+                payload_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
         
-        # 既存DBへの sheet_name カラム自動安全追加マイグレーション
+        # 既存DBへの sheet_name カラム安全追加マイグレーション
         for tbl in ["transactions", "deleted_transactions"]:
             try:
                 conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN sheet_name TEXT DEFAULT '';"))
@@ -279,13 +315,12 @@ def register_new_user_db(username, password, role="staff", display_name=""):
     except Exception as e:
         return False, f"登録エラー: {e}"
 # ==========================================
-# 5. 取引データ永続化 & 高速キャッシュ（シート名完全対応）
+# 5. 取引データ永続化 & 高速キャッシュ & RBACアクセス制御
 # ==========================================
 @st.cache_data(ttl=60, show_spinner=False)
 def load_records_cached(target_user_filter: str = None):
     engine = get_engine()
     with engine.connect() as conn:
-        # DBに sheet_name カラムが存在しない場合の安全マイグレーション
         try:
             conn.execute(text("ALTER TABLE transactions ADD COLUMN sheet_name TEXT DEFAULT '';"))
         except Exception:
@@ -298,7 +333,6 @@ def load_records_cached(target_user_filter: str = None):
             else:
                 df = pd.read_sql(text(f"{cols_query} ORDER BY date DESC, id DESC"), conn)
         except Exception:
-            # 旧テーブル定義の場合のフォールバック
             fallback_query = "SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at FROM transactions"
             if target_user_filter and target_user_filter != "全員のデータを表示":
                 df = pd.read_sql(text(f"{fallback_query} WHERE user_id = :uid ORDER BY date DESC, id DESC"), conn, params={"uid": target_user_filter})
@@ -318,7 +352,6 @@ def load_records_cached(target_user_filter: str = None):
         df["差引残高"] = df["仕入金額"]
         df["合計"] = df["仕入金額"]
 
-    # ★ KeyError: 'シート名' を 100% 防ぐ完全防護処理
     if "シート名" not in df.columns:
         df["シート名"] = "Sheet1"
     df["シート名"] = df["シート名"].fillna("").apply(lambda s: str(s).strip() if str(s).strip() else "Sheet1")
@@ -329,6 +362,7 @@ def load_records_from_db(target_user_filter: str = None):
 
 def invalidate_records_cache():
     load_records_cached.clear()
+    gc.collect()
 
 def insert_records_to_db(user_id: str, records: list, auto_backup=True):
     if not records:
@@ -387,14 +421,32 @@ def insert_records_to_db(user_id: str, records: list, auto_backup=True):
     if auto_backup:
         create_backup_snapshot(user_id, trigger_reason=f"自動追記バックアップ ({len(records)}件記録)")
 
-def update_single_record_in_db(record_dict: dict):
+def update_single_record_in_db(record_dict: dict, operator_user: str = "admin", operator_role: str = "admin") -> Tuple[bool, str]:
+    """
+    ③ 部署・ロール別アクセス権限（RBAC）ガード付きレコード更新
+    staff は「自分が登録したデータ（user_id == operator_user）」のみ更新可能
+    """
     rec_id = record_dict.get("id")
-    if not rec_id: return False
+    if not rec_id:
+        return False, "IDが指定されていません"
+    
     engine = get_engine()
+    # RBAC 権限チェック
+    if operator_role != "admin":
+        with engine.connect() as conn:
+            owner_row = conn.execute(
+                text("SELECT user_id FROM transactions WHERE id = :rid"),
+                {"rid": rec_id}
+            ).fetchone()
+            if owner_row and str(owner_row[0]).strip() != str(operator_user).strip():
+                return False, f"権限エラー: 他の担当者（{owner_row[0]}）が登録したデータは変更できません。"
+
     p = int(record_dict.get("単価", 0))
     q = int(record_dict.get("数量", 0))
     sub = int(record_dict.get("仕入金額", record_dict.get("小計", p * q)))
     item_n = str(record_dict.get("品名", record_dict.get("商品名", "品名未指定"))).strip() or "品名未指定"
+    sheet_n = str(record_dict.get("シート名", "Sheet1")).strip() or "Sheet1"
+
     with engine.begin() as conn:
         conn.execute(
             text("""
@@ -406,7 +458,8 @@ def update_single_record_in_db(record_dict: dict):
                     item_name = :in,
                     unit_price = :p,
                     quantity = :q,
-                    subtotal = :sub
+                    subtotal = :sub,
+                    sheet_name = :sn
                 WHERE id = :rid
             """),
             {
@@ -415,36 +468,57 @@ def update_single_record_in_db(record_dict: dict):
                 "c": str(record_dict.get("カテゴリー", "")),
                 "ic": str(record_dict.get("商品コード", "")),
                 "in": item_n,
-                "p": p, "q": q, "sub": sub, "rid": rec_id
+                "p": p, "q": q, "sub": sub, "sn": sheet_n, "rid": rec_id
             }
         )
     invalidate_records_cache()
-    return True
+    return True, "更新が完了しました"
 
-def delete_records_by_ids(ids: list, deleted_by: str):
-    if not ids: return
+def delete_records_by_ids(ids: list, deleted_by: str, operator_role: str = "admin") -> Tuple[int, int]:
+    """
+    ③ 部署・ロール別アクセス権限（RBAC）ガード付きレコード削除
+    staff は自身が登録したレコードのみ削除可能。権限外レコードは安全にスキップ。
+    返り値: (削除成功件数, スキップ件数)
+    """
+    if not ids:
+        return 0, 0
     engine = get_engine()
+    deleted_count = 0
+    skipped_count = 0
+
     with engine.begin() as conn:
         for rid in ids:
             row = conn.execute(
-                text("SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id FROM transactions WHERE id = :rid"),
+                text("SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name FROM transactions WHERE id = :rid"),
                 {"rid": rid}
             ).fetchone()
-            if row:
-                conn.execute(
-                    text("""
-                        INSERT INTO deleted_transactions
-                        (original_id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, deleted_by)
-                        VALUES (:oid, :d, :m, :c, :ic, :in, :p, :q, :sub, :u, :db)
-                    """),
-                    {
-                        "oid": row[0], "d": row[1], "m": row[2], "c": row[3], "ic": row[4],
-                        "in": row[5], "p": row[6], "q": row[7], "sub": row[8], "u": row[9], "db": deleted_by
-                    }
-                )
-        conn.execute(text(f"DELETE FROM transactions WHERE id IN ({','.join(map(str, ids))})"))
+            if not row:
+                continue
+
+            # staff の場合は他者のレコード削除を拒否
+            if operator_role != "admin" and str(row[9]).strip() != str(deleted_by).strip():
+                skipped_count += 1
+                continue
+
+            conn.execute(
+                text("""
+                    INSERT INTO deleted_transactions
+                    (original_id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, deleted_by)
+                    VALUES (:oid, :d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, :db)
+                """),
+                {
+                    "oid": row[0], "d": row[1], "m": row[2], "c": row[3], "ic": row[4],
+                    "in": row[5], "p": row[6], "q": row[7], "sub": row[8], "u": row[9],
+                    "sn": row[10] if len(row) > 10 else "", "db": deleted_by
+                }
+            )
+            conn.execute(text("DELETE FROM transactions WHERE id = :rid"), {"rid": rid})
+            deleted_count += 1
+
     invalidate_records_cache()
-    create_backup_snapshot(deleted_by, trigger_reason=f"データ削除前自動退避 ({len(ids)}件削除)")
+    if deleted_count > 0:
+        create_backup_snapshot(deleted_by, trigger_reason=f"データ削除前自動退避 ({deleted_count}件削除)")
+    return deleted_count, skipped_count
 
 def get_employee_summary_stats():
     engine = get_engine()
@@ -463,13 +537,19 @@ def get_employee_summary_stats():
     return df
 
 # ==========================================
-# 6. バックアップ & 高速復元エンジン
+# 6. バックアップ & クラウドDB二重退避復元エンジン
 # ==========================================
 def create_backup_snapshot(user_id: str, trigger_reason="定期自動バックアップ"):
+    """
+    ④ クラウド環境永続化対応バックアップ作成
+    ローカルファイル（JSON）保存に加え、DB内 `backup_logs` テーブルへも完全保存し、
+    Streamlit Cloud の再起動・ファイル消失時にも確実な復旧を保証します。
+    """
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     engine = get_engine()
     with engine.connect() as conn:
         df_all = pd.read_sql("SELECT * FROM transactions ORDER BY id ASC", conn)
+    
     meta = {
         "timestamp": now_str,
         "created_by": user_id,
@@ -478,54 +558,136 @@ def create_backup_snapshot(user_id: str, trigger_reason="定期自動バック�
         "total_subtotal": int(df_all["subtotal"].sum()) if not df_all.empty and "subtotal" in df_all.columns else 0
     }
     bk_filename = f"backup_{now_str}.json"
-    bk_path = os.path.join(BACKUP_DIR, bk_filename)
     payload = {
         "meta": meta,
         "records": df_all.to_dict(orient="records")
     }
-    with open(bk_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    payload_json_str = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # 1. ローカルディスク保存
+    try:
+        bk_path = os.path.join(BACKUP_DIR, bk_filename)
+        with open(bk_path, "w", encoding="utf-8") as f:
+            f.write(payload_json_str)
+    except Exception:
+        pass
+
+    # 2. データベース（PostgreSQL / SQLite）内の backup_logs テーブルへ二重永続化
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO backup_logs 
+                    (filename, timestamp, created_by, reason, record_count, total_subtotal, payload_json)
+                    VALUES (:fn, :ts, :cb, :rs, :rc, :sub, :pj)
+                """),
+                {
+                    "fn": bk_filename,
+                    "ts": now_str,
+                    "cb": user_id,
+                    "rs": trigger_reason,
+                    "rc": meta["record_count"],
+                    "sub": meta["total_subtotal"],
+                    "pj": payload_json_str
+                }
+            )
+    except Exception:
+        pass
+
     return bk_filename
 
 def list_all_backups():
+    """DBテーブル（backup_logs）とローカルファイルを統合・重複排除してリスト化"""
+    backups_dict = {}
+
+    # 1. DBテーブルからの取得
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT filename, timestamp, created_by, reason, record_count, total_subtotal FROM backup_logs ORDER BY id DESC")).fetchall()
+            for r in rows:
+                backups_dict[r[0]] = {
+                    "filepath": None,
+                    "filename": r[0],
+                    "timestamp": r[1],
+                    "created_by": r[2],
+                    "reason": r[3],
+                    "record_count": r[4],
+                    "total_subtotal": r[5],
+                    "source": "db"
+                }
+    except Exception:
+        pass
+
+    # 2. ローカルファイルの取得
     files = glob.glob(os.path.join(BACKUP_DIR, "backup_*.json"))
     files.sort(reverse=True)
-    backups = []
     for fp in files:
+        fname = os.path.basename(fp)
+        if fname in backups_dict:
+            backups_dict[fname]["filepath"] = fp
+            continue
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 d = json.load(f)
                 meta = d.get("meta", {})
-                backups.append({
+                backups_dict[fname] = {
                     "filepath": fp,
-                    "filename": os.path.basename(fp),
+                    "filename": fname,
                     "timestamp": meta.get("timestamp", "不明"),
                     "created_by": meta.get("created_by", "system"),
                     "reason": meta.get("reason", "自動作成"),
                     "record_count": meta.get("record_count", 0),
-                    "total_subtotal": meta.get("total_subtotal", 0)
-                })
+                    "total_subtotal": meta.get("total_subtotal", 0),
+                    "source": "file"
+                }
         except Exception:
             continue
+
+    backups = list(backups_dict.values())
+    backups.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
     return backups
 
-def restore_from_backup_file(filepath: str, restored_by: str):
-    if not os.path.exists(filepath):
-        return {"success": False, "message": "バックアップファイルが存在しません"}
+def restore_from_backup_target(backup_item: dict, restored_by: str):
+    """ファイルまたはDBテーブル上のJSONから確実に全データを復元"""
+    data = None
+    engine = get_engine()
+
+    # 1. ファイルから読み込み
+    fp = backup_item.get("filepath")
+    if fp and os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+
+    # 2. DBの backup_logs テーブルから復元
+    if not data:
+        fname = backup_item.get("filename")
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("SELECT payload_json FROM backup_logs WHERE filename = :fn ORDER BY id DESC LIMIT 1"), {"fn": fname}).fetchone()
+                if row and row[0]:
+                    data = json.loads(row[0])
+        except Exception:
+            pass
+
+    if not data:
+        return {"success": False, "message": "バックアップデータを取得できませんでした"}
+
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
         records = data.get("records", [])
         create_backup_snapshot(restored_by, trigger_reason="データ復元直前の現行データ自動保護")
-        engine = get_engine()
+        
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM transactions;"))
             for r in records:
                 conn.execute(
                     text("""
                         INSERT INTO transactions 
-                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at)
-                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :cat)
+                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at)
+                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, :cat)
                     """),
                     {
                         "d": str(r.get("date", "")),
@@ -537,6 +699,7 @@ def restore_from_backup_file(filepath: str, restored_by: str):
                         "q": int(r.get("quantity", 0)),
                         "sub": int(r.get("subtotal", 0)),
                         "u": str(r.get("user_id", "restored")),
+                        "sn": str(r.get("sheet_name", "Sheet1")),
                         "cat": str(r.get("created_at", datetime.now()))
                     }
                 )
@@ -544,6 +707,9 @@ def restore_from_backup_file(filepath: str, restored_by: str):
         return {"success": True, "restored_count": len(records)}
     except Exception as e:
         return {"success": False, "message": str(e)}
+
+# 互換エイリアス
+restore_from_backup_file = lambda fp, rb: restore_from_backup_target({"filepath": fp, "filename": os.path.basename(fp)}, rb)
 
 # ==========================================
 # 7. 商品マスタ & カテゴリー連動定義
@@ -2925,7 +3091,7 @@ with tabs[0]:
         buf.extend(f"trailer\n<< /Size {len(offsets) + 1} /Root {catalog_num} 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode("latin1"))
         return bytes(buf)
 
-    # 2. 画面描画ブロック
+   # 2. 画面描画ブロック（② 大容量対応ページネーション & メモリ最適化）
     if raw_sheets:
         total_raw_rows = sum(len(sdf) for sdf in raw_sheets.values())
         total_sum = int(df_current["仕入金額"].sum()) if df_current is not None and not df_current.empty and "仕入金額" in df_current.columns else 0
@@ -2937,7 +3103,7 @@ with tabs[0]:
         m3.metric("総仕入金額", f"¥ {total_sum:,}")
         m4.metric("平均単価", f"¥ {int(total_sum / total_q):,}" if total_q > 0 else "¥ 0")
 
-        # 📥 【新設】元配置・全シート完全保持の Excel / PDF 一括ダウンロードボタン群
+        # 📥 元配置・全シート完全保持の Excel / PDF 一括ダウンロードボタン群
         fname_base = st.session_state.get("last_imported_file_name", "trade_file").rsplit(".", 1)[0]
         col_dl_x, col_dl_p = st.columns(2)
         with col_dl_x:
@@ -2976,12 +3142,29 @@ with tabs[0]:
                     sdf = raw_sheets[sname]
                     st.caption(f"シート名: **{sname}** (全 {len(sdf)} 行)")
                     st.dataframe(sdf, use_container_width=True, height=520)
+            gc.collect()
         else:
             if df_current is not None and not df_current.empty:
                 display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "シート名", "登録担当者"] if c in df_current.columns]
-                st.dataframe(df_current[display_cols], use_container_width=True, height=480)
+                
+                # ② ページネーションコントロール（1ページ50件）
+                PAGE_SIZE = 50
+                total_records = len(df_current)
+                total_pages = max(1, (total_records + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    # ファイル未取込時のフォールバック表示
+                col_p1, col_p2 = st.columns([3, 1.5])
+                with col_p1:
+                    cur_page = st.number_input(f"📄 ページ選択 (全 {total_pages} ページ / 総件数 {total_records:,} 件)", min_value=1, max_value=total_pages, value=1, step=1, key="tab0_db_page_num")
+                with col_p2:
+                    st.caption(f"表示中: **{(cur_page - 1) * PAGE_SIZE + 1} 〜 {min(cur_page * PAGE_SIZE, total_records)} 件**")
+
+                p_start = (cur_page - 1) * PAGE_SIZE
+                p_end = p_start + PAGE_SIZE
+                page_df = df_current[display_cols].iloc[p_start:p_end]
+                st.dataframe(page_df, use_container_width=True, height=480)
+                gc.collect()
+
+    # ファイル未取込時のフォールバック表示（ページネーション対応）
     elif df_current is not None and not df_current.empty:
         total_sum = int(df_current["仕入金額"].sum()) if "仕入金額" in df_current.columns else 0
         total_q = int(df_current["数量"].sum()) if "数量" in df_current.columns else 0
@@ -2993,7 +3176,21 @@ with tabs[0]:
         m4.metric("平均単価", f"¥ {int(total_sum / total_q):,}" if total_q > 0 else "¥ 0")
 
         display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "シート名", "登録担当者"] if c in df_current.columns]
-        st.dataframe(df_current[display_cols], use_container_width=True, height=480)
+        PAGE_SIZE = 50
+        total_records = len(df_current)
+        total_pages = max(1, (total_records + PAGE_SIZE - 1) // PAGE_SIZE)
+
+        col_p1, col_p2 = st.columns([3, 1.5])
+        with col_p1:
+            cur_page = st.number_input(f"📄 ページ選択 (全 {total_pages} ページ / 総件数 {total_records:,} 件)", min_value=1, max_value=total_pages, value=1, step=1, key="tab0_fallback_page_num")
+        with col_p2:
+            st.caption(f"表示中: **{(cur_page - 1) * PAGE_SIZE + 1} 〜 {min(cur_page * PAGE_SIZE, total_records)} 件**")
+
+        p_start = (cur_page - 1) * PAGE_SIZE
+        p_end = p_start + PAGE_SIZE
+        page_df = df_current[display_cols].iloc[p_start:p_end]
+        st.dataframe(page_df, use_container_width=True, height=480)
+        gc.collect()
     else:
         st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。")
 # ==========================================
@@ -3068,13 +3265,14 @@ with tabs[1]:
                 with col_save:
                     if st.button("💾 変更をデータベースに保存する", type="primary", use_container_width=True, key=f"save_edited_btn_{t_idx}"):
                         changes_count = 0
+                        blocked_count = 0
                         for _, row in edited_df.iterrows():
                             rid = row.get("id")
                             if pd.notnull(rid):
                                 p = int(row.get("単価", 0))
                                 q = int(row.get("数量", 0))
                                 sub = p * q
-                                update_single_record_in_db({
+                                ok, msg = update_single_record_in_db({
                                     "id": int(rid),
                                     "日付": str(row.get("日付", "")),
                                     "市場番号": str(row.get("市場番号", "")),
@@ -3085,11 +3283,31 @@ with tabs[1]:
                                     "数量": q,
                                     "仕入金額": sub,
                                     "シート名": str(row.get("シート名", "")).strip() or "Sheet1"
-                                })
-                                changes_count += 1
-                        st.toast(f"✅ {changes_count} 件の変更を完全保存しました！")
+                                }, operator_user=current_user, operator_role=user_role)
+                                if ok:
+                                    changes_count += 1
+                                else:
+                                    blocked_count += 1
+                        if blocked_count > 0:
+                            st.warning(f"⚠️ {blocked_count} 件は権限外（他担当者の登録データ）のため変更をスキップしました。")
+                        if changes_count > 0:
+                            st.toast(f"✅ {changes_count} 件の変更を完全保存しました！")
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                         st.rerun()
+
+                with col_del:
+                    selected_rows = edited_df[edited_df["選択"] == True]
+                    if not selected_rows.empty:
+                        del_btn_label = f"🗑️ 選択した {len(selected_rows)} 件を削除"
+                        if st.button(del_btn_label, type="secondary", use_container_width=True, key=f"del_selected_btn_{t_idx}"):
+                            deleted_ids = selected_rows["id"].dropna().astype(int).tolist()
+                            del_cnt, skip_cnt = delete_records_by_ids(deleted_ids, deleted_by=current_user, operator_role=user_role)
+                            if skip_cnt > 0:
+                                st.warning(f"⚠️ {skip_cnt} 件は権限外（他担当者の登録データ）のため削除をスキップしました。")
+                            if del_cnt > 0:
+                                st.toast(f"🗑️ {del_cnt} 件を削除しました（元通り復元可能）。")
+                            st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                            st.rerun()
 
                 with col_del:
                     selected_rows = edited_df[edited_df["選択"] == True]
