@@ -2634,67 +2634,68 @@ with tabs[0]:
             """, unsafe_allow_html=True)
 
         if uploaded_entry_file is not None:
+            # 1回だけバイト列を安全取得（多重読み込み防止）
+            file_bytes = _extract_bytes_from_file(uploaded_entry_file)
             col_act1, col_act2 = st.columns([2, 3])
             with col_act1:
                 btn_auto_import = st.button("⚡ このファイルの内容を直ちに自動記録する", type="primary", use_container_width=True, key="btn_exec_auto_record")
             with col_act2:
                 try:
-                    xlsx_quick_bytes = convert_xls_file_to_multisheet_xlsx_bytes(uploaded_entry_file)
-                    uploaded_entry_file.seek(0)
+                    # ① キャッシュ化された高速変換を使用
+                    xlsx_quick_bytes = _cached_convert_xls_file_to_multisheet_xlsx_bytes(file_bytes)
                     orig_base = uploaded_entry_file.name.rsplit(".", 1)[0]
-                    st.download_button(
-                        label=f"💾 このファイルを全シート保持して最新Excel (.xlsx) 形式で保存",
-                        data=xlsx_quick_bytes,
-                        file_name=f"{orig_base}_最新版.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="quick_download_xlsx_tab0"
-                    )
+                    if xlsx_quick_bytes:
+                        st.download_button(
+                            label=f"💾 このファイルを全シート保持して最新Excel (.xlsx) 形式で保存",
+                            data=xlsx_quick_bytes,
+                            file_name=f"{orig_base}_最新版.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="quick_download_xlsx_tab0"
+                        )
                 except Exception:
                     pass
 
             if btn_auto_import:
                 try:
-                    # 1. 元エクセルの全シート未加工グリッドデータを抽出（配置・書式保持用）
-                    uploaded_entry_file.seek(0)
-                    raw_sheets = extract_all_raw_sheets_from_file(uploaded_entry_file)
-                    uploaded_entry_file.seek(0)
-                    
-                    # 2. DB用明細データの抽出
-                    df_parsed, extracted_sups = parse_trade_file(uploaded_entry_file)
+                    with st.spinner("⚡ データを爆速解析・自動記録中..."):
+                        # ① キャッシュ済み関数で一瞬で展開
+                        raw_sheets = _cached_extract_all_raw_sheets(file_bytes)
+                        df_parsed, extracted_sups = _cached_parse_trade_file(file_bytes)
 
-                    if raw_sheets or not df_parsed.empty:
-                        # 取引先の自動候補追加
-                        for s in extracted_sups:
-                            if s and s not in st.session_state.extracted_suppliers:
-                                st.session_state.extracted_suppliers.append(s)
+                        if raw_sheets or not df_parsed.empty:
+                            for s in extracted_sups:
+                                if s and s not in st.session_state.extracted_suppliers:
+                                    st.session_state.extracted_suppliers.append(s)
 
-                        # DB登録
-                        if not df_parsed.empty:
-                            new_records_list = df_parsed.to_dict("records")
-                            insert_records_to_db(current_user, new_records_list)
-                            st.session_state.verification_batch = {
-                                "file_name": uploaded_entry_file.name,
-                                "df": df_parsed
-                            }
+                            if not df_parsed.empty:
+                                new_records_list = df_parsed.to_dict("records")
+                                insert_records_to_db(current_user, new_records_list)
+                                st.session_state.verification_batch = {
+                                    "file_name": uploaded_entry_file.name,
+                                    "df": df_parsed
+                                }
 
-                        # ★ 全シート生グリッドデータをセッション & 永続ストレージに保持
-                        st.session_state.last_imported_raw_sheets = raw_sheets
-                        st.session_state.last_imported_file_name = uploaded_entry_file.name
+                            # ② 不要な中間メモリを即時破棄してセッション保持
+                            st.session_state.last_imported_raw_sheets = raw_sheets
+                            st.session_state.last_imported_file_name = uploaded_entry_file.name
 
-                        try:
-                            RAW_SHEETS_CACHE_FILE = os.path.join(DATA_DIR, "latest_imported_raw_sheets.json")
-                            serializable_dict = {s: sdf.to_dict(orient="split") for s, sdf in raw_sheets.items()}
-                            with open(RAW_SHEETS_CACHE_FILE, "w", encoding="utf-8") as f:
-                                json.dump(serializable_dict, f, ensure_ascii=False)
-                        except Exception:
-                            pass
+                            try:
+                                RAW_SHEETS_CACHE_FILE = os.path.join(DATA_DIR, "latest_imported_raw_sheets.json")
+                                serializable_dict = {s: sdf.to_dict(orient="split") for s, sdf in raw_sheets.items()}
+                                with open(RAW_SHEETS_CACHE_FILE, "w", encoding="utf-8") as f:
+                                    json.dump(serializable_dict, f, ensure_ascii=False)
+                            except Exception:
+                                pass
 
-                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"✅ 『{uploaded_entry_file.name}』の全 {len(raw_sheets)} シートを元エクセル配置のまま自動記録！下の記録一覧へ正確に反映されました。")
-                        st.rerun()
-                    else:
-                        st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
+                            del file_bytes
+                            gc.collect()
+
+                            st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                            st.toast(f"✅ 『{uploaded_entry_file.name}』の全 {len(raw_sheets)} シートを瞬時に記録・同期完了！")
+                            st.rerun()
+                        else:
+                            st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
                 except Exception as e:
                     st.error(f"ファイル解析エラー: {e}")
 
