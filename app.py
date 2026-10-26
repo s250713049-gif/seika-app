@@ -1740,7 +1740,7 @@ def _parse_biff_rk(rk: int) -> Optional[float]:
         return None
 
 
-　　# ==========================================
+# ==========================================
 # 9.1 全シート保持 .xlsx 生成 & 生グリッド高速キャッシュ抽出
 # ==========================================
 def _extract_bytes_from_file(file_or_bytes: Any) -> bytes:
