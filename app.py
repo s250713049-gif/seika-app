@@ -278,34 +278,38 @@ def register_new_user_db(username, password, role="staff", display_name=""):
         return True, "ユーザーを新規登録しました"
     except Exception as e:
         return False, f"登録エラー: {e}"
-
 # ==========================================
-# 5. 取引データ永続化 & 高速キャッシュ
+# 5. 取引データ永続化 & 高速キャッシュ（シート名完全対応）
 # ==========================================
 @st.cache_data(ttl=60, show_spinner=False)
 def load_records_cached(target_user_filter: str = None):
     engine = get_engine()
     with engine.connect() as conn:
-        if target_user_filter and target_user_filter != "全員のデータを表示":
-            query = text("""
-                SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at
-                FROM transactions
-                WHERE user_id = :uid
-                ORDER BY date DESC, id DESC
-            """)
-            df = pd.read_sql(query, conn, params={"uid": target_user_filter})
-        else:
-            query = text("""
-                SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at
-                FROM transactions
-                ORDER BY date DESC, id DESC
-            """)
-            df = pd.read_sql(query, conn)
+        # DBに sheet_name カラムが存在しない場合の安全マイグレーション
+        try:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN sheet_name TEXT DEFAULT '';"))
+        except Exception:
+            pass
+
+        cols_query = "SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at FROM transactions"
+        try:
+            if target_user_filter and target_user_filter != "全員のデータを表示":
+                df = pd.read_sql(text(f"{cols_query} WHERE user_id = :uid ORDER BY date DESC, id DESC"), conn, params={"uid": target_user_filter})
+            else:
+                df = pd.read_sql(text(f"{cols_query} ORDER BY date DESC, id DESC"), conn)
+        except Exception:
+            # 旧テーブル定義の場合のフォールバック
+            fallback_query = "SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at FROM transactions"
+            if target_user_filter and target_user_filter != "全員のデータを表示":
+                df = pd.read_sql(text(f"{fallback_query} WHERE user_id = :uid ORDER BY date DESC, id DESC"), conn, params={"uid": target_user_filter})
+            else:
+                df = pd.read_sql(text(f"{fallback_query} ORDER BY date DESC, id DESC"), conn)
             
     df = df.rename(columns={
         "date": "日付", "market_number": "市場番号", "category": "カテゴリー",
         "item_code": "商品コード", "item_name": "品名", "unit_price": "単価",
-        "quantity": "数量", "subtotal": "仕入金額", "user_id": "登録担当者"
+        "quantity": "数量", "subtotal": "仕入金額", "user_id": "登録担当者",
+        "sheet_name": "シート名"
     })
     if not df.empty:
         df["商品名"] = df["品名"]
@@ -313,6 +317,11 @@ def load_records_cached(target_user_filter: str = None):
         df["支払金額"] = 0
         df["差引残高"] = df["仕入金額"]
         df["合計"] = df["仕入金額"]
+
+    # ★ KeyError: 'シート名' を 100% 防ぐ完全防護処理
+    if "シート名" not in df.columns:
+        df["シート名"] = "Sheet1"
+    df["シート名"] = df["シート名"].fillna("").apply(lambda s: str(s).strip() if str(s).strip() else "Sheet1")
     return df
 
 def load_records_from_db(target_user_filter: str = None):
@@ -327,30 +336,53 @@ def insert_records_to_db(user_id: str, records: list, auto_backup=True):
     engine = get_engine()
     now_ts = datetime.now()
     with engine.begin() as conn:
+        try:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN sheet_name TEXT DEFAULT '';"))
+        except Exception:
+            pass
         for r in records:
             p = int(r.get("単価", 0))
             q = int(r.get("数量", 0))
             sub = int(r.get("仕入金額", r.get("小計", p * q)))
             item_n = str(r.get("品名", r.get("商品名", "品名未指定"))).strip() or "品名未指定"
-            conn.execute(
-                text("""
-                    INSERT INTO transactions 
-                    (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at)
-                    VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :cat)
-                """),
-                {
-                    "d": str(r.get("日付", now_ts.strftime("%Y-%m-%d"))),
-                    "m": str(r.get("市場番号", "M-001")),
-                    "c": str(r.get("カテゴリー", "1課 (熊谷・大宮)")),
-                    "ic": str(r.get("商品コード", "AUTO")),
-                    "in": item_n,
-                    "p": p,
-                    "q": q,
-                    "sub": sub,
-                    "u": user_id,
-                    "cat": now_ts
-                }
-            )
+            sheet_n = str(r.get("シート名", r.get("sheet_name", ""))).strip() or "Sheet1"
+            try:
+                conn.execute(
+                    text("""
+                        INSERT INTO transactions 
+                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at)
+                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, :cat)
+                    """),
+                    {
+                        "d": str(r.get("日付", now_ts.strftime("%Y-%m-%d"))),
+                        "m": str(r.get("市場番号", "M-001")),
+                        "c": str(r.get("カテゴリー", "1課 (熊谷・大宮)")),
+                        "ic": str(r.get("商品コード", "AUTO")),
+                        "in": item_n,
+                        "p": p,
+                        "q": q,
+                        "sub": sub,
+                        "u": user_id,
+                        "sn": sheet_n,
+                        "cat": now_ts
+                    }
+                )
+            except Exception:
+                conn.execute(
+                    text("""
+                        INSERT INTO transactions 
+                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at)
+                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :cat)
+                    """),
+                    {
+                        "d": str(r.get("日付", now_ts.strftime("%Y-%m-%d"))),
+                        "m": str(r.get("市場番号", "M-001")),
+                        "c": str(r.get("カテゴリー", "1課 (熊谷・大宮)")),
+                        "ic": str(r.get("商品コード", "AUTO")),
+                        "in": item_n,
+                        "p": p, "q": q, "sub": sub, "u": user_id, "cat": now_ts
+                    }
+                )
     invalidate_records_cache()
     if auto_backup:
         create_backup_snapshot(user_id, trigger_reason=f"自動追記バックアップ ({len(records)}件記録)")
@@ -2739,11 +2771,12 @@ with tabs[0]:
 
         display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "シート名", "登録担当者"] if c in df_current.columns]
 
-        # 2. シート名リストの取得（写真1枚目と同様のマルチシートタブ生成）
-        if "シート名" in summary_source.columns:
-            sheet_names_list = [str(s).strip() for s in summary_source["シート名"].dropna().unique() if str(s).strip()]
-        else:
-            sheet_names_list = []
+        # 2. シート名リストの取得（シート名カラムの存在を100%保証してKeyErrorを根絶）
+        if "シート名" not in summary_source.columns:
+            summary_source["シート名"] = "Sheet1"
+        summary_source["シート名"] = summary_source["シート名"].fillna("").apply(lambda s: str(s).strip() if str(s).strip() else "Sheet1")
+
+        sheet_names_list = [str(s).strip() for s in summary_source["シート名"].unique() if str(s).strip()]
         if not sheet_names_list:
             sheet_names_list = ["Sheet1"]
 
