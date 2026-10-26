@@ -176,7 +176,7 @@ def verify_session_token(token: str):
     return None
 
 # ==========================================
-# 3. データベーステーブル初期化
+# 3. データベーステーブル初期化（sheet_name 完全対応）
 # ==========================================
 def init_db():
     engine = get_engine()
@@ -203,6 +203,7 @@ def init_db():
                 quantity INTEGER NOT NULL DEFAULT 0,
                 subtotal INTEGER NOT NULL DEFAULT 0,
                 user_id TEXT NOT NULL,
+                sheet_name TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
@@ -219,11 +220,19 @@ def init_db():
                 quantity INTEGER,
                 subtotal INTEGER,
                 user_id TEXT,
+                sheet_name TEXT DEFAULT '',
                 deleted_by TEXT,
                 deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
         
+        # 既存DBへの sheet_name カラム自動安全追加マイグレーション
+        for tbl in ["transactions", "deleted_transactions"]:
+            try:
+                conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN sheet_name TEXT DEFAULT '';"))
+            except Exception:
+                pass
+
         res = conn.execute(text("SELECT count(*) FROM users;")).scalar()
         if res == 0:
             init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD", "password123")
@@ -238,7 +247,6 @@ def init_db():
                 )
 
 init_db()
-
 # ==========================================
 # 4. ユーザー認証関数
 # ==========================================
@@ -2690,9 +2698,9 @@ with tabs[0]:
                 st.toast(f"🎉 「{final_item_name}」 (¥{subtotal_calc:,}) を高速登録しました！下の記録一覧へ正確に反映されました。")
                 st.rerun()
 
-  # 📋 記録済みデータ一覧（リアルタイム反映・全件表示 & 種類別タブ分類）
+# 📋 登録済み取引データ一覧（エクセルのシート毎にタブ切り替え完全対応）
     st.write("")
-    st.markdown('<div class="section-title">📋 登録済み取引データ一覧（即時反映・最新順・全件完全表示）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📋 登録済み取引データ一覧（シート別タブ切り替え・全件完全表示）</div>', unsafe_allow_html=True)
 
     if df_current is not None and not df_current.empty:
         # 1. 過去の文字化け・破損レコード（FL]] や 1X:/ 等）の自動検出
@@ -2706,7 +2714,6 @@ with tabs[0]:
         mojibake_count = int(mojibake_mask.sum())
         clean_df = df_current[~mojibake_mask].copy()
 
-        # 2. サマリー集計指標の算出（正常データ基準で算出）
         summary_source = clean_df if not clean_df.empty else df_current
         total_sum = int(summary_source["仕入金額"].sum()) if "仕入金額" in summary_source.columns else 0
         total_q = int(summary_source["数量"].sum()) if "数量" in summary_source.columns else 0
@@ -2717,76 +2724,52 @@ with tabs[0]:
         m3.metric("総仕入金額", f"¥ {total_sum:,}")
         m4.metric("平均単価", f"¥ {int(total_sum / total_q):,}" if total_q > 0 else "¥ 0")
 
-        # 3. 過去の破損データに対するアラート & ワンクリック一括清掃（クリーンアップ）機能
+        # 破損データ清掃アラート
         if mojibake_count > 0:
             c_warn1, c_warn2 = st.columns([3.5, 1.5])
             with c_warn1:
-                st.warning(f"⚠️ 過去に登録されたデータ内に {mojibake_count} 件の文字化け・破損データ（`FL]]...` 等）が含まれています。下のボタンで安全に一括削除できます。")
+                st.warning(f"⚠️ 過去に登録されたデータ内に {mojibake_count} 件の破損データ（`FL]]...` 等）が含まれています。")
             with c_warn2:
-                if st.button(f"🧹 破損データ({mojibake_count}件)を一括清掃・削除", key="clean_mojibake_records_btn", use_container_width=True, type="secondary"):
+                if st.button(f"🧹 破損データ({mojibake_count}件)を一括削除・清掃", key="clean_mojibake_records_btn_tab1", use_container_width=True, type="secondary"):
                     bad_ids = df_current[mojibake_mask]["id"].dropna().astype(int).tolist()
                     delete_records_by_ids(bad_ids, deleted_by=current_user)
                     st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.toast(f"✅ {len(bad_ids)} 件の文字化け破損データを安全に一掃・清掃しました！")
+                    st.toast(f"✅ {len(bad_ids)} 件の文字化け破損データを安全に削除しました！")
                     st.rerun()
 
-        display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "登録担当者"] if c in df_current.columns]
+        display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "シート名", "登録担当者"] if c in df_current.columns]
 
-        # 4. 「ALL全件」「カテゴリー別（課別）」「取引先別（市場番号別）」タブ分類表示
-        t_view_all, t_view_cat, t_view_sup = st.tabs([
-            f"🌐 ALL 全データ表示 ({len(df_current):,}件)",
-            "🏢 カテゴリー別（課別表示）",
-            "🤝 取引先別（市場番号別表示）"
-        ])
+        # 2. シート名リストの取得（写真1枚目と同様のマルチシートタブ生成）
+        if "シート名" in summary_source.columns:
+            sheet_names_list = [str(s).strip() for s in summary_source["シート名"].dropna().unique() if str(s).strip()]
+        else:
+            sheet_names_list = []
+        if not sheet_names_list:
+            sheet_names_list = ["Sheet1"]
 
-        with t_view_all:
-            # 件数制限（.head）を完全撤廃し、全件スクロール表示
-            if mojibake_count > 0:
-                hide_bad = st.checkbox("破損・文字化けデータを非表示にして正常データのみ表示する", value=True, key="chk_hide_bad_records_tab1")
-                target_all_df = clean_df if hide_bad else df_current
-            else:
-                target_all_df = df_current
+        # 写真1枚目と同じタブ構成を自動生成
+        sheet_tab_titles = [f"🌐 ALL 全シート統合 ({len(summary_source):,}件)"] + [f"📑 {s}" for s in sheet_names_list]
+        sheet_tabs = st.tabs(sheet_tab_titles)
 
-            st.caption(f"※ 件数制限（.head）を撤廃し、登録されている全 **{len(target_all_df):,} 件** を完全に表示しています。")
-            st.dataframe(target_all_df[display_cols], use_container_width=True, height=520)
+        # A. 全シート統合タブ
+        with sheet_tabs[0]:
+            st.caption(f"※ 件数制限（.head）を撤廃し、全シート合計 **{len(summary_source):,} 件** を完全に表示しています。")
+            st.dataframe(summary_source[display_cols], use_container_width=True, height=520)
 
-        with t_view_cat:
-            all_cats = [str(x) for x in summary_source["カテゴリー"].dropna().unique() if str(x).strip()]
-            if all_cats:
-                col_sel_cat, col_sp_cat = st.columns([2.5, 1.5])
-                with col_sel_cat:
-                    chosen_view_cat = st.selectbox("表示したいカテゴリー（課）を選択:", ["（全カテゴリー一覧）"] + all_cats, key="sel_cat_filter_tab1")
+        # B. 各シート個別タブ（写真1枚目のプレビューを完全再現）
+        for idx, s_name in enumerate(sheet_names_list, start=1):
+            with sheet_tabs[idx]:
+                sheet_data_df = summary_source[summary_source["シート名"] == s_name]
+                s_total_sub = int(sheet_data_df["仕入金額"].sum()) if "仕入金額" in sheet_data_df.columns else 0
+                s_total_qty = int(sheet_data_df["数量"].sum()) if "数量" in sheet_data_df.columns else 0
 
-                cat_filtered_df = summary_source if chosen_view_cat == "（全カテゴリー一覧）" else summary_source[summary_source["カテゴリー"] == chosen_view_cat]
+                c_sm1, c_sm2 = st.columns([3, 2])
+                c_sm1.caption(f"シート名: **{s_name}** (全 {len(sheet_data_df):,} 行 / 数量計: {s_total_qty:,} 個)")
+                c_sm2.caption(f"シート仕入金額合計: **¥ {s_total_sub:,}**")
 
-                c_cat_s1, c_cat_s2, c_cat_s3 = st.columns(3)
-                c_cat_s1.metric(f"選択区分: {chosen_view_cat}", f"{len(cat_filtered_df):,} 件")
-                c_cat_s2.metric("数量合計", f"{int(cat_filtered_df['数量'].sum()):,} 個" if "数量" in cat_filtered_df.columns else "0 個")
-                c_cat_s3.metric("仕入金額合計", f"¥ {int(cat_filtered_df['仕入金額'].sum()):,}" if "仕入金額" in cat_filtered_df.columns else "¥ 0")
-
-                st.dataframe(cat_filtered_df[display_cols], use_container_width=True, height=450)
-            else:
-                st.info("カテゴリーデータがありません。")
-
-        with t_view_sup:
-            all_sups = [str(x) for x in summary_source["市場番号"].dropna().unique() if str(x).strip()]
-            if all_sups:
-                col_sel_sup, col_sp_sup = st.columns([2.5, 1.5])
-                with col_sel_sup:
-                    chosen_view_sup = st.selectbox("表示したい取引先（市場番号）を選択:", ["（全取引先一覧）"] + all_sups, key="sel_sup_filter_tab1")
-
-                sup_filtered_df = summary_source if chosen_view_sup == "（全取引先一覧）" else summary_source[summary_source["市場番号"] == chosen_view_sup]
-
-                c_sup_s1, c_sup_s2, c_sup_s3 = st.columns(3)
-                c_sup_s1.metric(f"選択取引先: {chosen_view_sup}", f"{len(sup_filtered_df):,} 件")
-                c_sup_s2.metric("数量合計", f"{int(sup_filtered_df['数量'].sum()):,} 個" if "数量" in sup_filtered_df.columns else "0 個")
-                c_sup_s3.metric("仕入金額合計", f"¥ {int(sup_filtered_df['仕入金額'].sum()):,}" if "仕入金額" in sup_filtered_df.columns else "¥ 0")
-
-                st.dataframe(sup_filtered_df[display_cols], use_container_width=True, height=450)
-            else:
-                st.info("取引先データがありません。")
+                st.dataframe(sheet_data_df[display_cols], use_container_width=True, height=480)
     else:
-        st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。") 
+        st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。")
 # ==========================================
 # タブ 2: 取引一覧・インライン編集
 # ==========================================
