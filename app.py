@@ -2771,10 +2771,10 @@ with tabs[0]:
     else:
         st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。")
 # ==========================================
-# タブ 2: 取引一覧・インライン編集
+# タブ 2: 取引一覧・インライン編集（シート毎タブ編集・削除対応）
 # ==========================================
 with tabs[1]:
-    st.markdown('<div class="section-title">📊 登録データの一覧・直接編集・選択削除</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📊 登録データの一覧・直接編集・選択削除（シート別タブ対応）</div>', unsafe_allow_html=True)
 
     if df_current is not None and not df_current.empty:
         col_ctrl1, col_ctrl2 = st.columns([2.5, 1.5])
@@ -2783,14 +2783,22 @@ with tabs[1]:
         with col_ctrl2:
             st.caption("※ 一番左の「選択」チェックボックスを入れて「選択したデータを削除」を押すと安全に一括削除できます。")
 
-        editor_df = df_current.copy()
-        editor_df.insert(0, "選択", False)
+        # 登録データ内のシート名リスト
+        if "シート名" in df_current.columns:
+            all_edit_sheets = [str(s).strip() for s in df_current["シート名"].dropna().unique() if str(s).strip()]
+        else:
+            all_edit_sheets = []
+        if not all_edit_sheets:
+            all_edit_sheets = ["Sheet1"]
 
-        editor_cols_order = [c for c in ["選択", "id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "登録担当者"] if c in editor_df.columns]
+        edit_tab_labels = [f"🌐 ALL 全件 ({len(df_current):,}件)"] + [f"📑 {s}" for s in all_edit_sheets]
+        edit_tabs = st.tabs(edit_tab_labels)
 
+        # 共通のColumnConfig
         column_config = {
             "選択": st.column_config.CheckboxColumn("選択", help="削除対象として選択"),
             "id": st.column_config.NumberColumn("ID", disabled=True),
+            "シート名": st.column_config.TextColumn("シート名"),
             "日付": st.column_config.TextColumn("取引日"),
             "市場番号": st.column_config.TextColumn("市場番号/取引先"),
             "カテゴリー": st.column_config.SelectboxColumn("カテゴリー", options=DEPT_LIST),
@@ -2801,63 +2809,85 @@ with tabs[1]:
             "仕入金額": st.column_config.NumberColumn("仕入金額 (円)", min_value=0, step=100),
             "登録担当者": st.column_config.TextColumn("登録担当者", disabled=True)
         }
+        editor_cols_order = [c for c in ["選択", "id", "シート名", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "登録担当者"] if c in df_current.columns or c in ["選択", "シート名"]]
 
-        edited_df = st.data_editor(
-            editor_df[editor_cols_order],
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config=column_config,
-            key=f"trade_data_editor_v_{st.session_state.get('editor_version', 0)}"
-        )
+        for t_idx, sheet_label in enumerate(edit_tab_labels):
+            with edit_tabs[t_idx]:
+                if t_idx == 0:
+                    current_tab_df = df_current.copy()
+                    st.caption(f"全シート合計: **{len(current_tab_df):,} 件** の直接編集・選択削除")
+                else:
+                    target_s = all_edit_sheets[t_idx - 1]
+                    current_tab_df = df_current[df_current["シート名"] == target_s].copy()
+                    st.caption(f"シート名: **{target_s}** (全 **{len(current_tab_df):,} 件**)")
 
-        col_save, col_del, col_dl_xlsx = st.columns([2, 2, 2])
+                if current_tab_df.empty:
+                    st.info("このシートにデータはありません。")
+                    continue
 
-        with col_save:
-            if st.button("💾 変更をデータベースに保存する", type="primary", use_container_width=True, key="save_edited_records_btn"):
-                changes_count = 0
-                for _, row in edited_df.iterrows():
-                    rid = row.get("id")
-                    if pd.notnull(rid):
-                        p = int(row.get("単価", 0))
-                        q = int(row.get("数量", 0))
-                        sub = p * q
-                        update_single_record_in_db({
-                            "id": int(rid),
-                            "日付": str(row.get("日付", "")),
-                            "市場番号": str(row.get("市場番号", "")),
-                            "カテゴリー": str(row.get("カテゴリー", "")),
-                            "商品コード": str(row.get("商品コード", "")),
-                            "品名": str(row.get("品名", "")),
-                            "単価": p,
-                            "数量": q,
-                            "仕入金額": sub
-                        })
-                        changes_count += 1
-                st.toast(f"✅ {changes_count} 件の変更を完全保存しました！")
-                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                st.rerun()
+                current_tab_df.insert(0, "選択", False)
+                if "シート名" not in current_tab_df.columns:
+                    current_tab_df["シート名"] = "Sheet1"
 
-        with col_del:
-            selected_rows = edited_df[edited_df["選択"] == True]
-            if not selected_rows.empty:
-                del_btn_label = f"🗑️ 選択した {len(selected_rows)} 件を削除"
-                if st.button(del_btn_label, type="secondary", use_container_width=True, key="del_selected_records_btn"):
-                    deleted_ids = selected_rows["id"].dropna().astype(int).tolist()
-                    delete_records_by_ids(deleted_ids, deleted_by=current_user)
-                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.toast(f"🗑️ {len(deleted_ids)} 件を削除しました（いつでも元通り復元可能）。")
-                    st.rerun()
+                edited_df = st.data_editor(
+                    current_tab_df[editor_cols_order],
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    column_config=column_config,
+                    key=f"trade_data_editor_tab_{t_idx}_v_{st.session_state.get('editor_version', 0)}"
+                )
 
-        with col_dl_xlsx:
-            export_cols = [c for c in ["日付", "市場番号", "カテゴリー", "商品コード", "品名", "数量", "単価", "仕入金額", "支払金額", "差引残高", "合計", "登録担当者"] if c in edited_df.columns]
-            xlsx_export_bytes = convert_df_to_xlsx_bytes(edited_df[export_cols], sheet_name="青果取引データ")
-            st.download_button(
-                "📗 最新 Excel (.xlsx) 出力",
-                data=xlsx_export_bytes,
-                file_name=f"seika_trade_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+                col_save, col_del, col_dl_xlsx = st.columns([2, 2, 2])
+
+                with col_save:
+                    if st.button("💾 変更をデータベースに保存する", type="primary", use_container_width=True, key=f"save_edited_btn_{t_idx}"):
+                        changes_count = 0
+                        for _, row in edited_df.iterrows():
+                            rid = row.get("id")
+                            if pd.notnull(rid):
+                                p = int(row.get("単価", 0))
+                                q = int(row.get("数量", 0))
+                                sub = p * q
+                                update_single_record_in_db({
+                                    "id": int(rid),
+                                    "日付": str(row.get("日付", "")),
+                                    "市場番号": str(row.get("市場番号", "")),
+                                    "カテゴリー": str(row.get("カテゴリー", "")),
+                                    "商品コード": str(row.get("商品コード", "")),
+                                    "品名": str(row.get("品名", "")),
+                                    "単価": p,
+                                    "数量": q,
+                                    "仕入金額": sub,
+                                    "シート名": str(row.get("シート名", "")).strip() or "Sheet1"
+                                })
+                                changes_count += 1
+                        st.toast(f"✅ {changes_count} 件の変更を完全保存しました！")
+                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                        st.rerun()
+
+                with col_del:
+                    selected_rows = edited_df[edited_df["選択"] == True]
+                    if not selected_rows.empty:
+                        del_btn_label = f"🗑️ 選択した {len(selected_rows)} 件を削除"
+                        if st.button(del_btn_label, type="secondary", use_container_width=True, key=f"del_selected_btn_{t_idx}"):
+                            deleted_ids = selected_rows["id"].dropna().astype(int).tolist()
+                            delete_records_by_ids(deleted_ids, deleted_by=current_user)
+                            st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                            st.toast(f"🗑️ {len(deleted_ids)} 件を削除しました（元通り復元可能）。")
+                            st.rerun()
+
+                with col_dl_xlsx:
+                    export_cols = [c for c in ["日付", "市場番号", "カテゴリー", "商品コード", "品名", "数量", "単価", "仕入金額", "シート名", "登録担当者"] if c in edited_df.columns]
+                    s_title = "青果取引データ" if t_idx == 0 else all_edit_sheets[t_idx - 1]
+                    xlsx_export_bytes = convert_df_to_xlsx_bytes(edited_df[export_cols], sheet_name=s_title)
+                    st.download_button(
+                        f"📗 この内容を Excel (.xlsx) 出力",
+                        data=xlsx_export_bytes,
+                        file_name=f"seika_trade_{s_title}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key=f"dl_xlsx_btn_{t_idx}"
+                    )
     else:
         st.info("表示する取引データがありません。")
 
