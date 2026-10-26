@@ -3226,8 +3226,19 @@ with tabs[0]:
             for t_idx, sname in enumerate(sheet_keys):
                 with grid_tabs[t_idx]:
                     sdf = raw_sheets[sname]
-                    st.caption(f"シート名: **{sname}** (全 {len(sdf)} 行)")
-                    st.dataframe(sdf, use_container_width=True, height=520)
+                    total_s_rows = len(sdf)
+                    st.caption(f"シート名: **{sname}** (全 {total_s_rows:,} 行)")
+
+                    # ③ ビューの遅延評価（100行超は大容量保護モードで高速レンダリング）
+                    if total_s_rows > 100:
+                        show_all = st.checkbox(f"全 {total_s_rows:,} 行を展開表示する", value=False, key=f"show_all_raw_grid_tab0_{t_idx}")
+                        display_sdf = sdf if show_all else sdf.iloc[:100]
+                        if not show_all:
+                            st.caption(f"⚡ 高速保護表示中: **先頭 100 行** を表示中（全 {total_s_rows:,} 行）")
+                    else:
+                        display_sdf = sdf
+
+                    st.dataframe(display_sdf, use_container_width=True, height=520)
             gc.collect()
         else:
             if df_current is not None and not df_current.empty:
