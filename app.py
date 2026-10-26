@@ -3270,9 +3270,26 @@ with tabs[1]:
     if df_current is not None and not df_current.empty:
         col_ctrl1, col_ctrl2 = st.columns([2.5, 1.5])
         with col_ctrl1:
-            st.caption("※ テーブル内のセルを直接クリックして数値を変更し、下の「変更をデータベースに保存」を押すと即時反映されます。")
+            st.caption("※ テーブル内のセルを直接クリックして数値を変更し、下の「変更をデータベースに保存」を押すと即時反映されます。行をゴミ箱で消去した場合も保存ボタンで完全にDB反映されます。")
         with col_ctrl2:
             st.caption("※ 一番左の「選択」チェックボックスを入れて「選択したデータを削除」を押すと安全に一括削除できます。")
+
+        # ↩️ 誤削除データのワンクリック復元（UNDO）バナー
+        if st.session_state.get("last_deleted_records"):
+            del_count_now = len(st.session_state.last_deleted_records)
+            st.markdown(f"""
+                <div class="restore-box" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <span>🛡️ 直前に削除されたデータが <b>{del_count_now} 件</b> 安全に退避保管されています。誤って削除した場合は即座に元通り戻せます。</span>
+                </div>
+            """, unsafe_allow_html=True)
+            col_undo, _ = st.columns([2.5, 3.5])
+            with col_undo:
+                if st.button(f"↩️ 直前に削除した {del_count_now} 件のデータを元通り復元する", type="primary", use_container_width=True, key="btn_undo_last_deleted_records"):
+                    restored_cnt = restore_last_deleted_records_db(st.session_state.last_deleted_records, restored_by=current_user)
+                    st.session_state.last_deleted_records = []
+                    st.toast(f"🎉 {restored_cnt} 件のデータを元通り復元しました！")
+                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                    st.rerun()
 
         # 登録データ内のシート名リスト
         if "シート名" in df_current.columns:
@@ -3320,6 +3337,9 @@ with tabs[1]:
                 if "シート名" not in current_tab_df.columns:
                     current_tab_df["シート名"] = "Sheet1"
 
+                # 編集前のID一覧を保持（ゴミ箱削除の検出用）
+                initial_row_ids = set(current_tab_df["id"].dropna().astype(int).tolist())
+
                 edited_df = st.data_editor(
                     current_tab_df[editor_cols_order],
                     use_container_width=True,
@@ -3332,6 +3352,15 @@ with tabs[1]:
 
                 with col_save:
                     if st.button("💾 変更をデータベースに保存する", type="primary", use_container_width=True, key=f"save_edited_btn_{t_idx}"):
+                        # 1. ゴミ箱アイコン（行削除）で画面から消えたIDを検出してDBから完全削除
+                        remaining_row_ids = set(edited_df["id"].dropna().astype(int).tolist())
+                        missing_ids = list(initial_row_ids - remaining_row_ids)
+                        auto_del_cnt = 0
+                        auto_skip_cnt = 0
+                        if missing_ids:
+                            auto_del_cnt, auto_skip_cnt, _ = delete_records_by_ids(missing_ids, deleted_by=current_user, operator_role=user_role)
+
+                        # 2. 残存行の更新処理
                         changes_count = 0
                         blocked_count = 0
                         for _, row in edited_df.iterrows():
@@ -3356,10 +3385,18 @@ with tabs[1]:
                                     changes_count += 1
                                 else:
                                     blocked_count += 1
-                        if blocked_count > 0:
-                            st.warning(f"⚠️ {blocked_count} 件は権限外（他担当者の登録データ）のため変更をスキップしました。")
+
+                        status_messages = []
+                        if auto_del_cnt > 0:
+                            status_messages.append(f"ゴミ箱削除 {auto_del_cnt} 件をDBに反映")
                         if changes_count > 0:
-                            st.toast(f"✅ {changes_count} 件の変更を完全保存しました！")
+                            status_messages.append(f"{changes_count} 件の変更を保存")
+
+                        if auto_skip_cnt > 0 or blocked_count > 0:
+                            st.warning(f"⚠️ {auto_skip_cnt + blocked_count} 件は権限外（他担当者の登録データ）のため操作をスキップしました。")
+                        if status_messages:
+                            st.toast(f"✅ {'・'.join(status_messages)} しました！")
+
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                         st.rerun()
 
@@ -3369,23 +3406,12 @@ with tabs[1]:
                         del_btn_label = f"🗑️ 選択した {len(selected_rows)} 件を削除"
                         if st.button(del_btn_label, type="secondary", use_container_width=True, key=f"del_selected_btn_{t_idx}"):
                             deleted_ids = selected_rows["id"].dropna().astype(int).tolist()
-                            del_cnt, skip_cnt = delete_records_by_ids(deleted_ids, deleted_by=current_user, operator_role=user_role)
+                            del_cnt, skip_cnt, _ = delete_records_by_ids(deleted_ids, deleted_by=current_user, operator_role=user_role)
                             if skip_cnt > 0:
                                 st.warning(f"⚠️ {skip_cnt} 件は権限外（他担当者の登録データ）のため削除をスキップしました。")
                             if del_cnt > 0:
-                                st.toast(f"🗑️ {del_cnt} 件を削除しました（元通り復元可能）。")
+                                st.toast(f"🗑️ {del_cnt} 件を削除しました（上の復元ボタンから元通り復元可能）。")
                             st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                            st.rerun()
-
-                with col_del:
-                    selected_rows = edited_df[edited_df["選択"] == True]
-                    if not selected_rows.empty:
-                        del_btn_label = f"🗑️ 選択した {len(selected_rows)} 件を削除"
-                        if st.button(del_btn_label, type="secondary", use_container_width=True, key=f"del_selected_btn_{t_idx}"):
-                            deleted_ids = selected_rows["id"].dropna().astype(int).tolist()
-                            delete_records_by_ids(deleted_ids, deleted_by=current_user)
-                            st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                            st.toast(f"🗑️ {len(deleted_ids)} 件を削除しました（元通り復元可能）。")
                             st.rerun()
 
                 with col_dl_xlsx:
@@ -3402,7 +3428,6 @@ with tabs[1]:
                     )
     else:
         st.info("表示する取引データがありません。")
-
 # ==========================================
 # タブ 3: 売上分析 & グラフ可視化
 # ==========================================
