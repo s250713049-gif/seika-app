@@ -2404,20 +2404,43 @@ with tabs[0]:
 
             if btn_auto_import:
                 try:
+                    # 1. 元エクセルの全シート未加工グリッドデータを抽出（配置・書式保持用）
+                    uploaded_entry_file.seek(0)
+                    raw_sheets = extract_all_raw_sheets_from_file(uploaded_entry_file)
+                    uploaded_entry_file.seek(0)
+                    
+                    # 2. DB用明細データの抽出
                     df_parsed, extracted_sups = parse_trade_file(uploaded_entry_file)
-                    if not df_parsed.empty:
+
+                    if raw_sheets or not df_parsed.empty:
+                        # 取引先の自動候補追加
                         for s in extracted_sups:
                             if s and s not in st.session_state.extracted_suppliers:
                                 st.session_state.extracted_suppliers.append(s)
 
-                        new_records_list = df_parsed.to_dict("records")
-                        insert_records_to_db(current_user, new_records_list)
-                        st.session_state.verification_batch = {
-                            "file_name": uploaded_entry_file.name,
-                            "df": df_parsed
-                        }
+                        # DB登録
+                        if not df_parsed.empty:
+                            new_records_list = df_parsed.to_dict("records")
+                            insert_records_to_db(current_user, new_records_list)
+                            st.session_state.verification_batch = {
+                                "file_name": uploaded_entry_file.name,
+                                "df": df_parsed
+                            }
+
+                        # ★ 全シート生グリッドデータをセッション & 永続ストレージに保持
+                        st.session_state.last_imported_raw_sheets = raw_sheets
+                        st.session_state.last_imported_file_name = uploaded_entry_file.name
+
+                        try:
+                            RAW_SHEETS_CACHE_FILE = os.path.join(DATA_DIR, "latest_imported_raw_sheets.json")
+                            serializable_dict = {s: sdf.to_dict(orient="split") for s, sdf in raw_sheets.items()}
+                            with open(RAW_SHEETS_CACHE_FILE, "w", encoding="utf-8") as f:
+                                json.dump(serializable_dict, f, ensure_ascii=False)
+                        except Exception:
+                            pass
+
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"✅ 『{uploaded_entry_file.name}』から {len(new_records_list)} 件を自動記録！下の記録一覧へ正確に反映されました。")
+                        st.toast(f"✅ 『{uploaded_entry_file.name}』の全 {len(raw_sheets)} シートを元エクセル配置のまま自動記録！下の記録一覧へ正確に反映されました。")
                         st.rerun()
                     else:
                         st.warning("⚠️ ファイル内に有効なデータ行が見つかりませんでした。")
@@ -2730,77 +2753,68 @@ with tabs[0]:
                 st.toast(f"🎉 「{final_item_name}」 (¥{subtotal_calc:,}) を高速登録しました！下の記録一覧へ正確に反映されました。")
                 st.rerun()
 
-# 📋 登録済み取引データ一覧（エクセルのシート毎にタブ切り替え完全対応）
+# 📋 登録済み取引データ一覧（元エクセル全シート完全保持グリッド & シート別タブ表示）
     st.write("")
-    st.markdown('<div class="section-title">📋 登録済み取引データ一覧（シート別タブ切り替え・全件完全表示）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📋 登録済み取引データ一覧（元エクセル配置・全シート保持反映）</div>', unsafe_allow_html=True)
 
-    if df_current is not None and not df_current.empty:
-        # 1. 過去の文字化け・破損レコード（FL]] や 1X:/ 等）の自動検出
-        mojibake_mask = df_current.apply(
-            lambda r: any(
-                "FL]]" in str(r[c]) or "1X:/" in str(r[c]) or any(ord(ch) < 32 for ch in str(r[c]) if ch not in "\t\n")
-                for c in ["日付", "品名", "商品名", "市場番号"] if c in r.index and pd.notnull(r[c])
-            ),
-            axis=1
-        )
-        mojibake_count = int(mojibake_mask.sum())
-        clean_df = df_current[~mojibake_mask].copy()
+    # 永続キャッシュおよびセッションから生グリッドデータをロード
+    RAW_SHEETS_CACHE_FILE = os.path.join(DATA_DIR, "latest_imported_raw_sheets.json")
+    raw_sheets = st.session_state.get("last_imported_raw_sheets")
+    if not raw_sheets and os.path.exists(RAW_SHEETS_CACHE_FILE):
+        try:
+            with open(RAW_SHEETS_CACHE_FILE, "r", encoding="utf-8") as f:
+                saved_raw = json.load(f)
+                raw_sheets = {s: pd.DataFrame(d["data"], columns=d["columns"], index=d["index"]) for s, d in saved_raw.items()}
+                st.session_state.last_imported_raw_sheets = raw_sheets
+        except Exception:
+            pass
 
-        summary_source = clean_df if not clean_df.empty else df_current
-        total_sum = int(summary_source["仕入金額"].sum()) if "仕入金額" in summary_source.columns else 0
-        total_q = int(summary_source["数量"].sum()) if "数量" in summary_source.columns else 0
+    # A. 自動記録されたエクセルの生グリッド（写真1枚目スタイル）の表示
+    if raw_sheets:
+        total_raw_rows = sum(len(sdf) for sdf in raw_sheets.values())
+        total_sum = int(df_current["仕入金額"].sum()) if df_current is not None and not df_current.empty and "仕入金額" in df_current.columns else 0
+        total_q = int(df_current["数量"].sum()) if df_current is not None and not df_current.empty and "数量" in df_current.columns else 0
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("総取引件数", f"{len(df_current):,} 件" + (f" (正常: {len(clean_df):,}件)" if mojibake_count > 0 else ""))
+        m1.metric("検出総シート数", f"{len(raw_sheets):,} シート")
+        m2.metric("総行数 (全シート計)", f"{total_raw_rows:,} 行")
+        m3.metric("総仕入金額", f"¥ {total_sum:,}")
+        m4.metric("平均単価", f"¥ {int(total_sum / total_q):,}" if total_q > 0 else "¥ 0")
+
+        c_info1, c_info2 = st.columns([3, 1.2])
+        with c_info1:
+            st.caption("※ 写真1枚目と同様、元のエクセルの行列配置・セル位置・独自表記（5%上乗せ等）をそのまま完全保持して表示しています。")
+        with c_info2:
+            view_switcher = st.radio("表示切り替え", ["📑 元エクセル配置（保持）", "📊 DB集計リスト"], horizontal=True, label_visibility="collapsed")
+
+        if view_switcher == "📑 元エクセル配置（保持）":
+            sheet_keys = list(raw_sheets.keys())
+            grid_tabs = st.tabs(sheet_keys)
+            for t_idx, sname in enumerate(sheet_keys):
+                with grid_tabs[t_idx]:
+                    sdf = raw_sheets[sname]
+                    st.caption(f"シート名: **{sname}** (全 {len(sdf)} 行)")
+                    # 写真1枚目と全く同じ 0, 1, 2... の列名＆元配置で全件表示
+                    st.dataframe(sdf, use_container_width=True, height=520)
+        else:
+            # DB正規化テーブル（必要な場合のみ確認可能）
+            if df_current is not None and not df_current.empty:
+                display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "シート名", "登録担当者"] if c in df_current.columns]
+                st.dataframe(df_current[display_cols], use_container_width=True, height=480)
+
+    # B. ファイル未取込（手動入力データのみ）時のフォールバック表示
+    elif df_current is not None and not df_current.empty:
+        total_sum = int(df_current["仕入金額"].sum()) if "仕入金額" in df_current.columns else 0
+        total_q = int(df_current["数量"].sum()) if "数量" in df_current.columns else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("総取引件数", f"{len(df_current):,} 件")
         m2.metric("総数量", f"{total_q:,} 個")
         m3.metric("総仕入金額", f"¥ {total_sum:,}")
         m4.metric("平均単価", f"¥ {int(total_sum / total_q):,}" if total_q > 0 else "¥ 0")
 
-        # 破損データ清掃アラート
-        if mojibake_count > 0:
-            c_warn1, c_warn2 = st.columns([3.5, 1.5])
-            with c_warn1:
-                st.warning(f"⚠️ 過去に登録されたデータ内に {mojibake_count} 件の破損データ（`FL]]...` 等）が含まれています。")
-            with c_warn2:
-                if st.button(f"🧹 破損データ({mojibake_count}件)を一括削除・清掃", key="clean_mojibake_records_btn_tab1", use_container_width=True, type="secondary"):
-                    bad_ids = df_current[mojibake_mask]["id"].dropna().astype(int).tolist()
-                    delete_records_by_ids(bad_ids, deleted_by=current_user)
-                    st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                    st.toast(f"✅ {len(bad_ids)} 件の文字化け破損データを安全に削除しました！")
-                    st.rerun()
-
         display_cols = [c for c in ["id", "日付", "市場番号", "カテゴリー", "商品コード", "品名", "単価", "数量", "仕入金額", "シート名", "登録担当者"] if c in df_current.columns]
-
-        # 2. シート名リストの取得（シート名カラムの存在を100%保証してKeyErrorを根絶）
-        if "シート名" not in summary_source.columns:
-            summary_source["シート名"] = "Sheet1"
-        summary_source["シート名"] = summary_source["シート名"].fillna("").apply(lambda s: str(s).strip() if str(s).strip() else "Sheet1")
-
-        sheet_names_list = [str(s).strip() for s in summary_source["シート名"].unique() if str(s).strip()]
-        if not sheet_names_list:
-            sheet_names_list = ["Sheet1"]
-
-        # 写真1枚目と同じタブ構成を自動生成
-        sheet_tab_titles = [f"🌐 ALL 全シート統合 ({len(summary_source):,}件)"] + [f"📑 {s}" for s in sheet_names_list]
-        sheet_tabs = st.tabs(sheet_tab_titles)
-
-        # A. 全シート統合タブ
-        with sheet_tabs[0]:
-            st.caption(f"※ 件数制限（.head）を撤廃し、全シート合計 **{len(summary_source):,} 件** を完全に表示しています。")
-            st.dataframe(summary_source[display_cols], use_container_width=True, height=520)
-
-        # B. 各シート個別タブ（写真1枚目のプレビューを完全再現）
-        for idx, s_name in enumerate(sheet_names_list, start=1):
-            with sheet_tabs[idx]:
-                sheet_data_df = summary_source[summary_source["シート名"] == s_name]
-                s_total_sub = int(sheet_data_df["仕入金額"].sum()) if "仕入金額" in sheet_data_df.columns else 0
-                s_total_qty = int(sheet_data_df["数量"].sum()) if "数量" in sheet_data_df.columns else 0
-
-                c_sm1, c_sm2 = st.columns([3, 2])
-                c_sm1.caption(f"シート名: **{s_name}** (全 {len(sheet_data_df):,} 行 / 数量計: {s_total_qty:,} 個)")
-                c_sm2.caption(f"シート仕入金額合計: **¥ {s_total_sub:,}**")
-
-                st.dataframe(sheet_data_df[display_cols], use_container_width=True, height=480)
+        st.dataframe(df_current[display_cols], use_container_width=True, height=480)
     else:
         st.info("💡 登録されたデータはまだありません。上のドラッグ＆ドロップまたは手動フォームから記録してください。")
 # ==========================================
