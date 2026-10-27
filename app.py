@@ -3705,36 +3705,37 @@ with tabs[2]:
         </div>
     """, unsafe_allow_html=True)
 
-    # 1. 汎用 Vision AI 伝票・請求書・納品書 高度画像解析エンジン
+    # 1. 汎用 Vision AI 伝票・請求書・納品書 レイアウト・書式・データ統合解析エンジン
     def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         key = _resolve_gemini_key()
+        last_err_msg = ""
+        
         if key:
             import base64
             b64_img = base64.b64encode(image_bytes).decode("utf-8")
-            vision_prompt = """あなたは日本の青果卸売・青果市場・農業流通における手書き伝票、納品書、請求書、受領書、仕入伝票の画像解析を行う最高峰のVision AIです。
-提供された画像に実際に書かれている手書き文字、ゴム印、活字印刷枠を漏れなく認識し、以下の構造を持つ純粋なJSONオブジェクトのみを出力してください（Markdownのバッククォート ```json などの囲みは不要です）。
+            
+            vision_prompt = """あなたは日本の青果卸売・青果市場・農業流通・企業間取引における手書き伝票、納品書、請求書、受領書、仕入伝票の画像解析を行う最高峰のVision AIです。
+提供された画像に実際に書かれている手書き文字、活字印刷枠、ゴム印、表の罫線、位置関係、書式装飾を1セルも漏らさず認識し、Excelで写真と寸分違わぬレイアウトと書式を再現するための構造化JSONを出力してください。
 
-【厳格な抽出ルール】
-1. customer_name: 宛名・納品先（例: 「(株)庄定 様」「○○青果 御中」など、画像に実在する名称。敬称含む）。
-2. issuer_name: 出荷者・荷主・発行元（例: 「築館なめこ生産組合」「JA○○」など）。
-3. date: 取引日・伝票日付。和暦（R8年9月23日、令8.9.23、8.9.23等）は必ず西暦の「YYYY-MM-DD」形式（令和8年=2026年）に換算してください。
-4. items: 明細行の配列。
-   - item_name: 品名・規格・入数（例: 「なめこ 100g A.S. 40入 10/s」「キャベツ」等、画像記載の通り）。
-   - quantity: 数量（箱数・パック数・個数）。不明時は1。
-   - unit_price: 単価（円）。記載がない場合は0。
-   - subtotal: 金額（単価×数量、または行記載の金額）。
-   - tax_rate: 税率（「8%」または「10%」）。
-   - remarks: 規格、等級、ロット番号、記号などの備考。
-5. subtotal_without_tax: 税抜合計金額（記載または明細計）。
-6. tax_amount: 消費税額（記載または計算値）。
-7. total_amount_with_tax: 税込合計金額（請求金額・合計金額）。
-8. slip_type: 伝票種別（「請求書」「納品書」「受領証」「仕入伝票」等）。
+【厳格な抽出・レイアウト再現ルール】
+1. データの捏造・推測補正は一切禁止です。写真に実在する表記を忠実に転写してください。
+2. 表のグリッド構造（行r・列c、1始まり）を正確に割り出し、空白行・空白列も含めて写真上の相対位置関係を完全再現してください。
+3. 結合セル（merges）: 複数セルにまたがる見出しやタイトル、合計欄は "A1:C2" や "B5:E5" の形式で抽出してください。
+4. 書式（font, fill, align, border, numfmt）:
+   - font: b(太字: true/false), sz(フォントサイズpt: 見出し16, 表頭11, 明細10等), color(ARGB 8桁: 例 "FF000000")
+   - fill: 背景塗りつぶし色(ARGB 8桁: 例 "FFF0FDF4", "FFF3F4F6", 白や無しは null)
+   - align: h(left|center|right), v(top|center|bottom), wrap(true/false)
+   - border: 各方向(l, r, t, b)の線種(thin|medium|thick|double|none)
+   - numfmt: 数値や金額には表示形式(例: "#,##0", "¥#,##0", "0")を指定し、数値自体は生の整数または小数を v に設定してください。
+5. 日付: 和暦(例: R8.9.23, 令8年9月23日)などの表記は、セルには写真そのままの文字列を転写し、トップレベルの date キーにはDB登録用として西暦 YYYY-MM-DD(令和8年=2026年)に換算した値を設定してください。
+6. 不確定セル: 薄い・かすれている等で判読しきれないセルは uncertain: true にしてください。
+7. 用紙向き: 横長伝票なら orientation: "landscape"、縦長なら "portrait" にしてください。
 
-【JSON出力フォーマット】
+【出力JSONスキーマ】
 {
-  "slip_type": "請求書",
-  "customer_name": "",
-  "issuer_name": "",
+  "slip_type": "請求書 または 納品書 等",
+  "customer_name": "宛名・納品先（敬称含む）",
+  "issuer_name": "出荷元・荷主・発行者",
   "date": "YYYY-MM-DD",
   "total_amount_with_tax": 0,
   "tax_amount": 0,
@@ -3742,17 +3743,46 @@ with tabs[2]:
   "tax_rate": "8%",
   "items": [
     {
-      "item_name": "",
-      "quantity": 0,
+      "item_name": "品名・規格・入数",
+      "quantity": 1,
       "unit_price": 0,
       "subtotal": 0,
       "tax_rate": "8%",
-      "remarks": ""
+      "remarks": "ロットや等級など"
     }
-  ]
+  ],
+  "layout": {
+    "sheet_name": "納品書",
+    "orientation": "portrait",
+    "col_widths": [12, 24, 10, 14, 14, 10, 18],
+    "row_heights": {"1": 28, "2": 20, "3": 20},
+    "merges": ["A1:D1", "A2:B2"],
+    "cells": [
+      {
+        "r": 1, "c": 1, "v": "納　品　書", "type": "text",
+        "font": {"b": true, "sz": 16, "color": "FF000000"},
+        "fill": null,
+        "align": {"h": "center", "v": "center", "wrap": false},
+        "border": {"l": "none", "r": "none", "t": "none", "b": "double"},
+        "numfmt": null,
+        "uncertain": false
+      }
+    ]
+  }
 }
 """
-            for m_name in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", AI_MODEL_PRIMARY]:
+            # 利用可能なモデルの順次試行リストを構築
+            models_to_try = []
+            if AI_MODEL_PRIMARY:
+                models_to_try.append(AI_MODEL_PRIMARY)
+            for m in AI_MODEL_FALLBACKS:
+                if m and m not in models_to_try:
+                    models_to_try.append(m)
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]:
+                if m not in models_to_try:
+                    models_to_try.append(m)
+
+            for m_name in models_to_try:
                 try:
                     url = f"{GEMINI_API_BASE}/{m_name}:generateContent"
                     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
@@ -3764,90 +3794,527 @@ with tabs[2]:
                                 {"text": vision_prompt}
                             ]
                         }],
-                        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048}
+                        "generationConfig": {
+                            "responseMimeType": "application/json",
+                            "temperature": 0.1,
+                            "maxOutputTokens": 16384
+                        }
                     }
-                    resp = requests.post(url, headers=headers, json=payload, timeout=(10, 45))
+                    resp = requests.post(url, headers=headers, json=payload, timeout=(15, 90))
                     if resp.status_code == 200:
                         txt = _extract_gemini_text(resp.json())
                         if txt:
+                            # コードフェンス除去
                             clean_str = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
                             clean_str = re.sub(r"\s*```$", "", clean_str)
-                            parsed = json.loads(clean_str)
-                            if parsed and isinstance(parsed, dict) and "items" in parsed:
+                            
+                            # JSONパース（末尾切れ修復機能付き）
+                            parsed = None
+                            try:
+                                parsed = json.loads(clean_str)
+                            except Exception:
+                                # 途中で切れた場合の閉じ括弧自動補完
+                                for pad in ["}", "]}", "]}}", "]}}}"]:
+                                    try:
+                                        parsed = json.loads(clean_str + pad)
+                                        break
+                                    except Exception:
+                                        continue
+                            
+                            if parsed and isinstance(parsed, dict):
+                                # 既存互換キーのデフォルト補完
+                                if "items" not in parsed or not isinstance(parsed["items"], list):
+                                    parsed["items"] = []
+                                if "layout" not in parsed or not isinstance(parsed["layout"], dict):
+                                    parsed["layout"] = None
                                 return parsed
-                except Exception:
+                    else:
+                        last_err_msg = f"{m_name}: HTTP {resp.status_code} {resp.text[:100]}"
+                except Exception as ex:
+                    last_err_msg = f"{m_name}: {str(ex)}"
                     continue
+        else:
+            last_err_msg = "Gemini APIキーが設定されていません。"
 
-        # B. APIキー未設定時または通信エラー時の動的テキスト解析フォールバック
-        # 画像バイト列内の特徴やOCR文字列から動的に生成（特定サンプルへの固定化を防止）
-        today_s = datetime.now().strftime("%Y-%m-%d")
+        # 捏造データ（築館なめこや恵バウアー等）は一切返さず、空の結果＋エラー理由を返却
         return {
-            "slip_type": "手書き伝票",
-            "customer_name": "(株)庄定 様",
-            "issuer_name": "築館なめこ生産組合",
-            "date": "2026-09-23",
+            "slip_type": "不明",
+            "customer_name": "",
+            "issuer_name": "",
+            "date": datetime.now().strftime("%Y-%m-%d"),
             "total_amount_with_tax": 0,
             "tax_amount": 0,
             "subtotal_without_tax": 0,
             "tax_rate": "8%",
-            "items": [
-                {
-                    "item_name": "なめこ 100g A.S. 40入 10/s",
-                    "quantity": 10,
-                    "unit_price": 0,
-                    "subtotal": 0,
-                    "tax_rate": "8%",
-                    "remarks": "築館出荷 A.S.40入"
-                }
-            ]
+            "items": [],
+            "layout": None,
+            "error_message": f"AI画像解析に失敗しました ({last_err_msg})" if last_err_msg else "画像の読み取りに失敗しました。"
         }
 
-    # 2. 元伝票の書式・配置関係を完全再現する Excel (.xlsx) バイナリ生成関数
+    # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
+    def _xml_escape(val: Any) -> str:
+        if val is None:
+            return ""
+        s = str(val)
+        clean = "".join(ch for ch in s if ord(ch) >= 32 or ch in "\t\n\r")
+        return (clean.replace("&", "&amp;")
+                     .replace("<", "&lt;")
+                     .replace(">", "&gt;")
+                     .replace('"', "&quot;")
+                     .replace("'", "&apos;"))
+
+    def _generate_styled_xlsx_from_layout(layout: dict, slip_dict: dict) -> bytes:
+        """
+        AIが解析したレイアウト・書式情報から、openpyxl等の外部ライブラリを一切使わず、
+        純粋なZip＋生XMLでExcel規格完全準拠の.xlsxバイナリを構築します。
+        """
+        cells_data = layout.get("cells", []) if isinstance(layout, dict) else []
+        sheet_name = str(layout.get("sheet_name", slip_dict.get("slip_type", "伝票"))).strip()[:31]
+        for ch in [':', '\\', '/', '?', '*', '[', ']']:
+            sheet_name = sheet_name.replace(ch, '_')
+        if not sheet_name:
+            sheet_name = "伝票"
+
+        orientation = layout.get("orientation", "portrait")
+        if orientation not in ("portrait", "landscape"):
+            orientation = "portrait"
+
+        # スタイル重複排除キャッシュ
+        # numFmtId の標準定義
+        std_num_fmts = {
+            "": 0, "general": 0, "@": 49, "0": 1, "0.00": 2,
+            "#,##0": 3, "#,##0.00": 4, "0%": 9, "0.00%": 10,
+            "yyyy-mm-dd": 14, "yyyy/m/d": 14, "m/d": 14
+        }
+        custom_num_fmts = {}  # format_code -> id (164~)
+        next_num_fmt_id = 164
+
+        # Fonts: 0番目は標準フォント
+        fonts = [
+            '<font><sz val="11"/><name val="游ゴシック"/><family val="2"/></font>'
+        ]
+        font_cache = {("游ゴシック", 11, False, None): 0}
+
+        # Fills: 0番目はnone, 1番目はgray125 (OpenXML仕様必須)
+        fills = [
+            '<fill><patternFill patternType="none"/></fill>',
+            '<fill><patternFill patternType="gray125"/></fill>'
+        ]
+        fill_cache = {"none": 0, "gray125": 1}
+
+        # Borders: 0番目は枠線なし
+        borders = [
+            '<border><left/><right/><top/><bottom/><diagonal/></border>'
+        ]
+        border_cache = {("none", "none", "none", "none"): 0}
+
+        # cellXfs: 0番目は標準
+        cell_xfs = [
+            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        ]
+        xf_cache = {(0, 0, 0, 0, "left", "center", False): 0}
+
+        def get_font_id(font_spec: dict) -> int:
+            if not isinstance(font_spec, dict):
+                return 0
+            b = bool(font_spec.get("b", False))
+            sz = int(font_spec.get("sz", 11))
+            sz = max(8, min(72, sz))
+            col = font_spec.get("color")
+            if col and not re.match(r"^[0-9A-Fa-f]{8}$", str(col)):
+                col = None
+            key = ("游ゴシック", sz, b, col)
+            if key in font_cache:
+                return font_cache[key]
+            
+            parts = [f'<sz val="{sz}"/>']
+            if b:
+                parts.append('<b/>')
+            if col:
+                parts.append(f'<color rgb="{col.upper()}"/>')
+            parts.append('<name val="游ゴシック"/><family val="2"/>')
+            xml_str = f'<font>{"".join(parts)}</font>'
+            idx = len(fonts)
+            fonts.append(xml_str)
+            font_cache[key] = idx
+            return idx
+
+        def get_fill_id(fill_spec: Any) -> int:
+            if not fill_spec or not isinstance(fill_spec, str):
+                return 0
+            hex_color = str(fill_spec).strip().replace("#", "").upper()
+            if len(hex_color) == 6:
+                hex_color = "FF" + hex_color
+            if not re.match(r"^[0-9A-Fa-f]{8}$", hex_color):
+                return 0
+            if hex_color in fill_cache:
+                return fill_cache[hex_color]
+            
+            xml_str = f'<fill><patternFill patternType="solid"><fgColor rgb="{hex_color}"/><bgColor indexed="64"/></patternFill></fill>'
+            idx = len(fills)
+            fills.append(xml_str)
+            fill_cache[hex_color] = idx
+            return idx
+
+        valid_border_styles = {"thin", "medium", "thick", "double", "dashed", "dotted", "hair", "none"}
+        def get_border_id(b_spec: dict) -> int:
+            if not isinstance(b_spec, dict):
+                return 0
+            l_s = b_spec.get("l", "none") if b_spec.get("l") in valid_border_styles else "none"
+            r_s = b_spec.get("r", "none") if b_spec.get("r") in valid_border_styles else "none"
+            t_s = b_spec.get("t", "none") if b_spec.get("t") in valid_border_styles else "none"
+            b_s = b_spec.get("b", "none") if b_spec.get("b") in valid_border_styles else "none"
+            
+            key = (l_s, r_s, t_s, b_s)
+            if key in border_cache:
+                return border_cache[key]
+            
+            parts = []
+            for side, st_name in [("left", l_s), ("right", r_s), ("top", t_s), ("bottom", b_s)]:
+                if st_name != "none":
+                    parts.append(f'<{side} style="{st_name}"><color rgb="FF808080"/></{side}>')
+                else:
+                    parts.append(f'<{side}/>')
+            parts.append('<diagonal/>')
+            xml_str = f'<border>{"".join(parts)}</border>'
+            idx = len(borders)
+            borders.append(xml_str)
+            border_cache[key] = idx
+            return idx
+
+        def get_num_fmt_id(fmt_code: str) -> int:
+            nonlocal next_num_fmt_id
+            if not fmt_code or not isinstance(fmt_code, str):
+                return 0
+            clean_fmt = fmt_code.strip()
+            if clean_fmt.lower() in std_num_fmts:
+                return std_num_fmts[clean_fmt.lower()]
+            if clean_fmt in custom_num_fmts:
+                return custom_num_fmts[clean_fmt]
+            
+            fid = next_num_fmt_id
+            next_num_fmt_id += 1
+            custom_num_fmts[clean_fmt] = fid
+            return fid
+
+        def get_xf_id(font_id: int, fill_id: int, border_id: int, num_fmt_id: int, align_spec: dict) -> int:
+            h_align = "left"
+            v_align = "center"
+            wrap = False
+            if isinstance(align_spec, dict):
+                h = align_spec.get("h", "left")
+                if h in ("left", "center", "right", "justify"):
+                    h_align = h
+                v = align_spec.get("v", "center")
+                if v in ("top", "center", "bottom"):
+                    v_align = v
+                wrap = bool(align_spec.get("wrap", False))
+
+            key = (font_id, fill_id, border_id, num_fmt_id, h_align, v_align, wrap)
+            if key in xf_cache:
+                return xf_cache[key]
+
+            applies = []
+            if font_id > 0: applies.append('applyFont="1"')
+            if fill_id > 0: applies.append('applyFill="1"')
+            if border_id > 0: applies.append('applyBorder="1"')
+            if num_fmt_id > 0: applies.append('applyNumberFormat="1"')
+            applies.append('applyAlignment="1"')
+
+            align_xml = f'<alignment horizontal="{h_align}" vertical="{v_align}"'
+            if wrap:
+                align_xml += ' wrapText="1"'
+            align_xml += '/>'
+
+            xf_xml = f'<xf numFmtId="{num_fmt_id}" fontId="{font_id}" fillId="{fill_id}" borderId="{border_id}" xfId="0" {" ".join(applies)}>{align_xml}</xf>'
+            idx = len(cell_xfs)
+            cell_xfs.append(xf_xml)
+            xf_cache[key] = idx
+            return idx
+
+        # グリッドのセルと行データを構築
+        rows_map: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
+        
+        for c_item in cells_data:
+            if not isinstance(c_item, dict):
+                continue
+            r_idx = c_item.get("r", 1)
+            c_idx = c_item.get("c", 1)
+            if not (1 <= r_idx <= 500 and 1 <= c_idx <= 50):
+                continue
+
+            val = c_item.get("v")
+            c_type = c_item.get("type", "text")
+            uncertain = bool(c_item.get("uncertain", False))
+            
+            # 不確定セルの背景強調
+            fill_spec = c_item.get("fill")
+            if uncertain and not fill_spec:
+                fill_spec = "FFFFFBEB"  # 薄い警告イエロー
+
+            f_id = get_font_id(c_item.get("font", {}))
+            fill_id = get_fill_id(fill_spec)
+            b_id = get_border_id(c_item.get("border", {}))
+            nf_id = get_num_fmt_id(c_item.get("numfmt", ""))
+            
+            # 数値型の右寄せ自動調整
+            align_spec = c_item.get("align", {})
+            if isinstance(align_spec, dict) and "h" not in align_spec and c_type == "number":
+                align_spec = dict(align_spec)
+                align_spec["h"] = "right"
+
+            xf_id = get_xf_id(f_id, fill_id, b_id, nf_id, align_spec)
+            cref = f"{col_letter(c_idx - 1)}{r_idx}"
+
+            # セルXMLの構築
+            if val is None or val == "":
+                # 空セルでも書式（罫線・背景色）があれば空要素を出力
+                if xf_id > 0:
+                    rows_map[r_idx].append((c_idx, f'<c r="{cref}" s="{xf_id}"/>'))
+            elif c_type == "number" or (isinstance(val, (int, float)) and not isinstance(val, bool)):
+                num_v = clean_num(val, None)
+                if num_v is not None:
+                    rows_map[r_idx].append((c_idx, f'<c r="{cref}" s="{xf_id}"><v>{num_v}</v></c>'))
+                else:
+                    esc = _xml_escape(val)
+                    rows_map[r_idx].append((c_idx, f'<c r="{cref}" s="{xf_id}" t="inlineStr"><is><t>{esc}</t></is></c>'))
+            else:
+                esc = _xml_escape(val)
+                rows_map[r_idx].append((c_idx, f'<c r="{cref}" s="{xf_id}" t="inlineStr"><is><t>{esc}</t></is></c>'))
+
+        # 列幅設定 (<cols>)
+        cols_xml = []
+        col_widths = layout.get("col_widths", [])
+        if isinstance(col_widths, list) and col_widths:
+            cols_xml.append('<cols>')
+            for col_i, w_val in enumerate(col_widths, start=1):
+                try:
+                    w = float(w_val)
+                    w = max(4.0, min(80.0, w))
+                except Exception:
+                    w = 12.0
+                cols_xml.append(f'<col min="{col_i}" max="{col_i}" width="{w:.1f}" customWidth="1"/>')
+            cols_xml.append('</cols>')
+
+        # 行データ (<sheetData>)
+        row_heights = layout.get("row_heights", {}) if isinstance(layout.get("row_heights"), dict) else {}
+        sheet_data_xml = ['<sheetData>']
+        for r_num in sorted(rows_map.keys()):
+            row_cells = sorted(rows_map[r_num], key=lambda x: x[0])
+            ht_attr = ""
+            h_val = row_heights.get(str(r_num)) or row_heights.get(r_num)
+            if h_val:
+                try:
+                    h_float = float(h_val)
+                    if 10 <= h_float <= 120:
+                        ht_attr = f' ht="{h_float:.1f}" customHeight="1"'
+                except Exception:
+                    pass
+            sheet_data_xml.append(f'<row r="{r_num}"{ht_attr}>')
+            for _, cell_xml in row_cells:
+                sheet_data_xml.append(cell_xml)
+            sheet_data_xml.append('</row>')
+        sheet_data_xml.append('</sheetData>')
+
+        # 結合セル (<mergeCells>)
+        merges_xml = []
+        raw_merges = layout.get("merges", [])
+        if isinstance(raw_merges, list) and raw_merges:
+            valid_merges = []
+            for m in raw_merges:
+                m_str = str(m).strip().upper()
+                if re.match(r"^[A-Z]{1,3}\d+:[A-Z]{1,3}\d+$", m_str):
+                    valid_merges.append(m_str)
+            if valid_merges:
+                merges_xml.append(f'<mergeCells count="{len(valid_merges)}">')
+                for m_ref in valid_merges:
+                    merges_xml.append(f'<mergeCell ref="{m_ref}"/>')
+                merges_xml.append('</mergeCells>')
+
+        # styles.xml の組み立て (厳密な子要素順)
+        styles_parts = [
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        ]
+        # 1. numFmts
+        if custom_num_fmts:
+            styles_parts.append(f'<numFmts count="{len(custom_num_fmts)}">')
+            for fcode, fid in custom_num_fmts.items():
+                styles_parts.append(f'<numFmt numFmtId="{fid}" formatCode="{_xml_escape(fcode)}"/>')
+            styles_parts.append('</numFmts>')
+        # 2. fonts
+        styles_parts.append(f'<fonts count="{len(fonts)}">')
+        styles_parts.extend(fonts)
+        styles_parts.append('</fonts>')
+        # 3. fills
+        styles_parts.append(f'<fills count="{len(fills)}">')
+        styles_parts.extend(fills)
+        styles_parts.append('</fills>')
+        # 4. borders
+        styles_parts.append(f'<borders count="{len(borders)}">')
+        styles_parts.extend(borders)
+        styles_parts.append('</borders>')
+        # 5. cellStyleXfs (仕様で必須)
+        styles_parts.append('<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>')
+        # 6. cellXfs
+        styles_parts.append(f'<cellXfs count="{len(cell_xfs)}">')
+        styles_parts.extend(cell_xfs)
+        styles_parts.append('</cellXfs>')
+        # 7. cellStyles
+        styles_parts.append('<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>')
+        styles_parts.append('</styleSheet>')
+        styles_xml_content = "".join(styles_parts)
+
+        # worksheet XML の組み立て (厳密な子要素順序)
+        ws_parts = [
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+            '<sheetViews><sheetView tabSelected="1" workbookViewId="0"/></sheetViews>',
+            '<sheetFormatPr defaultRowHeight="18" defaultColWidth="11"/>'
+        ]
+        ws_parts.extend(cols_xml)
+        ws_parts.extend(sheet_data_xml)
+        ws_parts.extend(merges_xml)
+        ws_parts.append('<pageMargins left="0.4" right="0.4" top="0.6" bottom="0.6" header="0.2" footer="0.2"/>')
+        ws_parts.append(f'<pageSetup orientation="{orientation}" paperSize="9"/>')  # paperSize 9 = A4
+        ws_parts.append('</worksheet>')
+        worksheet_xml_content = "".join(ws_parts)
+
+        # Zipファイル（.xlsx）の生成
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>""")
+
+            zf.writestr("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""")
+
+            zf.writestr("xl/_rels/workbook.xml.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>""")
+
+            esc_sheet = _xml_escape(sheet_name)
+            zf.writestr("xl/workbook.xml", f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="{esc_sheet}" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>""")
+
+            zf.writestr("xl/styles.xml", styles_xml_content)
+            zf.writestr("xl/worksheets/sheet1.xml", worksheet_xml_content)
+
+        return bio.getvalue()
+
     def build_handwritten_slip_exact_xlsx(slip_dict: dict) -> bytes:
-        stype = slip_dict.get("slip_type", "伝票・納品書")
-        c_name = slip_dict.get("customer_name", "御中")
-        i_name = slip_dict.get("issuer_name", "")
-        s_date = slip_dict.get("date", datetime.now().strftime("%Y-%m-%d"))
+        """
+        AIが検出したレイアウト情報がある場合は完全書式保持でExcelを生成し、
+        レイアウトが無い場合でも架空データを含まない安全なグリッドフォールバックでExcelを生成します。
+        """
+        layout = slip_dict.get("layout") if isinstance(slip_dict, dict) else None
+        
+        # 1. AI抽出レイアウトが存在する場合: 完全書式保持OOXML生成
+        if layout and isinstance(layout, dict) and layout.get("cells"):
+            try:
+                return _generate_styled_xlsx_from_layout(layout, slip_dict)
+            except Exception:
+                pass
+
+        # 2. レイアウト情報が無い場合: 実データに基づきフォールバックグリッドを動的構築（架空データは一切排除）
+        stype = str(slip_dict.get("slip_type") or "伝票").strip()
+        c_name = str(slip_dict.get("customer_name") or "").strip()
+        i_name = str(slip_dict.get("issuer_name") or "").strip()
+        s_date = str(slip_dict.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
         tot_tax = int(clean_num(slip_dict.get("total_amount_with_tax", 0)))
         tax_val = int(clean_num(slip_dict.get("tax_amount", 0)))
         sub_notax = int(clean_num(slip_dict.get("subtotal_without_tax", 0)))
         t_rate = str(slip_dict.get("tax_rate", "8%"))
-        items = slip_dict.get("items", [])
+        items = slip_dict.get("items", []) if isinstance(slip_dict.get("items"), list) else []
 
-        # 元の手書き伝票のグリッド配置を完全マトリクス化（ヘッダー・宛名・発行元・明細・合計）
-        grid_matrix = [
-            ["", "", f"　{stype}　", "", "", "", "No."],
-            [c_name, "", "", "", "", i_name, ""],
-            [f"取引日: {s_date}", "", "下記のとおり納品・請求申し上げます", "", "", "登録番号", ""],
-            ["税込合計金額", f"¥ {tot_tax:,}" if tot_tax > 0 else "-", "", "", "消費税額等", f"¥ {tax_val:,}" if tax_val > 0 else "-", ""],
-            ["品名・規格", "数量", "単価", "金額 (税抜)", "税率", "備考・規格ロット", ""]
-        ]
+        fallback_layout = {
+            "sheet_name": stype or "伝票",
+            "orientation": "portrait",
+            "col_widths": [24, 10, 14, 16, 10, 20],
+            "row_heights": {"1": 28, "2": 22, "3": 20, "4": 20, "5": 22},
+            "merges": ["A1:F1", "A2:C2", "D2:F2", "A3:C3", "D3:F3"],
+            "cells": [
+                {
+                    "r": 1, "c": 1, "v": f"　{stype}　", "type": "text",
+                    "font": {"b": True, "sz": 16, "color": "FF1E293B"},
+                    "align": {"h": "center", "v": "center"},
+                    "border": {"b": "double"}
+                },
+                {
+                    "r": 2, "c": 1, "v": f"宛名: {c_name}" if c_name else "", "type": "text",
+                    "font": {"b": True, "sz": 12}, "align": {"h": "left", "v": "center"}
+                },
+                {
+                    "r": 2, "c": 4, "v": f"発行: {i_name}" if i_name else "", "type": "text",
+                    "font": {"sz": 10}, "align": {"h": "right", "v": "center"}
+                },
+                {
+                    "r": 3, "c": 1, "v": f"取引日: {s_date}", "type": "text",
+                    "font": {"sz": 10}, "align": {"h": "left", "v": "center"}
+                },
+                {
+                    "r": 3, "c": 4, "v": f"合計金額 (税込): ¥{tot_tax:,}" if tot_tax > 0 else "", "type": "text",
+                    "font": {"b": True, "sz": 11, "color": "FF166534"}, "align": {"h": "right", "v": "center"}
+                },
+                # 表ヘッダー
+                {"r": 5, "c": 1, "v": "品名・規格", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 5, "c": 2, "v": "数量", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 5, "c": 3, "v": "単価 (円)", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 5, "c": 4, "v": "金額 (税抜)", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 5, "c": 5, "v": "税率", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 5, "c": 6, "v": "備考・規格ロット", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}}
+            ]
+        }
 
+        # 明細行の追記
+        cur_row = 6
         for it in items:
             q_v = int(clean_num(it.get("quantity", 1)))
             p_v = int(clean_num(it.get("unit_price", 0)))
             sub_v = int(clean_num(it.get("subtotal", p_v * q_v if p_v > 0 else 0)))
-            grid_matrix.append([
-                str(it.get("item_name", "品名未指定")),
-                q_v,
-                p_v if p_v > 0 else "-",
-                sub_v if sub_v > 0 else "-",
-                str(it.get("tax_rate", t_rate)),
-                str(it.get("remarks", "")),
-                ""
+            fallback_layout["cells"].extend([
+                {"r": cur_row, "c": 1, "v": str(it.get("item_name", "")), "type": "text", "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 2, "v": q_v, "type": "number", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 3, "v": p_v if p_v > 0 else "", "type": "number" if p_v > 0 else "text", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 4, "v": sub_v if sub_v > 0 else "", "type": "number" if sub_v > 0 else "text", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 5, "v": str(it.get("tax_rate", t_rate)), "type": "text", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 6, "v": str(it.get("remarks", "")), "type": "text", "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}}
+            ])
+            cur_row += 1
+
+        # 合計行
+        if tot_tax > 0 or sub_notax > 0:
+            fallback_layout["merges"].append(f"A{cur_row}:C{cur_row}")
+            fallback_layout["cells"].extend([
+                {"r": cur_row, "c": 1, "v": "合計 (税抜)", "type": "text", "font": {"b": True}, "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 4, "v": sub_notax if sub_notax > 0 else "", "type": "number", "numfmt": "#,##0", "font": {"b": True}, "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 5, "v": f"消費税 ({t_rate})", "type": "text", "fill": "FFF8FAFC", "align": {"h": "center"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 6, "v": tax_val if tax_val > 0 else "", "type": "number", "numfmt": "#,##0", "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}}
+            ])
+            cur_row += 1
+            fallback_layout["merges"].append(f"A{cur_row}:C{cur_row}")
+            fallback_layout["cells"].extend([
+                {"r": cur_row, "c": 1, "v": "税込総合計", "type": "text", "font": {"b": True, "color": "FF166534"}, "fill": "FFDCFCE7", "align": {"h": "right"}, "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 4, "v": tot_tax if tot_tax > 0 else "", "type": "number", "numfmt": "#,##0", "font": {"b": True, "color": "FF166534"}, "fill": "FFDCFCE7", "align": {"h": "right"}, "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 5, "v": "", "type": "text", "fill": "FFDCFCE7", "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 6, "v": "", "type": "text", "fill": "FFDCFCE7", "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}}
             ])
 
-        # 伝票の罫線・余白行を保持
-        while len(grid_matrix) < 13:
-            grid_matrix.append(["", "", "", "", "", "", ""])
-
-        grid_matrix.append(["合計 (税抜)", "", "", f"¥ {sub_notax:,}" if sub_notax > 0 else "-", f"消費税率 ({t_rate})", f"¥ {tax_val:,}" if tax_val > 0 else "-", ""])
-        grid_matrix.append(["税込総合計", "", "", f"¥ {tot_tax:,}" if tot_tax > 0 else "-", "", "", ""])
-        grid_matrix.append([f"※ 本ファイルは伝票画像（{s_date}）より元配置を完全保持して自動生成されました。", "", "", "", "", "", ""])
-
-        raw_dict = {f"{stype}": pd.DataFrame(grid_matrix)}
-        return export_raw_sheets_to_xlsx_bytes(raw_dict)
-
+        return _generate_styled_xlsx_from_layout(fallback_layout, slip_dict)
     # 3. アップロード & プレビュー UI
     col_u1, col_u2 = st.columns([2.5, 1.5])
     with col_u1:
