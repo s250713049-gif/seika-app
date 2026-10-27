@@ -33,17 +33,35 @@ st.set_page_config(
 
 st.markdown("""
     <style>
+    /* ==========================================
+       1. 基本スタイル & PC向けワイドレイアウト
+       ========================================== */
     .main { background-color: #f8f9fa; }
+    
     .app-header {
         background: linear-gradient(135deg, #1e7e34 0%, #28a745 100%);
         padding: 1.0rem 1.4rem;
         border-radius: 10px;
         color: white;
-        margin-bottom: 1.0rem;
+        margin-bottom: 0.8rem;
         box-shadow: 0 4px 12px rgba(40, 167, 69, 0.15);
     }
-    .app-header h1 { margin: 0; font-size: 1.5rem; font-weight: 700; color: #ffffff; }
-    .app-header p { margin: 2px 0 0 0; opacity: 0.9; font-size: 0.85rem; }
+    .app-header h1 {
+        margin: 0;
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: #ffffff;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .app-header p {
+        margin: 4px 0 0 0;
+        opacity: 0.92;
+        font-size: 0.85rem;
+        line-height: 1.4;
+    }
+    
     .section-title {
         font-size: 1.05rem;
         font-weight: 700;
@@ -52,11 +70,13 @@ st.markdown("""
         border-bottom: 2px solid #e2e8f0;
         padding-bottom: 4px;
     }
+    
     .role-badge-admin { background-color: #dc3545; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .role-badge-staff { background-color: #28a745; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .db-badge-cloud { background-color: #0284c7; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .db-badge-local { background-color: #4b5563; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
     .speed-badge { background-color: #10b981; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+    
     .security-notice {
         background: #f0fdf4;
         border: 1px solid #86efac;
@@ -86,6 +106,111 @@ st.markdown("""
         padding: 14px 18px;
         border-radius: 10px;
         margin-bottom: 14px;
+    }
+
+    /* ==========================================
+       2. スマートフォン（携帯）向け最適化メディアクエリ (幅 768px 以下)
+       ========================================== */
+    @media (max-width: 768px) {
+        /* 全体の左右余白をスマホ画面に合わせてスリム化 */
+        .block-container {
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+            padding-top: 1.0rem !important;
+            padding-bottom: 2.0rem !important;
+        }
+
+        /* ヘッダーバナーの文字サイズと余白調整 */
+        .app-header {
+            padding: 0.8rem 1.0rem !important;
+            border-radius: 8px !important;
+            margin-bottom: 0.6rem !important;
+        }
+        .app-header h1 {
+            font-size: 1.15rem !important;
+            line-height: 1.3 !important;
+        }
+        .app-header p {
+            font-size: 0.75rem !important;
+            line-height: 1.35 !important;
+            word-break: break-all !important;
+        }
+
+        /* 上部タブリストの横スクロール化（折り返し崩れを防止しスワイプ可能に） */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 6px !important;
+            overflow-x: auto !important;
+            overflow-y: hidden !important;
+            white-space: nowrap !important;
+            flex-wrap: nowrap !important;
+            -webkit-overflow-scrolling: touch !important;
+            padding-bottom: 6px !important;
+            margin-bottom: 8px !important;
+            scrollbar-width: thin !important;
+        }
+        .stTabs [data-baseweb="tab"] {
+            font-size: 0.8rem !important;
+            padding: 8px 12px !important;
+            white-space: nowrap !important;
+            border-radius: 6px !important;
+            background-color: #f1f5f9 !important;
+            margin-right: 4px !important;
+        }
+        .stTabs [aria-selected="true"] {
+            background-color: #dcfce7 !important;
+            color: #166534 !important;
+            font-weight: 700 !important;
+        }
+
+        /* 横並びボタンやカラム（stHorizontalBlock）の自動縦並び化（横潰れ防止） */
+        [data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+            gap: 8px !important;
+        }
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+            margin-bottom: 2px !important;
+        }
+
+        /* ボタンのタッチ領域拡大（指で押しやすい高さ44px以上を確保） */
+        .stButton button, .stDownloadButton button {
+            width: 100% !important;
+            min-height: 44px !important;
+            font-size: 0.9rem !important;
+            padding: 10px 14px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+
+        /* 指標メトリクスのスマホ表示最適化 */
+        [data-testid="stMetric"] {
+            padding: 8px 12px !important;
+            border-radius: 8px !important;
+            background: #ffffff !important;
+            border: 1px solid #e2e8f0 !important;
+            margin-bottom: 6px !important;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.25rem !important;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.75rem !important;
+        }
+
+        /* データテーブル・エディタのスマホ横幅100%フィット & 横スワイプ保証 */
+        [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
+            width: 100% !important;
+            overflow-x: auto !important;
+            -webkit-overflow-scrolling: touch !important;
+        }
+
+        /* スマホでのフォーム入力時に勝手に画面がズームインする現象を防止 (iOS対策: 16px) */
+        .stTextInput input, .stNumberInput input, .stSelectbox select, .stDateInput input {
+            font-size: 16px !important;
+        }
     }
     </style>
 """, unsafe_allow_html=True)
@@ -2580,11 +2705,17 @@ with st.sidebar:
         st.query_params.clear()
         st.rerun()
 
-# ヘッダーバナー
+# ヘッダーバナー（PC・スマートフォン自動レスポンシブ対応）
 st.markdown(f"""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p>担当者: {current_user} | 課選択自動反映・旧.xls全シート保持変換・不整合ゼロ照合・BCP耐障害性</p>
+        <p>
+            <b>担当者:</b> {current_user} ｜ 
+            <span>課選択自動反映</span> ｜ 
+            <span>旧.xls全シート保持変換</span> ｜ 
+            <span>不整合ゼロ照合</span> ｜ 
+            <span>BCP耐障害性</span>
+        </p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -2592,7 +2723,7 @@ st.markdown(f"""
 df_current = load_records_from_db(target_user_for_query)
 
 # ==========================================
-# 12. タブ構成
+# 12. タブ構成（PC横並び & スマホ横スワイプ対応）
 # ==========================================
 tab_titles = [
     "⚡ 高速連続入力 & 自動記録",
