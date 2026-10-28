@@ -2373,14 +2373,14 @@ if st.session_state.logged_in_user is None:
             st.session_state.user_role = verified_session["role"]
 
 # ==========================================
-# 10. ログインポータル画面
+# 10. ログインポータル画面 (URLトークン露出の完全廃止)
 # ==========================================
 if st.session_state.logged_in_user is None:
     st.markdown("""
         <div style="text-align: center; margin-top: 30px;">
             <span style="font-size: 54px;">🍎</span>
             <h1 style="color: #1e7e34; margin-bottom: 4px;">青果卸売 在庫・取引管理 Pro</h1>
-            <p style="color: #718096; font-size: 14px;">連続入力高速化・PostgreSQLクラウド同期・BCP耐スリープ対応</p>
+            <p style="color: #718096; font-size: 14px;">本番運用版・セキュア暗号化セッション・高速排他制御</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -2388,52 +2388,37 @@ if st.session_state.logged_in_user is None:
     with col_l2:
         with st.form("login_form"):
             username_input = st.text_input("👤 ユーザーID", placeholder="admin, user1, staff_a 等")
-            password_input = st.text_input("🔒 パスワード", type="password", placeholder="••••••••")
+            password_input = st.text_input("🔒 パスワード", type="password")
             submit_login = st.form_submit_button("安全にログインする", use_container_width=True, type="primary")
             
             if submit_login:
                 user_auth = verify_user_login(username_input, password_input)
                 if user_auth:
+                    # 🔐 URLクエリではなく内部セッションのみで安全に管理
                     st.session_state.logged_in_user = user_auth["username"]
                     st.session_state.user_role = user_auth["role"]
-                    token = create_session_token(user_auth["username"], user_auth["role"])
-                    st.query_params["auth_token"] = token
+                    st.session_state.session_token_id = str(uuid.uuid4())
+                    st.session_state.session_expires = time.time() + (12 * 3600)  # TTL 12時間
+                    st.toast("✅ 認証に成功しました")
                     st.rerun()
                 else:
-                    st.error("❌ IDまたはパスワードが無効です（PBKDF2暗号化照合失敗）")
-
-        st.write("")
-        st.caption("テスト用クイック認証:")
-        q1, q2, q3 = st.columns(3)
-        with q1:
-            if st.button("👑 管理者(admin)", use_container_width=True):
-                st.session_state.logged_in_user = "admin"
-                st.session_state.user_role = "admin"
-                st.query_params["auth_token"] = create_session_token("admin", "admin")
-                st.rerun()
-        with q2:
-            if st.button("👤 一般社員(user1)", use_container_width=True):
-                st.session_state.logged_in_user = "user1"
-                st.session_state.user_role = "staff"
-                st.query_params["auth_token"] = create_session_token("user1", "staff")
-                st.rerun()
-        with q3:
-            if st.button("👤 業務課(staff_a)", use_container_width=True):
-                st.session_state.logged_in_user = "staff_a"
-                st.session_state.user_role = "staff"
-                st.query_params["auth_token"] = create_session_token("staff_a", "staff")
-                st.rerun()
+                    st.error("❌ ユーザーIDまたはパスワードが無効です")
 
     st.stop()
 
+# セッション有効期限（TTL）チェック
+if time.time() > st.session_state.get("session_expires", 0):
+    st.session_state.clear()
+    st.warning("⚠️ セッション有効期限が切れました。再度ログインしてください。")
+    st.rerun()
+
 # ==========================================
-# 11. メイン画面ヘッダー & サイドバー
+# 11. メイン画面ヘッダー & サイドバー（一般社員PW自己変更UI対応）
 # ==========================================
 current_user = st.session_state.logged_in_user
 user_role = st.session_state.user_role
 is_admin = (user_role == "admin")
 
-# サイドバー設定
 with st.sidebar:
     st.markdown("### 🏢 システム情報")
     if is_admin:
@@ -2441,65 +2426,59 @@ with st.sidebar:
     else:
         st.markdown('<span class="role-badge-staff">👤 営業スタッフ (Staff)</span>', unsafe_allow_html=True)
     
-    st.write(f"ログイン中: **{current_user}**")
+    st.write(f"ログイン中: **{html.escape(current_user)}**")
     
     if is_using_cloud_db():
         st.markdown('<span class="db-badge-cloud">☁️ Cloud PostgreSQL 稼働中</span>', unsafe_allow_html=True)
     else:
-        st.markdown('<span class="db-badge-local">💾 ローカル SQLite 稼働中</span>', unsafe_allow_html=True)
-    st.markdown('<span class="speed-badge">⚡ 高速入力・BCP常時バックアップ</span>', unsafe_allow_html=True)
+        st.markdown('<span class="db-badge-local">💾 SQLite (WALロック防止) 稼働中</span>', unsafe_allow_html=True)
 
     st.divider()
 
-    # 表示対象ユーザーの絞り込み（管理者は全員分、一般は自分のみデフォルト）
+    # 🔐 一般スタッフ向けパスワード自己変更モーダル
+    with st.expander("🔒 パスワード変更", expanded=False):
+        with st.form("self_pw_change_form"):
+            cur_p = st.text_input("現在のパスワード", type="password")
+            new_p1 = st.text_input("新しいパスワード (6文字以上)", type="password")
+            new_p2 = st.text_input("新しいパスワード (確認)", type="password")
+            if st.form_submit_button("パスワードを更新", use_container_width=True):
+                auth_chk = verify_user_login(current_user, cur_p)
+                if not auth_chk:
+                    st.error("現在のパスワードが正しくありません。")
+                elif len(new_p1) < 6:
+                    st.error("新しいパスワードは6文字以上で設定してください。")
+                elif new_p1 != new_p2:
+                    st.error("新しいパスワードが一致しません。")
+                else:
+                    with execute_with_retry() as conn:
+                        conn.execute(
+                            text("UPDATE users SET password_hash = :p WHERE username = :u"),
+                            {"p": hash_password(new_p1), "u": current_user}
+                        )
+                    st.success("パスワードを変更しました！")
+
     if is_admin:
         all_users = get_all_users_from_db()
         user_filter_options = ["全員のデータを表示"] + [u["username"] for u in all_users]
-        chosen_filter = st.selectbox(
-            "👥 取引データの閲覧対象:",
-            options=user_filter_options,
-            index=0,
-            key="sb_user_filter"
-        )
+        chosen_filter = st.selectbox("👥 取引データの閲覧対象:", options=user_filter_options, index=0)
         target_user_for_query = None if chosen_filter == "全員のデータを表示" else chosen_filter
     else:
         target_user_for_query = current_user
-        st.caption(f"※ あなたの登録データ ({current_user}) を表示中")
 
     st.divider()
-
-    # Gemini APIキー設定
-    with st.expander("🔑 AI / API 設定 (任意)", expanded=False):
-        curr_key = st.session_state.get("custom_gemini_api_key", "")
-        new_k = st.text_input("Gemini API Key", value=curr_key, type="password", key="gemini_key_input_sb")
-        if new_k != curr_key:
-            st.session_state.custom_gemini_api_key = new_k
-            st.toast("✅ APIキーを保存しました")
-
-    st.write("")
     if st.button("🚪 ログアウト", use_container_width=True):
-        st.session_state.logged_in_user = None
-        st.session_state.user_role = None
-        st.query_params.clear()
+        st.session_state.clear()
         st.rerun()
 
-# ヘッダーバナー（PC・スマートフォン自動レスポンシブ対応）
+# ヘッダーバナー（XSS防止 HTML エスケープ適用）
 st.markdown(f"""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p>
-            <b>担当者:</b> {current_user} ｜ 
-            <span>課選択自動反映</span> ｜ 
-            <span>旧.xls全シート保持変換</span> ｜ 
-            <span>不整合ゼロ照合</span> ｜ 
-            <span>BCP耐障害性</span>
-        </p>
+        <p><b>担当者:</b> {html.escape(current_user)} ｜ <b>権限:</b> {html.escape(user_role)} ｜ <b>排他制御:</b> WAL・リトライ稼働中</p>
     </div>
 """, unsafe_allow_html=True)
 
-# 該当データのロード
 df_current = load_records_from_db(target_user_for_query)
-
 # ==========================================
 # 12. タブ構成（PC横並び & スマホ横スワイプ対応）
 # ==========================================
