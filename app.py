@@ -471,29 +471,24 @@ def register_new_user_db(username, password, role="staff", display_name=""):
     except Exception as e:
         return False, f"登録エラー: {e}"
 # ==========================================
-# 5. 取引データ永続化 & 高速キャッシュ & RBACアクセス制御
+# 5. 取引データ永続化・論理削除・RBAC・非同期バックアップ
 # ==========================================
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False)
 def load_records_cached(target_user_filter: str = None):
+    """論理削除されていないデータ（is_deleted = 0）のみを高速抽出"""
     engine = get_engine()
     with engine.connect() as conn:
-        try:
-            conn.execute(text("ALTER TABLE transactions ADD COLUMN sheet_name TEXT DEFAULT '';"))
-        except Exception:
-            pass
-
-        cols_query = "SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at FROM transactions"
-        try:
-            if target_user_filter and target_user_filter != "全員のデータを表示":
-                df = pd.read_sql(text(f"{cols_query} WHERE user_id = :uid ORDER BY date DESC, id DESC"), conn, params={"uid": target_user_filter})
-            else:
-                df = pd.read_sql(text(f"{cols_query} ORDER BY date DESC, id DESC"), conn)
-        except Exception:
-            fallback_query = "SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at FROM transactions"
-            if target_user_filter and target_user_filter != "全員のデータを表示":
-                df = pd.read_sql(text(f"{fallback_query} WHERE user_id = :uid ORDER BY date DESC, id DESC"), conn, params={"uid": target_user_filter})
-            else:
-                df = pd.read_sql(text(f"{fallback_query} ORDER BY date DESC, id DESC"), conn)
+        cols = "id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at"
+        if target_user_filter and target_user_filter != "全員のデータを表示":
+            df = pd.read_sql(
+                text(f"SELECT {cols} FROM transactions WHERE is_deleted = 0 AND user_id = :uid ORDER BY date DESC, id DESC"),
+                conn, params={"uid": target_user_filter}
+            )
+        else:
+            df = pd.read_sql(
+                text(f"SELECT {cols} FROM transactions WHERE is_deleted = 0 ORDER BY date DESC, id DESC"),
+                conn
+            )
             
     df = df.rename(columns={
         "date": "日付", "market_number": "市場番号", "category": "カテゴリー",
@@ -504,9 +499,9 @@ def load_records_cached(target_user_filter: str = None):
     if not df.empty:
         df["商品名"] = df["品名"]
         df["小計"] = df["仕入金額"]
+        df["合計"] = df["仕入金額"]
         df["支払金額"] = 0
         df["差引残高"] = df["仕入金額"]
-        df["合計"] = df["仕入金額"]
 
     if "シート名" not in df.columns:
         df["シート名"] = "Sheet1"
@@ -521,158 +516,101 @@ def invalidate_records_cache():
     gc.collect()
 
 def insert_records_to_db(user_id: str, records: list, auto_backup=True):
-    if not records:
-        return
-    engine = get_engine()
+    if not records: return
     now_ts = datetime.now()
-    with engine.begin() as conn:
-        try:
-            conn.execute(text("ALTER TABLE transactions ADD COLUMN sheet_name TEXT DEFAULT '';"))
-        except Exception:
-            pass
+    with execute_with_retry() as conn:
         for r in records:
-            p = int(r.get("単価", 0))
-            q = int(r.get("数量", 0))
-            sub = int(r.get("仕入金額", r.get("小計", p * q)))
+            p = int(clean_num(r.get("単価", 0)))
+            q = int(clean_num(r.get("数量", 0)))
+            sub = int(clean_num(r.get("仕入金額", r.get("小計", p * q))))
             item_n = str(r.get("品名", r.get("商品名", "品名未指定"))).strip() or "品名未指定"
             sheet_n = str(r.get("シート名", r.get("sheet_name", ""))).strip() or "Sheet1"
-            try:
-                conn.execute(
-                    text("""
-                        INSERT INTO transactions 
-                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at)
-                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, :cat)
-                    """),
-                    {
-                        "d": str(r.get("日付", now_ts.strftime("%Y-%m-%d"))),
-                        "m": str(r.get("市場番号", "M-001")),
-                        "c": str(r.get("カテゴリー", "1課 (熊谷・大宮)")),
-                        "ic": str(r.get("商品コード", "AUTO")),
-                        "in": item_n,
-                        "p": p,
-                        "q": q,
-                        "sub": sub,
-                        "u": user_id,
-                        "sn": sheet_n,
-                        "cat": now_ts
-                    }
-                )
-            except Exception:
-                conn.execute(
-                    text("""
-                        INSERT INTO transactions 
-                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, created_at)
-                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :cat)
-                    """),
-                    {
-                        "d": str(r.get("日付", now_ts.strftime("%Y-%m-%d"))),
-                        "m": str(r.get("市場番号", "M-001")),
-                        "c": str(r.get("カテゴリー", "1課 (熊谷・大宮)")),
-                        "ic": str(r.get("商品コード", "AUTO")),
-                        "in": item_n,
-                        "p": p, "q": q, "sub": sub, "u": user_id, "cat": now_ts
-                    }
-                )
+            conn.execute(
+                text("""
+                    INSERT INTO transactions 
+                    (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, is_deleted, created_at)
+                    VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, 0, :cat)
+                """),
+                {
+                    "d": str(r.get("日付", now_ts.strftime("%Y-%m-%d"))),
+                    "m": str(r.get("市場番号", "M-001")),
+                    "c": str(r.get("カテゴリー", "1課 (熊谷・大宮)")),
+                    "ic": str(r.get("商品コード", "AUTO")),
+                    "in": item_n, "p": p, "q": q, "sub": sub, "u": user_id, "sn": sheet_n, "cat": now_ts
+                }
+            )
     invalidate_records_cache()
     if auto_backup:
-        create_backup_snapshot(user_id, trigger_reason=f"自動追記バックアップ ({len(records)}件記録)")
+        create_backup_snapshot_async(user_id, trigger_reason=f"自動追記バックアップ ({len(records)}件記録)")
 
 def update_single_record_in_db(record_dict: dict, operator_user: str = "admin", operator_role: str = "admin") -> Tuple[bool, str]:
-    """
-    ③ 部署・ロール別アクセス権限（RBAC）ガード付きレコード更新
-    staff は「自分が登録したデータ（user_id == operator_user）」のみ更新可能
-    """
     rec_id = record_dict.get("id")
-    if not rec_id:
-        return False, "IDが指定されていません"
+    if not rec_id: return False, "IDが指定されていません"
     
     engine = get_engine()
-    # RBAC 権限チェック
     if operator_role != "admin":
         with engine.connect() as conn:
-            owner_row = conn.execute(
-                text("SELECT user_id FROM transactions WHERE id = :rid"),
-                {"rid": rec_id}
-            ).fetchone()
-            if owner_row and str(owner_row[0]).strip() != str(operator_user).strip():
-                return False, f"権限エラー: 他の担当者（{owner_row[0]}）が登録したデータは変更できません。"
+            owner = conn.execute(text("SELECT user_id FROM transactions WHERE id = :rid"), {"rid": rec_id}).scalar()
+            if owner and str(owner).strip() != str(operator_user).strip():
+                return False, f"権限エラー: 他担当者（{owner}）のデータは変更できません。"
 
-    p = int(record_dict.get("単価", 0))
-    q = int(record_dict.get("数量", 0))
-    sub = int(record_dict.get("仕入金額", record_dict.get("小計", p * q)))
+    p = int(clean_num(record_dict.get("単価", 0)))
+    q = int(clean_num(record_dict.get("数量", 0)))
+    sub = int(clean_num(record_dict.get("仕入金額", r_sub := p * q)))
     item_n = str(record_dict.get("品名", record_dict.get("商品名", "品名未指定"))).strip() or "品名未指定"
     sheet_n = str(record_dict.get("シート名", "Sheet1")).strip() or "Sheet1"
 
-    with engine.begin() as conn:
-        conn.execute(
+    with execute_with_retry() as conn:
+        res = conn.execute(
             text("""
                 UPDATE transactions
-                SET date = :d,
-                    market_number = :m,
-                    category = :c,
-                    item_code = :ic,
-                    item_name = :in,
-                    unit_price = :p,
-                    quantity = :q,
-                    subtotal = :sub,
-                    sheet_name = :sn
-                WHERE id = :rid
+                SET date = :d, market_number = :m, category = :c, item_code = :ic,
+                    item_name = :in, unit_price = :p, quantity = :q, subtotal = :sub, sheet_name = :sn
+                WHERE id = :rid AND is_deleted = 0
             """),
             {
-                "d": str(record_dict.get("日付", "")),
-                "m": str(record_dict.get("市場番号", "")),
-                "c": str(record_dict.get("カテゴリー", "")),
-                "ic": str(record_dict.get("商品コード", "")),
-                "in": item_n,
-                "p": p, "q": q, "sub": sub, "sn": sheet_n, "rid": rec_id
+                "d": str(record_dict.get("日付", "")), "m": str(record_dict.get("市場番号", "")),
+                "c": str(record_dict.get("カテゴリー", "")), "ic": str(record_dict.get("商品コード", "")),
+                "in": item_n, "p": p, "q": q, "sub": sub, "sn": sheet_n, "rid": rec_id
             }
         )
+        if res.rowcount == 0: return False, "更新対象データが存在しません。"
     invalidate_records_cache()
     return True, "更新が完了しました"
 
 def delete_records_by_ids(ids: list, deleted_by: str, operator_role: str = "admin") -> Tuple[int, int, List[dict]]:
-    """
-    ③ 部署・ロール別アクセス権限（RBAC）ガード付きレコード削除
-    staff は自身が登録したレコードのみ削除可能。権限外レコードは安全にスキップ。
-    退避テーブル `deleted_transactions` に記録し、ワンクリック復元用リストを返却。
-    返り値: (削除成功件数, スキップ件数, 削除レコード辞書リスト)
-    """
-    if not ids:
-        return 0, 0, []
+    """🗄️ 論理削除（is_deleted = 1）による安全な削除と監査履歴保持"""
+    if not ids: return 0, 0, []
     engine = get_engine()
-    deleted_count = 0
-    skipped_count = 0
-    deleted_records = []
+    deleted_count, skipped_count, deleted_records = 0, 0, []
+    now_ts = datetime.now()
 
-    with engine.begin() as conn:
+    with execute_with_retry() as conn:
         for rid in ids:
             row = conn.execute(
-                text("SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name FROM transactions WHERE id = :rid"),
+                text("SELECT id, date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name FROM transactions WHERE id = :rid AND is_deleted = 0"),
                 {"rid": rid}
             ).fetchone()
-            if not row:
-                continue
+            if not row: continue
 
-            # staff の場合は他者のレコード削除を拒否
             if operator_role != "admin" and str(row[9]).strip() != str(deleted_by).strip():
                 skipped_count += 1
                 continue
 
             rec_dict = {
-                "original_id": row[0],
-                "date": str(row[1]),
-                "market_number": str(row[2]),
-                "category": str(row[3]),
-                "item_code": str(row[4]),
-                "item_name": str(row[5]),
-                "unit_price": int(row[6]),
-                "quantity": int(row[7]),
-                "subtotal": int(row[8]),
-                "user_id": str(row[9]),
-                "sheet_name": str(row[10]) if len(row) > 10 and row[10] else "Sheet1"
+                "original_id": row[0], "date": str(row[1]), "market_number": str(row[2]),
+                "category": str(row[3]), "item_code": str(row[4]), "item_name": str(row[5]),
+                "unit_price": int(row[6]), "quantity": int(row[7]), "subtotal": int(row[8]),
+                "user_id": str(row[9]), "sheet_name": str(row[10]) if row[10] else "Sheet1"
             }
             deleted_records.append(rec_dict)
 
+            # 論理削除の適用
+            conn.execute(
+                text("UPDATE transactions SET is_deleted = 1, deleted_at = :cat, deleted_by = :db WHERE id = :rid"),
+                {"cat": now_ts, "db": deleted_by, "rid": rid}
+            )
+            # 互換用退避テーブルへの記録
             conn.execute(
                 text("""
                     INSERT INTO deleted_transactions
@@ -682,259 +620,68 @@ def delete_records_by_ids(ids: list, deleted_by: str, operator_role: str = "admi
                 {
                     "oid": row[0], "d": row[1], "m": row[2], "c": row[3], "ic": row[4],
                     "in": row[5], "p": row[6], "q": row[7], "sub": row[8], "u": row[9],
-                    "sn": row[10] if len(row) > 10 else "", "db": deleted_by
+                    "sn": row[10] or "", "db": deleted_by
                 }
             )
-            conn.execute(text("DELETE FROM transactions WHERE id = :rid"), {"rid": rid})
             deleted_count += 1
 
     invalidate_records_cache()
     if deleted_count > 0:
-        create_backup_snapshot(deleted_by, trigger_reason=f"データ削除前自動退避 ({deleted_count}件削除)")
-        # セッションに直前の削除レコードを退避保持
+        create_backup_snapshot_async(deleted_by, trigger_reason=f"データ論理削除 ({deleted_count}件削除)")
         st.session_state.last_deleted_records = deleted_records
 
     return deleted_count, skipped_count, deleted_records
 
 def restore_last_deleted_records_db(records_to_restore: list, restored_by: str = "admin") -> int:
-    """
-    誤削除データをDBへ安全に復帰（UNDO復元）
-    退避テーブル（deleted_transactions）からも削除し、完全復元します。
-    """
-    if not records_to_restore:
-        return 0
-    engine = get_engine()
-    now_ts = datetime.now()
+    """論理削除フラグを戻す（is_deleted = 0）によるワンクリック復元"""
+    if not records_to_restore: return 0
     restored_count = 0
-    with engine.begin() as conn:
+    with execute_with_retry() as conn:
         for r in records_to_restore:
-            p = int(r.get("unit_price", r.get("単価", 0)))
-            q = int(r.get("quantity", r.get("数量", 0)))
-            sub = int(r.get("subtotal", r.get("仕入金額", r.get("小計", p * q))))
-            item_n = str(r.get("item_name", r.get("品名", r.get("商品名", "品名未指定")))).strip() or "品名未指定"
-            sheet_n = str(r.get("sheet_name", r.get("シート名", "Sheet1"))).strip() or "Sheet1"
-            conn.execute(
-                text("""
-                    INSERT INTO transactions 
-                    (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at)
-                    VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, :cat)
-                """),
-                {
-                    "d": str(r.get("date", r.get("日付", now_ts.strftime("%Y-%m-%d")))),
-                    "m": str(r.get("market_number", r.get("市場番号", "M-001"))),
-                    "c": str(r.get("category", r.get("カテゴリー", "1課 (熊谷・大宮)"))),
-                    "ic": str(r.get("item_code", r.get("商品コード", "AUTO"))),
-                    "in": item_n,
-                    "p": p,
-                    "q": q,
-                    "sub": sub,
-                    "u": str(r.get("user_id", r.get("登録担当者", restored_by))),
-                    "sn": sheet_n,
-                    "cat": now_ts
-                }
-            )
-            restored_count += 1
             orig_id = r.get("original_id", r.get("id"))
             if orig_id:
-                try:
-                    conn.execute(text("DELETE FROM deleted_transactions WHERE original_id = :oid"), {"oid": orig_id})
-                except Exception:
-                    pass
+                res = conn.execute(
+                    text("UPDATE transactions SET is_deleted = 0, deleted_at = NULL, deleted_by = NULL WHERE id = :oid"),
+                    {"oid": orig_id}
+                )
+                if res.rowcount > 0:
+                    restored_count += 1
+                    try:
+                        conn.execute(text("DELETE FROM deleted_transactions WHERE original_id = :oid"), {"oid": orig_id})
+                    except Exception: pass
     invalidate_records_cache()
-    if restored_count > 0:
-        create_backup_snapshot(restored_by, trigger_reason=f"誤削除データ復元 ({restored_count}件復元)")
     return restored_count
-def get_employee_summary_stats():
-    engine = get_engine()
-    with engine.connect() as conn:
-        query = text("""
-            SELECT user_id, 
-                   COUNT(*) as record_count, 
-                   SUM(subtotal) as total_amount, 
-                   SUM(quantity) as total_quantity,
-                   MAX(date) as last_activity
-            FROM transactions
-            GROUP BY user_id
-            ORDER BY total_amount DESC
-        """)
-        df = pd.read_sql(query, conn)
-    return df
 
-# ==========================================
-# 6. バックアップ & クラウドDB二重退避復元エンジン
-# ==========================================
-def create_backup_snapshot(user_id: str, trigger_reason="定期自動バックアップ"):
-    """
-    ④ クラウド環境永続化対応バックアップ作成
-    ローカルファイル（JSON）保存に加え、DB内 `backup_logs` テーブルへも完全保存し、
-    Streamlit Cloud の再起動・ファイル消失時にも確実な復旧を保証します。
-    """
+# 🚀 ディスク I/O の非同期化（バックアップ処理によるUIフリーズの完全防止）
+def _bg_backup_task(user_id: str, trigger_reason: str):
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    engine = get_engine()
-    with engine.connect() as conn:
-        df_all = pd.read_sql("SELECT * FROM transactions ORDER BY id ASC", conn)
-    
-    meta = {
-        "timestamp": now_str,
-        "created_by": user_id,
-        "reason": trigger_reason,
-        "record_count": len(df_all),
-        "total_subtotal": int(df_all["subtotal"].sum()) if not df_all.empty and "subtotal" in df_all.columns else 0
-    }
-    bk_filename = f"backup_{now_str}.json"
-    payload = {
-        "meta": meta,
-        "records": df_all.to_dict(orient="records")
-    }
-    payload_json_str = json.dumps(payload, ensure_ascii=False, indent=2)
-
-    # 1. ローカルディスク保存
-    try:
-        bk_path = os.path.join(BACKUP_DIR, bk_filename)
-        with open(bk_path, "w", encoding="utf-8") as f:
-            f.write(payload_json_str)
-    except Exception:
-        pass
-
-    # 2. データベース（PostgreSQL / SQLite）内の backup_logs テーブルへ二重永続化
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO backup_logs 
-                    (filename, timestamp, created_by, reason, record_count, total_subtotal, payload_json)
-                    VALUES (:fn, :ts, :cb, :rs, :rc, :sub, :pj)
-                """),
-                {
-                    "fn": bk_filename,
-                    "ts": now_str,
-                    "cb": user_id,
-                    "rs": trigger_reason,
-                    "rc": meta["record_count"],
-                    "sub": meta["total_subtotal"],
-                    "pj": payload_json_str
-                }
-            )
-    except Exception:
-        pass
-
-    return bk_filename
-
-def list_all_backups():
-    """DBテーブル（backup_logs）とローカルファイルを統合・重複排除してリスト化"""
-    backups_dict = {}
-
-    # 1. DBテーブルからの取得
     engine = get_engine()
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("SELECT filename, timestamp, created_by, reason, record_count, total_subtotal FROM backup_logs ORDER BY id DESC")).fetchall()
-            for r in rows:
-                backups_dict[r[0]] = {
-                    "filepath": None,
-                    "filename": r[0],
-                    "timestamp": r[1],
-                    "created_by": r[2],
-                    "reason": r[3],
-                    "record_count": r[4],
-                    "total_subtotal": r[5],
-                    "source": "db"
-                }
-    except Exception:
-        pass
+            df_all = pd.read_sql("SELECT * FROM transactions WHERE is_deleted = 0 ORDER BY id ASC", conn)
+        meta = {
+            "timestamp": now_str, "created_by": user_id, "reason": trigger_reason,
+            "record_count": len(df_all), "total_subtotal": int(df_all["subtotal"].sum()) if not df_all.empty else 0
+        }
+        bk_filename = f"backup_{now_str}.json"
+        payload = {"meta": meta, "records": df_all.to_dict(orient="records")}
+        payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
 
-    # 2. ローカルファイルの取得
-    files = glob.glob(os.path.join(BACKUP_DIR, "backup_*.json"))
-    files.sort(reverse=True)
-    for fp in files:
-        fname = os.path.basename(fp)
-        if fname in backups_dict:
-            backups_dict[fname]["filepath"] = fp
-            continue
-        try:
-            with open(fp, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                meta = d.get("meta", {})
-                backups_dict[fname] = {
-                    "filepath": fp,
-                    "filename": fname,
-                    "timestamp": meta.get("timestamp", "不明"),
-                    "created_by": meta.get("created_by", "system"),
-                    "reason": meta.get("reason", "自動作成"),
-                    "record_count": meta.get("record_count", 0),
-                    "total_subtotal": meta.get("total_subtotal", 0),
-                    "source": "file"
-                }
-        except Exception:
-            continue
+        with open(os.path.join(BACKUP_DIR, bk_filename), "w", encoding="utf-8") as f:
+            f.write(payload_json)
 
-    backups = list(backups_dict.values())
-    backups.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
-    return backups
-
-def restore_from_backup_target(backup_item: dict, restored_by: str):
-    """ファイルまたはDBテーブル上のJSONから確実に全データを復元"""
-    data = None
-    engine = get_engine()
-
-    # 1. ファイルから読み込み
-    fp = backup_item.get("filepath")
-    if fp and os.path.exists(fp):
-        try:
-            with open(fp, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            pass
-
-    # 2. DBの backup_logs テーブルから復元
-    if not data:
-        fname = backup_item.get("filename")
-        try:
-            with engine.connect() as conn:
-                row = conn.execute(text("SELECT payload_json FROM backup_logs WHERE filename = :fn ORDER BY id DESC LIMIT 1"), {"fn": fname}).fetchone()
-                if row and row[0]:
-                    data = json.loads(row[0])
-        except Exception:
-            pass
-
-    if not data:
-        return {"success": False, "message": "バックアップデータを取得できませんでした"}
-
-    try:
-        records = data.get("records", [])
-        create_backup_snapshot(restored_by, trigger_reason="データ復元直前の現行データ自動保護")
-        
         with engine.begin() as conn:
-            conn.execute(text("DELETE FROM transactions;"))
-            for r in records:
-                conn.execute(
-                    text("""
-                        INSERT INTO transactions 
-                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, created_at)
-                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, :cat)
-                    """),
-                    {
-                        "d": str(r.get("date", "")),
-                        "m": str(r.get("market_number", "")),
-                        "c": str(r.get("category", "")),
-                        "ic": str(r.get("item_code", "")),
-                        "in": str(r.get("item_name", "")),
-                        "p": int(r.get("unit_price", 0)),
-                        "q": int(r.get("quantity", 0)),
-                        "sub": int(r.get("subtotal", 0)),
-                        "u": str(r.get("user_id", "restored")),
-                        "sn": str(r.get("sheet_name", "Sheet1")),
-                        "cat": str(r.get("created_at", datetime.now()))
-                    }
-                )
-        invalidate_records_cache()
-        return {"success": True, "restored_count": len(records)}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
+            conn.execute(
+                text("INSERT INTO backup_logs (filename, timestamp, created_by, reason, record_count, total_subtotal, payload_json) VALUES (:fn, :ts, :cb, :rs, :rc, :sub, :pj)"),
+                {"fn": bk_filename, "ts": now_str, "cb": user_id, "rs": trigger_reason, "rc": meta["record_count"], "sub": meta["total_subtotal"], "pj": payload_json}
+            )
+    except Exception: pass
 
-# 互換エイリアス
-restore_from_backup_file = lambda fp, rb: restore_from_backup_target({"filepath": fp, "filename": os.path.basename(fp)}, rb)
+def create_backup_snapshot_async(user_id: str, trigger_reason="定期自動バックアップ"):
+    threading.Thread(target=_bg_backup_task, args=(user_id, trigger_reason), daemon=True).start()
+    return "backup_in_background"
 
+create_backup_snapshot = lambda u, t="手動作成": create_backup_snapshot_async(u, t)
 # ==========================================
 # 7. 商品マスタ & カテゴリー連動定義
 # ==========================================
@@ -3736,150 +3483,117 @@ with tabs[2]:
         </div>
     """, unsafe_allow_html=True)
 
-    # 1. 汎用 Vision AI 伝票・請求書・納品書 レイアウト・書式・データ統合解析エンジン
+    # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
     def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         key = _resolve_gemini_key()
         last_err_msg = ""
         
+        # 🤖 ユーザー別レートリミット判定（1日50回上限）
+        today_s = datetime.now().strftime("%Y%m%d")
+        rl_key = f"rate_limit_ai_{current_user}_{today_s}"
+        cur_calls = st.session_state.get(rl_key, 0)
+        if cur_calls >= 50 and not is_admin:
+            return {
+                "slip_type": "制限到達", "customer_name": "", "issuer_name": "", "date": datetime.now().strftime("%Y-%m-%d"),
+                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
+                "items": [], "layout": None,
+                "error_message": "本日のAI伝票解析上限（50回/日）に達しました。明日再度ご利用いただくか手入力フォームをご利用ください。"
+            }
+
         if key:
             import base64
             b64_img = base64.b64encode(image_bytes).decode("utf-8")
             
-            vision_prompt = """あなたは日本の青果卸売・青果市場・農業流通・企業間取引における手書き伝票、納品書、請求書、受領書、仕入伝票の画像解析を行う最高峰のVision AIです。
-提供された画像に実際に書かれている手書き文字、活字印刷枠、ゴム印、表の罫線、位置関係、書式装飾を1セルも漏らさず認識し、Excelで写真と寸分違わぬレイアウトと書式を再現するための構造化JSONを出力してください。
+            vision_prompt = """あなたは日本の青果卸売・農業流通における手書き伝票・納品書・請求書の超高精度Vision AIです。
+提供された画像の実在する文字・数値を正確に読み取り、以下のJSON形式のみを出力してください。架空のデータやサンプルの捏造は絶対に禁止です。
 
-【厳格な抽出・レイアウト再現ルール】
-1. データの捏造・推測補正は一切禁止です。写真に実在する表記を忠実に転写してください。
-2. 表のグリッド構造（行r・列c、1始まり）を正確に割り出し、空白行・空白列も含めて写真上の相対位置関係を完全再現してください。
-3. 結合セル（merges）: 複数セルにまたがる見出しやタイトル、合計欄は "A1:C2" や "B5:E5" の形式で抽出してください。
-4. 書式（font, fill, align, border, numfmt）:
-   - font: b(太字: true/false), sz(フォントサイズpt: 見出し16, 表頭11, 明細10等), color(ARGB 8桁: 例 "FF000000")
-   - fill: 背景塗りつぶし色(ARGB 8桁: 例 "FFF0FDF4", "FFF3F4F6", 白や無しは null)
-   - align: h(left|center|right), v(top|center|bottom), wrap(true/false)
-   - border: 各方向(l, r, t, b)の線種(thin|medium|thick|double|none)
-   - numfmt: 数値や金額には表示形式(例: "#,##0", "¥#,##0", "0")を指定し、数値自体は生の整数または小数を v に設定してください。
-5. 日付: 和暦(例: R8.9.23, 令8年9月23日)などの表記は、セルには写真そのままの文字列を転写し、トップレベルの date キーにはDB登録用として西暦 YYYY-MM-DD(令和8年=2026年)に換算した値を設定してください。
-6. 不確定セル: 薄い・かすれている等で判読しきれないセルは uncertain: true にしてください。
-7. 用紙向き: 横長伝票なら orientation: "landscape"、縦長なら "portrait" にしてください。
+【重要算術ルール】
+・単価と数量から「金額 = 単価 × 数量」を正確に算定してください。
+・各明細行の税抜小計、消費税額、税込合計金額を算出して返却してください。
 
-【出力JSONスキーマ】
 {
-  "slip_type": "請求書 または 納品書 等",
-  "customer_name": "宛名・納品先（敬称含む）",
-  "issuer_name": "出荷元・荷主・発行者",
+  "slip_type": "納品書",
+  "customer_name": "宛名",
+  "issuer_name": "出荷者・荷主",
   "date": "YYYY-MM-DD",
   "total_amount_with_tax": 0,
   "tax_amount": 0,
   "subtotal_without_tax": 0,
   "tax_rate": "8%",
   "items": [
-    {
-      "item_name": "品名・規格・入数",
-      "quantity": 1,
-      "unit_price": 0,
-      "subtotal": 0,
-      "tax_rate": "8%",
-      "remarks": "ロットや等級など"
-    }
-  ],
-  "layout": {
-    "sheet_name": "納品書",
-    "orientation": "portrait",
-    "col_widths": [12, 24, 10, 14, 14, 10, 18],
-    "row_heights": {"1": 28, "2": 20, "3": 20},
-    "merges": ["A1:D1", "A2:B2"],
-    "cells": [
-      {
-        "r": 1, "c": 1, "v": "納　品　書", "type": "text",
-        "font": {"b": true, "sz": 16, "color": "FF000000"},
-        "fill": null,
-        "align": {"h": "center", "v": "center", "wrap": false},
-        "border": {"l": "none", "r": "none", "t": "none", "b": "double"},
-        "numfmt": null,
-        "uncertain": false
-      }
-    ]
-  }
+    {"item_name": "品名", "quantity": 1, "unit_price": 0, "subtotal": 0, "tax_rate": "8%", "remarks": ""}
+  ]
 }
 """
-            # 利用可能なモデルの順次試行リストを構築
-            models_to_try = []
-            if AI_MODEL_PRIMARY:
-                models_to_try.append(AI_MODEL_PRIMARY)
-            for m in AI_MODEL_FALLBACKS:
-                if m and m not in models_to_try:
-                    models_to_try.append(m)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]:
-                if m not in models_to_try:
-                    models_to_try.append(m)
-
-            for m_name in models_to_try:
+            # タイムアウトを30秒へ短縮しUIスタックを防止
+            for m_name in [AI_MODEL_PRIMARY, "gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
-                    url = f"{GEMINI_API_BASE}/{m_name}:generateContent"
-                    headers = {"Content-Type": "application/json", "x-goog-api-key": key}
-                    payload = {
-                        "contents": [{
-                            "role": "user",
-                            "parts": [
-                                {"inlineData": {"mimeType": mime_type, "data": b64_img}},
-                                {"text": vision_prompt}
-                            ]
-                        }],
-                        "generationConfig": {
-                            "responseMimeType": "application/json",
-                            "temperature": 0.1,
-                            "maxOutputTokens": 16384
-                        }
-                    }
-                    resp = requests.post(url, headers=headers, json=payload, timeout=(15, 90))
+                    resp = requests.post(
+                        f"{GEMINI_API_BASE}/{m_name}:generateContent",
+                        headers={"Content-Type": "application/json", "x-goog-api-key": key},
+                        json={
+                            "contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime_type, "data": b64_img}}, {"text": vision_prompt}]}],
+                            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 4096}
+                        },
+                        timeout=(10, 30)
+                    )
                     if resp.status_code == 200:
                         txt = _extract_gemini_text(resp.json())
                         if txt:
-                            # コードフェンス除去
                             clean_str = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
                             clean_str = re.sub(r"\s*```$", "", clean_str)
-                            
-                            # JSONパース（末尾切れ修復機能付き）
-                            parsed = None
-                            try:
-                                parsed = json.loads(clean_str)
-                            except Exception:
-                                # 途中で切れた場合の閉じ括弧自動補完
-                                for pad in ["}", "]}", "]}}", "]}}}"]:
-                                    try:
-                                        parsed = json.loads(clean_str + pad)
-                                        break
-                                    except Exception:
-                                        continue
-                            
-                            if parsed and isinstance(parsed, dict):
-                                # 既存互換キーのデフォルト補完
-                                if "items" not in parsed or not isinstance(parsed["items"], list):
-                                    parsed["items"] = []
-                                if "layout" not in parsed or not isinstance(parsed["layout"], dict):
-                                    parsed["layout"] = None
+                            parsed = json.loads(clean_str)
+                            if parsed and isinstance(parsed, dict) and "items" in parsed:
+                                st.session_state[rl_key] = cur_calls + 1
+                                
+                                # 🤖 算術チェックサム自動検証 & 桁間違い自動補正
+                                validated_items = []
+                                calc_subtotal = 0
+                                has_correction = False
+                                for it in parsed.get("items", []):
+                                    q = clean_num(it.get("quantity", 1))
+                                    p = clean_num(it.get("unit_price", 0))
+                                    s = clean_num(it.get("subtotal", 0))
+                                    
+                                    # 数量×単価と金額の不一致チェック（例: 80円が800円等の桁ズレ検知）
+                                    expected_s = p * q
+                                    if p > 0 and q > 0 and s != expected_s:
+                                        it["subtotal"] = expected_s
+                                        it["remarks"] = str(it.get("remarks", "")) + " (※金額自動補正)"
+                                        has_correction = True
+                                        s = expected_s
+                                    elif s > 0 and q > 0 and p == 0:
+                                        p = int(s / q)
+                                        it["unit_price"] = p
+
+                                    calc_subtotal += s
+                                    validated_items.append(it)
+
+                                parsed["items"] = validated_items
+                                if calc_subtotal > 0:
+                                    parsed["subtotal_without_tax"] = calc_subtotal
+                                    t_rate_val = 0.08 if "8" in str(parsed.get("tax_rate", "8")) else 0.10
+                                    calc_tax = int(calc_subtotal * t_rate_val)
+                                    parsed["tax_amount"] = calc_tax
+                                    parsed["total_amount_with_tax"] = calc_subtotal + calc_tax
+                                
+                                if has_correction:
+                                    parsed["_checksum_warning"] = "⚠️ 算術検証により明細金額の桁ズレを自動補正しました。"
+
                                 return parsed
                     else:
-                        last_err_msg = f"{m_name}: HTTP {resp.status_code} {resp.text[:100]}"
+                        last_err_msg = f"{m_name} (HTTP {resp.status_code})"
                 except Exception as ex:
-                    last_err_msg = f"{m_name}: {str(ex)}"
+                    last_err_msg = str(ex)
                     continue
-        else:
-            last_err_msg = "Gemini APIキーが設定されていません。"
 
-        # 捏造データ（築館なめこや恵バウアー等）は一切返さず、空の結果＋エラー理由を返却
+        # ❌ ダミーデータの完全廃止: 架空データは返さず明確なエラーを通知
         return {
-            "slip_type": "不明",
-            "customer_name": "",
-            "issuer_name": "",
+            "slip_type": "未検出", "customer_name": "", "issuer_name": "",
             "date": datetime.now().strftime("%Y-%m-%d"),
-            "total_amount_with_tax": 0,
-            "tax_amount": 0,
-            "subtotal_without_tax": 0,
-            "tax_rate": "8%",
-            "items": [],
-            "layout": None,
-            "error_message": f"AI画像解析に失敗しました ({last_err_msg})" if last_err_msg else "画像の読み取りに失敗しました。"
+            "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
+            "items": [], "layout": None,
+            "error_message": f"画像の解析に失敗しました ({last_err_msg})。APIキーの設定を確認するか、直接入力フォームをご利用ください。"
         }
 
     # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
