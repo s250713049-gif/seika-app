@@ -3242,13 +3242,10 @@ with tabs[1]:
                     if st.button("削除", key=f"m_del_{r.get('id')}", type="secondary"):
                         delete_records_by_ids([r.get("id")], deleted_by=current_user, operator_role=user_role)
                         st.rerun()
-    else:
-        # 既存のテーブル表示（3229行目以降の if edit_mode == ... がそのまま動きます）
-
     # ==========================================
     # A. 【元エクセル配置・全シート完全保持】グリッド直接編集モード（写真1枚目スタイル）
     # ==========================================
-    if edit_mode == "📑 元エクセル配置グリッド編集（推奨）" and raw_sheets:
+    elif edit_mode == "📑 元エクセル配置グリッド編集（推奨）" and raw_sheets:
         sheet_names = list(raw_sheets.keys())
         grid_edit_tabs = st.tabs(sheet_names)
 
