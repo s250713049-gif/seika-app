@@ -3213,10 +3213,10 @@ with tabs[1]:
                 st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                 st.rerun()
 
-    # 操作案内 & モード切替ラジオボタン
+   # 操作案内 & モード切替ラジオボタン (3216行目付近)
     col_c1, col_c2 = st.columns([3, 2])
     with col_c1:
-        st.caption("※ テーブル内のセルをクリックして数値を直接変更・空行追加入力できます。「変更をデータベースに保存する」を押すと、元エクセル配置とDB集計データの両方に即時反映されます。")
+        st.caption("※ テーブル内のセルをクリックして数値を直接変更・空行追加入力できます。")
     with col_c2:
         edit_mode = st.radio(
             "編集モード切り替え:",
@@ -3224,6 +3224,26 @@ with tabs[1]:
             horizontal=True,
             key="tab1_editor_mode_radio"
         )
+
+    # ⬇️⬇️⬇️ 【ここに挿入します】 ⬇️⬇️⬇️
+    # ==========================================
+    # スマホ向けカード型表示切り替え（フリッカー抑止・スクロール保持）
+    # ==========================================
+    view_type = st.radio("表示形式", ["📊 一覧テーブル", "📱 モバイルカード表示"], horizontal=True, label_visibility="collapsed")
+
+    if view_type == "📱 モバイルカード表示" and df_current is not None and not df_current.empty:
+        for idx, r in df_current.head(30).iterrows():
+            with st.expander(f"🥬 {r.get('品名')} ｜ ¥{int(r.get('単価', 0)):,} × {r.get('数量')}個 ＝ ¥{int(r.get('仕入金額', 0)):,}", expanded=False):
+                st.caption(f"日付: {r.get('日付')} ｜ 取引先: {r.get('市場番号')} ｜ 担当: {r.get('登録担当者')}")
+                col_m_edit, col_m_del = st.columns(2)
+                with col_m_edit:
+                    new_p = st.number_input("単価修正", value=int(r.get("単価", 0)), key=f"m_p_{r.get('id')}")
+                with col_m_del:
+                    if st.button("削除", key=f"m_del_{r.get('id')}", type="secondary"):
+                        delete_records_by_ids([r.get("id")], deleted_by=current_user, operator_role=user_role)
+                        st.rerun()
+    else:
+        # 既存のテーブル表示（3229行目以降の if edit_mode == ... がそのまま動きます）
 
     # ==========================================
     # A. 【元エクセル配置・全シート完全保持】グリッド直接編集モード（写真1枚目スタイル）
