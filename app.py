@@ -7,6 +7,7 @@ import hmac
 import json
 import glob
 import secrets
+import uuid
 import plotly.express as px
 from sqlalchemy import create_engine, text, event
 import io
@@ -424,18 +425,47 @@ def init_db():
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trans_market ON transactions (is_deleted, market_number);"))
         except Exception: pass
 
-        # 初期管理者登録
-        res = conn.execute(text("SELECT count(*) FROM users;")).scalar()
-        if res == 0:
-            init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD") or secrets.token_urlsafe(10)
+      # ==========================================
+        # 👤 初期管理者(admin/admin123) & 一般社員(user1/password123) 確実同期
+        # ==========================================
+        init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD", "admin123").strip() or "admin123"
+        admin_hash = hash_password(init_admin_pw)
+        
+        # 1. admin アカウントの確認・新規登録またはパスワード強制再同期
+        admin_row = conn.execute(text("SELECT id FROM users WHERE username = 'admin'")).fetchone()
+        if not admin_row:
             conn.execute(
                 text("INSERT INTO users (username, password_hash, role, display_name) VALUES (:u, :p, :r, :d)"),
-                {"u": "admin", "p": hash_password(init_admin_pw), "r": "admin", "d": "統括管理者"}
+                {"u": "admin", "p": admin_hash, "r": "admin", "d": "統括管理者"}
             )
-            for uid, uname in [("user1", "佐藤 (営業1課)"), ("user2", "鈴木 (営業2課)"), ("staff_a", "高橋 (業務課)")]:
+        else:
+            # 既存DBが存在する場合でも admin のパスワードを admin123 へ安全に同期更新
+            conn.execute(
+                text("UPDATE users SET password_hash = :p, role = 'admin' WHERE username = 'admin'"),
+                {"p": admin_hash}
+            )
+
+        # 2. 一般スタッフアカウントの保証（user1, user2, staff_a）
+        staff_defaults = [
+            ("user1", "佐藤 (営業1課)"),
+            ("user2", "鈴木 (営業2課)"),
+            ("staff_a", "高橋 (業務課)")
+        ]
+        default_staff_pw = "password123"
+        staff_hash = hash_password(default_staff_pw)
+
+        for uid, uname in staff_defaults:
+            u_row = conn.execute(text("SELECT id FROM users WHERE username = :u"), {"u": uid}).fetchone()
+            if not u_row:
                 conn.execute(
                     text("INSERT INTO users (username, password_hash, role, display_name) VALUES (:u, :p, :r, :d)"),
-                    {"u": uid, "p": hash_password("password123"), "r": "staff", "d": uname}
+                    {"u": uid, "p": staff_hash, "r": "staff", "d": uname}
+                )
+            else:
+                # パスワードが未設定または空の場合は password123 を保証
+                conn.execute(
+                    text("UPDATE users SET password_hash = :p WHERE username = :u AND (password_hash IS NULL OR password_hash = '')"),
+                    {"p": staff_hash, "u": uid}
                 )
 
 init_db()
