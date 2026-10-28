@@ -216,17 +216,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. 永続ストレージ & DB設定（WALモード & タイムアウト30秒強化）
+# 1. 永続ストレージ・DB接続・排他制御・自動リトライ
 # ==========================================
+import threading
+from contextlib import contextmanager
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 SQLITE_DB_PATH = os.path.join(DATA_DIR, "seika_enterprise.db")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 MASTER_CSV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "item_master.csv")
+RAW_SHEETS_CACHE_FILE = os.path.join(DATA_DIR, "latest_imported_raw_sheets.json")
 
 def get_secret(key: str, default: str = None) -> str:
-    """環境変数または st.secrets から設定値を取得"""
     val = os.environ.get(key)
     if val: return val
     try:
@@ -236,11 +239,33 @@ def get_secret(key: str, default: str = None) -> str:
         pass
     return default
 
+# 🔐 ハードコード鍵の完全排除: 未設定時は動的セキュア鍵を暗号学的に生成
+_DYN_SECRET_FILE = os.path.join(DATA_DIR, ".dyn_secret.key")
+def _get_or_create_secure_key() -> str:
+    env_key = get_secret("AUTH_SECRET_KEY")
+    if env_key and env_key != "seika_corp_secure_master_salt_2026_x9":
+        return env_key
+    if os.path.exists(_DYN_SECRET_FILE):
+        try:
+            with open(_DYN_SECRET_FILE, "r", encoding="utf-8") as f:
+                k = f.read().strip()
+                if len(k) >= 32: return k
+        except Exception:
+            pass
+    new_k = secrets.token_hex(32)
+    try:
+        with open(_DYN_SECRET_FILE, "w", encoding="utf-8") as f:
+            f.write(new_k)
+    except Exception:
+        pass
+    return new_k
+
+AUTH_SECRET_KEY = _get_or_create_secure_key()
+
 def get_engine():
     """
-    データベース接続エンジン取得
-    PostgreSQL（Cloud DB）優先接続。
-    SQLite利用時は WALモード (journal_mode=WAL) & busy_timeout=30秒を自動適用し同時書き込みロックを防止。
+    PostgreSQL: コネクションプール（10/20）＋READ COMMITTED分離レベル
+    SQLite: WALモード＋タイムアウト30秒＋busy_timeout=30000
     """
     database_url = get_secret("DATABASE_URL")
     if database_url:
@@ -248,13 +273,13 @@ def get_engine():
             database_url = database_url.replace("postgres://", "postgresql://", 1)
         return create_engine(
             database_url,
-            pool_pre_ping=True,
-            pool_recycle=1800,
+            isolation_level="READ COMMITTED",
             pool_size=10,
-            max_overflow=20
+            max_overflow=20,
+            pool_pre_ping=True,
+            pool_recycle=1800
         )
     
-    # SQLite: 同時書き込みロック回避（timeout=30.0 + WALモードリスナー）
     sqlite_engine = create_engine(
         f"sqlite:///{SQLITE_DB_PATH}?check_same_thread=False",
         connect_args={"check_same_thread": False, "timeout": 30.0}
@@ -273,54 +298,45 @@ def get_engine():
 
     return sqlite_engine
 
+@contextmanager
+def execute_with_retry(max_retries: int = 3, base_delay: float = 0.2):
+    """SQLite ロック競合時の指数バックオフ付き自動書き込みリトライ"""
+    engine = get_engine()
+    attempt = 0
+    while True:
+        try:
+            with engine.begin() as conn:
+                yield conn
+            break
+        except Exception as e:
+            attempt += 1
+            if ("locked" in str(e).lower() or "busy" in str(e).lower()) and attempt < max_retries:
+                time.sleep(base_delay * (2 ** (attempt - 1)))
+                continue
+            raise e
+
 def is_using_cloud_db() -> bool:
     return bool(get_secret("DATABASE_URL"))
 
 # ==========================================
-# 2. セキュリティ & 認証関数 (PBKDF2暗号化)
+# 2. セキュリティ & 認証関数 (PBKDF2暗号化 & 有効期限TTL)
 # ==========================================
-AUTH_SECRET_KEY = get_secret("AUTH_SECRET_KEY", "seika_corp_secure_master_salt_2026_x9")
-
 def hash_password(password: str, salt: str = None) -> str:
     if not salt:
         salt = secrets.token_hex(16)
-    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000)
     return f"{salt}:{key.hex()}"
 
 def verify_password(stored_hash: str, provided_password: str) -> bool:
     try:
         salt, key_hex = stored_hash.split(":")
-        new_key = hashlib.pbkdf2_hmac("sha256", provided_password.encode("utf-8"), salt.encode("utf-8"), 100000)
+        new_key = hashlib.pbkdf2_hmac("sha256", provided_password.encode("utf-8"), salt.encode("utf-8"), 120000)
         return hmac.compare_digest(key_hex, new_key.hex())
     except Exception:
         return False
 
-def create_session_token(username: str, role: str) -> str:
-    ts = int(time.time())
-    payload = f"{username}|{role}|{ts}"
-    sig = hmac.new(AUTH_SECRET_KEY.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"{payload}|{sig}"
-
-def verify_session_token(token: str):
-    try:
-        parts = token.split("|")
-        if len(parts) != 4:
-            return None
-        username, role, ts_str, sig = parts
-        ts = int(ts_str)
-        # 有効期限 14日間
-        if time.time() - ts > (14 * 86400):
-            return None
-        payload = f"{username}|{role}|{ts}"
-        expected_sig = hmac.new(AUTH_SECRET_KEY.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-        if hmac.compare_digest(sig, expected_sig):
-            return {"username": username, "role": role}
-    except Exception:
-        pass
-    return None
-
 # ==========================================
-# 3. データベーステーブル初期化（PostgreSQL / SQLite 両対応 & backup_logs 永続化）
+# 3. データベーステーブル初期化（論理削除 is_deleted ＆ 複合インデックス完備）
 # ==========================================
 def init_db():
     engine = get_engine()
@@ -338,6 +354,7 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
+        # 🗄️ 論理削除 (is_deleted, deleted_at, deleted_by) 対応 transactions
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS transactions (
                 id {pk_auto},
@@ -351,6 +368,9 @@ def init_db():
                 subtotal BIGINT NOT NULL DEFAULT 0,
                 user_id TEXT NOT NULL,
                 sheet_name TEXT DEFAULT '',
+                is_deleted INTEGER NOT NULL DEFAULT 0,
+                deleted_at TIMESTAMP,
+                deleted_by TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
@@ -372,7 +392,6 @@ def init_db():
                 deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
-        # ④ クラウド永続化用バックアップテーブル（再起動時のデータ消失を防止）
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS backup_logs (
                 id {pk_auto},
@@ -386,17 +405,29 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
-        
-        # 既存DBへの sheet_name カラム安全追加マイグレーション
-        for tbl in ["transactions", "deleted_transactions"]:
-            try:
-                conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN sheet_name TEXT DEFAULT '';"))
-            except Exception:
-                pass
 
+        # 既存DBへの is_deleted カラム追加マイグレーション
+        try:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0;"))
+        except Exception: pass
+        try:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN deleted_at TIMESTAMP;"))
+        except Exception: pass
+        try:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN deleted_by TEXT;"))
+        except Exception: pass
+
+        # 🗄️ 複合インデックスの作成（検索・集計の高速化）
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trans_filter ON transactions (is_deleted, user_id, date);"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trans_sheet ON transactions (is_deleted, sheet_name);"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trans_market ON transactions (is_deleted, market_number);"))
+        except Exception: pass
+
+        # 初期管理者登録
         res = conn.execute(text("SELECT count(*) FROM users;")).scalar()
         if res == 0:
-            init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD", "password123")
+            init_admin_pw = get_secret("INITIAL_ADMIN_PASSWORD") or secrets.token_urlsafe(10)
             conn.execute(
                 text("INSERT INTO users (username, password_hash, role, display_name) VALUES (:u, :p, :r, :d)"),
                 {"u": "admin", "p": hash_password(init_admin_pw), "r": "admin", "d": "統括管理者"}
