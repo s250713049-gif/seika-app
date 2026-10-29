@@ -4571,31 +4571,43 @@ with tabs[4]:
 
     c_bk_act1, c_bk_act2 = st.columns([2, 3])
     with c_bk_act1:
-        if st.button("📸 手動で今すぐスナップショットを作成", use_container_width=True):
+        if st.button("📸 手動で今すぐスナップショットを作成", use_container_width=True, type="primary"):
             bk_fname = create_backup_snapshot(current_user, trigger_reason="手動スナップショット作成")
             st.toast(f"✅ バックアップを作成しました: {bk_fname}")
             st.rerun()
 
     st.write("")
-    backups_list = list_all_backups()
+    
+    # 🛡️ 安全ガード付きバックアップ一覧取得
+    try:
+        backups_list = list_all_backups()
+    except Exception as e:
+        backups_list = []
+        st.warning(f"バックアップ情報の取得中に軽微な警告が発生しました: {e}")
+
     if backups_list:
         st.markdown(f"##### 🗄️ 利用可能なバックアップスナップショット ({len(backups_list)} 件)")
         for idx, target_bk in enumerate(backups_list[:10]):
             with st.expander(f"📦 {target_bk['timestamp']} - {target_bk['reason']} ({target_bk['record_count']}件 / ¥{target_bk['total_subtotal']:,})", expanded=(idx == 0)):
-                col_b1, col_b2 = st.columns([3, 1])
+                col_b1, col_b2 = st.columns([3, 1.2])
                 with col_b1:
                     st.write(f"• 作成者: **{target_bk['created_by']}**")
                     st.write(f"• ファイル名: `{target_bk['filename']}`")
                     st.write(f"• 記録件数: **{target_bk['record_count']:,} 件** (総額: ¥{target_bk['total_subtotal']:,})")
                 with col_b2:
-                    if st.button("🔄 この時点へ復元", key=f"restore_btn_{target_bk['filename']}", use_container_width=True, type="primary"):
-                        r_res = restore_from_backup_file(target_bk["filepath"], restored_by=current_user)
-                        if r_res.get("success"):
-                            st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                            st.success(f"🎉 {target_bk['timestamp']} の状態へ完全復旧しました！")
-                            st.rerun()
+                    if is_admin:
+                        if st.button("🔄 この時点へ復元", key=f"restore_btn_{target_bk['filename']}", use_container_width=True, type="secondary"):
+                            r_res = restore_from_backup_file(target_bk.get("filepath") or target_bk.get("filename"), restored_by=current_user)
+                            if r_res.get("success"):
+                                st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                                st.success(f"🎉 {target_bk['timestamp']} の状態へ完全復旧しました！")
+                                st.rerun()
+                            else:
+                                st.error(r_res.get("message", "復元に失敗しました。"))
+                    else:
+                        st.caption("※ 復元は統括管理者のみ実行可能")
     else:
-        st.info("バックアップデータはまだ作成されていません。")
+        st.info("💡 バックアップデータはまだ作成されていません。上のボタンからスナップショットを作成できます。")
 
 # ==========================================
 # タブ 6: 取引データ一括インポート & 形式変換 (.xls ➡ .xlsx)
