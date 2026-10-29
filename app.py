@@ -689,7 +689,7 @@ def restore_last_deleted_records_db(records_to_restore: list, restored_by: str =
                     except Exception: pass
     invalidate_records_cache()
     return restored_count
-    def get_employee_summary_stats() -> pd.DataFrame:
+def get_employee_summary_stats() -> pd.DataFrame:
     """社員（user_id）ごとの取引登録実績サマリーを取得（論理削除除外・安全ガード付き）"""
     engine = get_engine()
     try:
