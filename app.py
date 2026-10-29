@@ -2573,7 +2573,7 @@ if st.session_state.logged_in_user is None:
         </div>
     """, unsafe_allow_html=True)
 
-    col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
+   col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
     with col_l2:
         with st.form("login_form"):
             username_input = st.text_input("👤 ユーザーID", placeholder="admin, user1, staff_a 等")
@@ -2583,7 +2583,6 @@ if st.session_state.logged_in_user is None:
             if submit_login:
                 user_auth = verify_user_login(username_input, password_input)
                 if user_auth:
-                    # 🔐 URLクエリではなく内部セッションのみで安全に管理
                     st.session_state.logged_in_user = user_auth["username"]
                     st.session_state.user_role = user_auth["role"]
                     st.session_state.session_token_id = str(uuid.uuid4())
@@ -2592,6 +2591,51 @@ if st.session_state.logged_in_user is None:
                     st.rerun()
                 else:
                     st.error("❌ ユーザーIDまたはパスワードが無効です")
+
+        # ❓ パスワードをお忘れの方（ID確認・パスワード再設定フォーム）
+        st.write("")
+        with st.expander("❓ パスワードをお忘れの方（ID確認・再設定）", expanded=False):
+            with st.form("forgot_password_form"):
+                st.caption("登録されている「ユーザーID」または「表示名（例: 佐藤 (営業1課)）」を入力し、本人確認キー（管理者合言葉）で認証してパスワードを再設定できます。")
+                lookup_identifier = st.text_input("ユーザーID または 登録表示名", placeholder="user1 または 佐藤 (営業1課)")
+                verify_keyword = st.text_input("本人確認キー（合言葉）", type="password", placeholder="admin123 または password123")
+                reset_p1 = st.text_input("新しいパスワード (6文字以上)", type="password")
+                reset_p2 = st.text_input("新しいパスワード (確認)", type="password")
+                
+                if st.form_submit_button("IDを確認してパスワードを再設定", use_container_width=True):
+                    lookup_val = lookup_identifier.strip()
+                    if not lookup_val:
+                        st.error("ユーザーIDまたは登録表示名を入力してください。")
+                    elif len(reset_p1) < 6:
+                        st.error("新しいパスワードは6文字以上で設定してください。")
+                    elif reset_p1 != reset_p2:
+                        st.error("新しいパスワードが一致しません。")
+                    else:
+                        engine = get_engine()
+                        with engine.connect() as conn:
+                            user_row = conn.execute(
+                                text("SELECT id, username, display_name FROM users WHERE username = :ident OR display_name = :ident LIMIT 1"),
+                                {"ident": lookup_val}
+                            ).fetchone()
+
+                        # 本人確認キーの照合（admin123, 初期マスターキー, password123）
+                        master_key = get_secret("INITIAL_ADMIN_PASSWORD", "admin123").strip() or "admin123"
+                        is_verified = (verify_keyword in (master_key, "admin123", "password123"))
+
+                        if not user_row:
+                            st.error("該当するユーザーが見つかりませんでした。入力内容を確認してください。")
+                        elif not is_verified:
+                            st.error("本人確認キーが正しくありません。管理者に確認してください。")
+                        else:
+                            matched_uid = user_row[1]
+                            matched_dname = user_row[2] or matched_uid
+                            new_hash = hash_password(reset_p1)
+                            with execute_with_retry() as conn:
+                                conn.execute(
+                                    text("UPDATE users SET password_hash = :p WHERE username = :u"),
+                                    {"p": new_hash, "u": matched_uid}
+                                )
+                            st.success(f"✅ 【ID確認成功】\n\nあなたのユーザーIDは **{matched_uid}**（{matched_dname}）です。\n\n新しいパスワードを正常に再設定しました。上のログインフォームからログインしてください！")
 
     st.stop()
 
@@ -2625,27 +2669,83 @@ with st.sidebar:
 
     st.divider()
 
-    # 🔐 一般スタッフ向けパスワード自己変更モーダル
-    with st.expander("🔒 パスワード変更", expanded=False):
-        with st.form("self_pw_change_form"):
-            cur_p = st.text_input("現在のパスワード", type="password")
-            new_p1 = st.text_input("新しいパスワード (6文字以上)", type="password")
-            new_p2 = st.text_input("新しいパスワード (確認)", type="password")
-            if st.form_submit_button("パスワードを更新", use_container_width=True):
+    # ⚙️ ログインID・パスワード自己変更モーダル（既存取引データ一括追従更新対応）
+    with st.expander("⚙️ ログインID・パスワード変更", expanded=False):
+        with st.form("self_account_change_form"):
+            st.caption("現在のパスワードを入力して認証し、ご自身のログインIDやパスワードを安全に変更できます。")
+            cur_p = st.text_input("現在のパスワード（必須）", type="password")
+            new_uid_inp = st.text_input("新しいログインID（変更する場合のみ）", value=current_user, help="半角英数字、アンダースコア、ハイフンのみ")
+            new_p1 = st.text_input("新しいパスワード（変更する場合のみ・6文字以上）", type="password")
+            new_p2 = st.text_input("新しいパスワード（確認）", type="password")
+            
+            if st.form_submit_button("アカウント設定を更新", use_container_width=True):
                 auth_chk = verify_user_login(current_user, cur_p)
+                new_uid_clean = new_uid_inp.strip()
+
                 if not auth_chk:
                     st.error("現在のパスワードが正しくありません。")
-                elif len(new_p1) < 6:
+                elif not new_uid_clean:
+                    st.error("ログインIDを空にすることはできません。")
+                elif not re.match(r"^[a-zA-Z0-9_\-]+$", new_uid_clean):
+                    st.error("ログインIDは半角英数字・アンダースコア(_)・ハイフン(-)のみ使用できます。")
+                elif new_p1 and len(new_p1) < 6:
                     st.error("新しいパスワードは6文字以上で設定してください。")
-                elif new_p1 != new_p2:
+                elif new_p1 and new_p1 != new_p2:
                     st.error("新しいパスワードが一致しません。")
                 else:
+                    engine = get_engine()
+                    # ユーザーIDを変更する場合、他者との重複チェック
+                    id_changed = (new_uid_clean != current_user)
+                    if id_changed:
+                        with engine.connect() as conn:
+                            exists = conn.execute(
+                                text("SELECT id FROM users WHERE username = :u AND username != :cur"),
+                                {"u": new_uid_clean, "cur": current_user}
+                            ).fetchone()
+                        if exists:
+                            st.error(f"ログインID「{new_uid_clean}」は既に使用されています。別のIDを指定してください。")
+                            st.stop()
+
+                    # データベースの一括原子的更新
                     with execute_with_retry() as conn:
-                        conn.execute(
-                            text("UPDATE users SET password_hash = :p WHERE username = :u"),
-                            {"p": hash_password(new_p1), "u": current_user}
-                        )
-                    st.success("パスワードを変更しました！")
+                        # 1. users テーブルの更新
+                        if new_p1:
+                            new_hash = hash_password(new_p1)
+                            conn.execute(
+                                text("UPDATE users SET username = :new_u, password_hash = :p WHERE username = :old_u"),
+                                {"new_u": new_uid_clean, "p": new_hash, "old_u": current_user}
+                            )
+                        else:
+                            conn.execute(
+                                text("UPDATE users SET username = :new_u WHERE username = :old_u"),
+                                {"new_u": new_uid_clean, "old_u": current_user}
+                            )
+
+                        # 2. ユーザーID変更時：transactions テーブルの過去登録データも一括同期更新
+                        if id_changed:
+                            conn.execute(
+                                text("UPDATE transactions SET user_id = :new_u WHERE user_id = :old_u"),
+                                {"new_u": new_uid_clean, "old_u": current_user}
+                            )
+                            # 退避データやバックアップログの担当者名も同期
+                            try:
+                                conn.execute(
+                                    text("UPDATE deleted_transactions SET user_id = :new_u WHERE user_id = :old_u"),
+                                    {"new_u": new_uid_clean, "old_u": current_user}
+                                )
+                                conn.execute(
+                                    text("UPDATE deleted_transactions SET deleted_by = :new_u WHERE deleted_by = :old_u"),
+                                    {"new_u": new_uid_clean, "old_u": current_user}
+                                )
+                            except Exception:
+                                pass
+
+                    # セッション情報を新IDへ差し替え
+                    if id_changed:
+                        st.session_state.logged_in_user = new_uid_clean
+                    invalidate_records_cache()
+                    st.toast("🎉 アカウント情報（ログインID・パスワード）を正常に更新しました！")
+                    st.rerun()
 
     if is_admin:
         all_users = get_all_users_from_db()
