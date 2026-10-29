@@ -3771,7 +3771,7 @@ with tabs[2]:
         </div>
     """, unsafe_allow_html=True)
 
-    # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
+   # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
     def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         key = _resolve_gemini_key()
         last_err_msg = ""
@@ -3792,98 +3792,74 @@ with tabs[2]:
             import base64
             b64_img = base64.b64encode(image_bytes).decode("utf-8")
             
-            vision_prompt = """あなたは日本の青果卸売・農業流通における手書き伝票・納品書・請求書の超高精度Vision AIです。
-提供された画像の実在する文字・数値を正確に読み取り、以下のJSON形式のみを出力してください。架空のデータやサンプルの捏造は絶対に禁止です。
+            vision_prompt = """あなたは日本の青果卸売・農業・商業流通における手書き請求書・納品書・受領証・仕入伝票の高度OCR・Vision AI解析エンジンです。
+提供された画像の実在する文字（手書き文字・ゴム印・印刷文字）、表構造、罫線を極めて高精度に解析し、必ず以下の有効なJSON形式のみを出力してください。架空のデータの捏造は絶対に禁止です。
 
-【重要算術ルール】
-・単価と数量から「金額 = 単価 × 数量」を正確に算定してください。
-・各明細行の税抜小計、消費税額、税込合計金額を算出して返却してください。
+【抽出・判定ルール】
+1. 伝票種別 (slip_type):
+   - 画像上部や中央に印字または手書きされているタイトル（例:「請求書」「御請求書」「請求明細書」「納品書」「受領証」「仕入伝票」等）から正確に判定してください。
+   - 「請求書」または「御請求書」とある場合は必ず「請求書」としてください。
 
+2. 宛名・納品先 (customer_name) と 出荷元・発行者 (issuer_name) の峻別:
+   - 「御中」「様」「殿」が付されている名称、または「請求先」「納品先」「得意先」欄に記載された名称を customer_name に設定してください。
+   - 会社印・角印が押印されている名称、または電話番号・FAX・適格請求書発行事業者登録番号（T+13桁）・住所と共に記載されている発行元・出荷元を issuer_name に設定してください。混同は厳禁です。
+
+3. 取引日・請求日 (date):
+   - 原本に記載された日付（発行日・請求日・納品日）を西暦 "YYYY-MM-DD" 形式に標準化してください。
+   - 和暦表記（例: 令和8年9月23日, 令8.9.23, R8.9.23）は、令和年数+2018（例: 令和8年→2026年）として西暦に正しく換算してください。
+
+4. 表構造と明細項目 (items):
+   - 伝票内の罫線や表の各行を上から順に認識し、明細が存在するすべての行を items 配列に抽出してください。
+   - 各明細行で以下を抽出してください:
+     * item_name: 商品名・品名・規格（手書き文字も忠実に読取）
+     * quantity: 数量（数値のみ。読取不可時は 1）
+     * unit: 単位（箱, c/s, ケース, 袋, kg, 本 等。なければ空文字）
+     * unit_price: 単価（数値のみ。円マークやカンマは除去）
+     * subtotal: 原本に記載されたその行の金額（数値のみ）
+     * tax_rate: 適用税率（"8%" または "10%"）
+     * remarks: 備考・摘要・規格ロット等
+   - 印刷された表の見出し（品名、数量、単価、金額など）は明細に含めないでください。
+
+5. 金額情報 (total_amount_with_tax, subtotal_without_tax, tax_amount):
+   - 原本に明記された「合計金額」「ご請求金額」「税込合計」「小計」「消費税額」の数値を正確に抽出してください。
+   - 原本の記載数値を最優先し、勝手に明細の計算値で上書きしないでください。
+
+6. セル配置とレイアウト (layout):
+   - 既存のExcel再現エンジンのために、伝票の表・ヘッダー・合計行のセル配置情報（cells, col_widths, merges）を可能な範囲で構築してください。
+
+```json
 {
-  "slip_type": "納品書",
-  "customer_name": "宛名",
-  "issuer_name": "出荷者・荷主",
+  "slip_type": "請求書",
+  "customer_name": "納品先または請求先名",
+  "issuer_name": "発行元・出荷者名",
   "date": "YYYY-MM-DD",
   "total_amount_with_tax": 0,
   "tax_amount": 0,
   "subtotal_without_tax": 0,
   "tax_rate": "8%",
   "items": [
-    {"item_name": "品名", "quantity": 1, "unit_price": 0, "subtotal": 0, "tax_rate": "8%", "remarks": ""}
-  ]
+    {
+      "item_name": "商品名",
+      "quantity": 10,
+      "unit": "箱",
+      "unit_price": 1500,
+      "subtotal": 15000,
+      "tax_rate": "8%",
+      "remarks": ""
+    }
+  ],
+  "layout": {
+    "sheet_name": "請求書",
+    "orientation": "portrait",
+    "col_widths": [24, 10, 14, 16, 10, 20],
+    "merges": ["A1:F1", "A2:C2", "D2:F2"],
+    "cells": [
+      {"r": 1, "c": 1, "v": "御請求書", "type": "text", "font": {"b": true, "sz": 16}, "align": {"h": "center"}},
+      {"r": 2, "c": 1, "v": "宛名", "type": "text", "font": {"b": true, "sz": 12}},
+      {"r": 2, "c": 4, "v": "発行元", "type": "text", "font": {"sz": 10}, "align": {"h": "right"}}
+    ]
+  }
 }
-"""
-            # タイムアウトを30秒へ短縮しUIスタックを防止
-            for m_name in [AI_MODEL_PRIMARY, "gemini-2.0-flash", "gemini-1.5-flash"]:
-                try:
-                    resp = requests.post(
-                        f"{GEMINI_API_BASE}/{m_name}:generateContent",
-                        headers={"Content-Type": "application/json", "x-goog-api-key": key},
-                        json={
-                            "contents": [{"role": "user", "parts": [{"inlineData": {"mimeType": mime_type, "data": b64_img}}, {"text": vision_prompt}]}],
-                            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 4096}
-                        },
-                        timeout=(10, 30)
-                    )
-                    if resp.status_code == 200:
-                        txt = _extract_gemini_text(resp.json())
-                        if txt:
-                            clean_str = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
-                            clean_str = re.sub(r"\s*```$", "", clean_str)
-                            parsed = json.loads(clean_str)
-                            if parsed and isinstance(parsed, dict) and "items" in parsed:
-                                st.session_state[rl_key] = cur_calls + 1
-                                
-                                # 🤖 算術チェックサム自動検証 & 桁間違い自動補正
-                                validated_items = []
-                                calc_subtotal = 0
-                                has_correction = False
-                                for it in parsed.get("items", []):
-                                    q = clean_num(it.get("quantity", 1))
-                                    p = clean_num(it.get("unit_price", 0))
-                                    s = clean_num(it.get("subtotal", 0))
-                                    
-                                    # 数量×単価と金額の不一致チェック（例: 80円が800円等の桁ズレ検知）
-                                    expected_s = p * q
-                                    if p > 0 and q > 0 and s != expected_s:
-                                        it["subtotal"] = expected_s
-                                        it["remarks"] = str(it.get("remarks", "")) + " (※金額自動補正)"
-                                        has_correction = True
-                                        s = expected_s
-                                    elif s > 0 and q > 0 and p == 0:
-                                        p = int(s / q)
-                                        it["unit_price"] = p
-
-                                    calc_subtotal += s
-                                    validated_items.append(it)
-
-                                parsed["items"] = validated_items
-                                if calc_subtotal > 0:
-                                    parsed["subtotal_without_tax"] = calc_subtotal
-                                    t_rate_val = 0.08 if "8" in str(parsed.get("tax_rate", "8")) else 0.10
-                                    calc_tax = int(calc_subtotal * t_rate_val)
-                                    parsed["tax_amount"] = calc_tax
-                                    parsed["total_amount_with_tax"] = calc_subtotal + calc_tax
-                                
-                                if has_correction:
-                                    parsed["_checksum_warning"] = "⚠️ 算術検証により明細金額の桁ズレを自動補正しました。"
-
-                                return parsed
-                    else:
-                        last_err_msg = f"{m_name} (HTTP {resp.status_code})"
-                except Exception as ex:
-                    last_err_msg = str(ex)
-                    continue
-
-        # ❌ ダミーデータの完全廃止: 架空データは返さず明確なエラーを通知
-        return {
-            "slip_type": "未検出", "customer_name": "", "issuer_name": "",
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
-            "items": [], "layout": None,
-            "error_message": f"画像の解析に失敗しました ({last_err_msg})。APIキーの設定を確認するか、直接入力フォームをご利用ください。"
-        }
-
     # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
     def _xml_escape(val: Any) -> str:
         if val is None:
@@ -4393,27 +4369,52 @@ with tabs[2]:
             st.image(img_bytes, caption=f"アップロードされた伝票: {uploaded_slip_img.name}", use_container_width=True)
 
         with col_result_view:
-            st.markdown(f"#### 🔍 AI解析結果プレビュー（伝票種別: **{slip_res.get('slip_type', '伝票')}**）")
+            detected_slip_type = slip_res.get('slip_type') or slip_res.get('document_type') or '伝票'
+            st.markdown(f"#### 🔍 AI解析結果プレビュー（伝票種別: **{detected_slip_type}**）")
             
             c_head1, c_head2 = st.columns(2)
             with c_head1:
-                st.write(f"• 宛名（納品先）: **{slip_res.get('customer_name', '未検出')}**")
-                st.write(f"• 取引日: **{slip_res.get('date', '未検出')}**")
+                disp_cust = slip_res.get('customer_name') or '未検出'
+                disp_date = slip_res.get('date') or '未検出'
+                st.write(f"• 宛名（請求先/納品先）: **{disp_cust}**")
+                st.write(f"• 取引日（発行日）: **{disp_date}**")
             with c_head2:
-                st.write(f"• 出荷元（荷主）: **{slip_res.get('issuer_name', '未検出')}**")
+                disp_issuer = slip_res.get('issuer_name') or '未検出'
                 tot_amt = int(clean_num(slip_res.get('total_amount_with_tax', 0)))
-                tax_amt = int(clean_num(slip_res.get('tax_amount', 0)))
-                st.write(f"• 合計金額: **¥ {tot_amt:,}**" if tot_amt > 0 else "• 合計金額: **-**")
+                st.write(f"• 出荷元（発行者/荷主）: **{disp_issuer}**")
+                st.write(f"• 税込合計金額: **¥ {tot_amt:,}**" if tot_amt > 0 else "• 税込合計金額: **-**")
+
+            # 警告情報の表示（原本と計算値の差異など）
+            slip_warnings = slip_res.get("warnings", [])
+            for w in slip_warnings:
+                st.caption(f"<span style='color: #b45309;'>{w}</span>", unsafe_allow_html=True)
+
+            sub_amt = int(clean_num(slip_res.get('subtotal_without_tax', 0)))
+            tax_amt = int(clean_num(slip_res.get('tax_amount', 0)))
+            t_rate_str = str(slip_res.get('tax_rate', '8%'))
+            if sub_amt > 0 or tax_amt > 0:
+                c_tax1, c_tax2, c_tax3 = st.columns(3)
+                c_tax1.caption(f"税抜小計: **¥ {sub_amt:,}**")
+                c_tax2.caption(f"消費税 ({t_rate_str}): **¥ {tax_amt:,}**")
+                c_tax3.caption(f"税込合計: **¥ {tot_amt:,}**")
 
             st.write("")
             st.markdown("##### 🛒 認識された明細項目")
             items_list = slip_res.get("items", [])
             if items_list:
                 items_df = pd.DataFrame(items_list)
-                items_display_df = items_df.rename(columns={
-                    "item_name": "品名・規格", "quantity": "数量", "unit_price": "単価 (円)",
-                    "subtotal": "金額 (円)", "tax_rate": "税率", "remarks": "備考・規格ロット"
-                })
+                # 列の安全マッピング
+                col_rename = {
+                    "item_name": "品名・規格",
+                    "quantity": "数量",
+                    "unit": "単位",
+                    "unit_price": "単価 (円)",
+                    "subtotal": "金額 (円)",
+                    "tax_rate": "税率",
+                    "remarks": "備考・規格ロット"
+                }
+                present_cols = [c for c in ["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"] if c in items_df.columns]
+                items_display_df = items_df[present_cols].rename(columns=col_rename)
                 st.dataframe(items_display_df, use_container_width=True)
             else:
                 st.warning("⚠️ 明細項目が検出されませんでした。")
@@ -4439,22 +4440,29 @@ with tabs[2]:
             with col_act_db:
                 if st.button("⚡ この伝票内容を直ちに自動記録する", use_container_width=True, key="btn_import_slip_to_db_v2"):
                     recs_to_add = []
-                    s_date = str(slip_res.get("date", datetime.now().strftime("%Y-%m-%d")))
-                    c_name = str(slip_res.get("customer_name") or slip_res.get("issuer_name") or "手書き取引先").strip()
+                    s_date = str(slip_res.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
+                    # 出荷元（仕入元）があれば最優先、なければ宛名、どちらも無ければデフォルト
+                    c_name = str(slip_res.get("issuer_name") or slip_res.get("customer_name") or "手書き取引先").strip()
                     sheet_tag = f"手書き伝票_{s_date.replace('-', '')}"
 
                     for it in items_list:
-                        q_val = int(clean_num(it.get("quantity", 1)))
-                        p_val = int(clean_num(it.get("unit_price", 0)))
-                        sub_val = int(clean_num(it.get("subtotal", p_val * q_val if p_val > 0 else 0)))
-                        item_str = str(it.get("item_name", "品名未指定")).strip() or "品名未指定"
+                        q_val = int(clean_num(it.get("quantity"), 1))
+                        p_val = int(clean_num(it.get("unit_price"), 0))
+                        # 原本金額を最優先、0の場合は単価×数量で補完
+                        sub_val = int(clean_num(it.get("subtotal"), p_val * q_val if p_val > 0 else 0))
+                        item_str = str(it.get("item_name") or "品名未指定").strip() or "品名未指定"
+                        unit_str = str(it.get("unit") or "").strip()
+                        if unit_str and unit_str not in item_str:
+                            item_display_name = f"{item_str} ({unit_str})"
+                        else:
+                            item_display_name = item_str
 
                         recs_to_add.append({
                             "日付": s_date,
                             "市場番号": c_name,
                             "カテゴリー": "1課 (熊谷・大宮)",
                             "商品コード": "AUTO",
-                            "品名": item_str,
+                            "品名": item_display_name,
                             "単価": p_val,
                             "数量": q_val,
                             "仕入金額": sub_val,
@@ -4464,7 +4472,7 @@ with tabs[2]:
                     if recs_to_add:
                         insert_records_to_db(current_user, recs_to_add)
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"🎉 手書き伝票（{len(recs_to_add)}件 / 宛名: {c_name}）をデータベースへ自動記録しました！")
+                        st.toast(f"🎉 手書き伝票（{len(recs_to_add)}件 / 取引先: {c_name}）をデータベースへ自動記録しました！")
                         st.rerun()
     else:
         st.info("💡 手書きの納品書・受領書・請求書の写真（.jpg / .png）をアップロードすると、ここに自動解析結果プレビューおよびExcel変換ボタンが表示されます。")
