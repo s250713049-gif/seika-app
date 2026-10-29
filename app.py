@@ -689,6 +689,30 @@ def restore_last_deleted_records_db(records_to_restore: list, restored_by: str =
                     except Exception: pass
     invalidate_records_cache()
     return restored_count
+    def get_employee_summary_stats() -> pd.DataFrame:
+    """社員（user_id）ごとの取引登録実績サマリーを取得（論理削除除外・安全ガード付き）"""
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text("""
+                    SELECT 
+                        user_id,
+                        COUNT(id) AS record_count,
+                        COALESCE(SUM(subtotal), 0) AS total_amount,
+                        COALESCE(SUM(quantity), 0) AS total_quantity,
+                        MAX(COALESCE(date, created_at)) AS last_activity
+                    FROM transactions
+                    WHERE is_deleted = 0
+                    GROUP BY user_id
+                    ORDER BY total_amount DESC
+                """),
+                conn
+            )
+            return df
+    except Exception:
+        # テーブル未作成時や例外時でもクラッシュさせず空のDataFrameを安全に返却
+        return pd.DataFrame(columns=["user_id", "record_count", "total_amount", "total_quantity", "last_activity"])
 
 # 🚀 ディスク I/O の非同期化（バックアップ処理によるUIフリーズの完全防止）
 def _bg_backup_task(user_id: str, trigger_reason: str):
