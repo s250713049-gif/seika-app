@@ -2573,7 +2573,7 @@ if st.session_state.logged_in_user is None:
         </div>
     """, unsafe_allow_html=True)
 
-   col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
+    col_l1, col_l2, col_l3 = st.columns([1, 1.2, 1])
     with col_l2:
         with st.form("login_form"):
             username_input = st.text_input("👤 ユーザーID", placeholder="admin, user1, staff_a 等")
