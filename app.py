@@ -8,6 +8,7 @@ import json
 import glob
 import secrets
 import uuid
+import html
 import plotly.express as px
 from sqlalchemy import create_engine, text, event
 import io
@@ -22,6 +23,13 @@ import ctypes
 import gc
 from collections import defaultdict
 from typing import Dict, Tuple, List, Optional, Any
+
+# 🛡️ HTMLエスケープ安全ガード関数（None・未定義・型例外時も安全に文字列フォールバック）
+def safe_html_escape(val: Any) -> str:
+    try:
+        return html.escape(str(val if val is not None else ""))
+    except Exception:
+        return str(val if val is not None else "")
 # ==========================================
 # ページ基本設定 & セキュリティヘッダーCSS (高速描画対応)
 # ==========================================
