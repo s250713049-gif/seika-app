@@ -2464,7 +2464,8 @@ with st.sidebar:
     else:
         st.markdown('<span class="role-badge-staff">👤 営業スタッフ (Staff)</span>', unsafe_allow_html=True)
     
-    st.write(f"ログイン中: **{html.escape(current_user)}**")
+    # 🛡️ safe_html_escape で安全描画
+    st.write(f"ログイン中: **{safe_html_escape(current_user)}**")
     
     if is_using_cloud_db():
         st.markdown('<span class="db-badge-cloud">☁️ Cloud PostgreSQL 稼働中</span>', unsafe_allow_html=True)
@@ -2508,11 +2509,13 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
 
-# ヘッダーバナー（XSS防止 HTML エスケープ適用）
+# ヘッダーバナー（XSS防止 safe_html_escape 適用）
+safe_user = safe_html_escape(current_user)
+safe_role = safe_html_escape(user_role)
 st.markdown(f"""
     <div class="app-header">
         <h1>🍎 青果卸売 在庫・取引管理 Pro</h1>
-        <p><b>担当者:</b> {html.escape(current_user)} ｜ <b>権限:</b> {html.escape(user_role)} ｜ <b>排他制御:</b> WAL・リトライ稼働中</p>
+        <p><b>担当者:</b> {safe_user} ｜ <b>権限:</b> {safe_role} ｜ <b>排他制御:</b> WAL・リトライ稼働中</p>
     </div>
 """, unsafe_allow_html=True)
 
