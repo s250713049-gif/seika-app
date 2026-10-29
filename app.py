@@ -720,6 +720,133 @@ def create_backup_snapshot_async(user_id: str, trigger_reason="定期自動バ�
     return "backup_in_background"
 
 create_backup_snapshot = lambda u, t="手動作成": create_backup_snapshot_async(u, t)
+
+# ==========================================
+# 6.5 バックアップ一覧スキャン & 安全復元関数
+# ==========================================
+def list_all_backups() -> list:
+    """DBテーブル（backup_logs）とローカルファイルを統合・重複排除して最新順に返却"""
+    backups_dict = {}
+
+    # 1. データベース（backup_logs テーブル）からの取得
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT filename, timestamp, created_by, reason, record_count, total_subtotal FROM backup_logs ORDER BY id DESC")
+            ).fetchall()
+            for r in rows:
+                backups_dict[r[0]] = {
+                    "filepath": os.path.join(BACKUP_DIR, r[0]),
+                    "filename": r[0],
+                    "timestamp": r[1],
+                    "created_by": r[2],
+                    "reason": r[3],
+                    "record_count": r[4],
+                    "total_subtotal": r[5],
+                    "source": "db"
+                }
+    except Exception:
+        pass
+
+    # 2. ローカルディスク（data/backups/）からの取得
+    try:
+        files = glob.glob(os.path.join(BACKUP_DIR, "backup_*.json"))
+        files.sort(reverse=True)
+        for fp in files:
+            fname = os.path.basename(fp)
+            if fname in backups_dict:
+                backups_dict[fname]["filepath"] = fp
+                continue
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                    meta = d.get("meta", {})
+                    backups_dict[fname] = {
+                        "filepath": fp,
+                        "filename": fname,
+                        "timestamp": meta.get("timestamp", "不明"),
+                        "created_by": meta.get("created_by", "system"),
+                        "reason": meta.get("reason", "自動作成"),
+                        "record_count": meta.get("record_count", 0),
+                        "total_subtotal": meta.get("total_subtotal", 0),
+                        "source": "file"
+                    }
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    backups = list(backups_dict.values())
+    backups.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+    return backups
+
+def restore_from_backup_file(filepath_or_name: str, restored_by: str = "admin") -> dict:
+    """指定されたバックアップから transactions テーブルを安全復元"""
+    data = None
+    engine = get_engine()
+
+    # 1. ファイルから読み込み
+    if filepath_or_name and os.path.exists(filepath_or_name):
+        try:
+            with open(filepath_or_name, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+
+    # 2. DBの backup_logs テーブルから復元
+    if not data:
+        fname = os.path.basename(filepath_or_name) if filepath_or_name else ""
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT payload_json FROM backup_logs WHERE filename = :fn ORDER BY id DESC LIMIT 1"),
+                    {"fn": fname}
+                ).fetchone()
+                if row and row[0]:
+                    data = json.loads(row[0])
+        except Exception:
+            pass
+
+    if not data or "records" not in data:
+        return {"success": False, "message": "バックアップデータを解析できませんでした。"}
+
+    records = data.get("records", [])
+
+    try:
+        # 復元直前の現行データを自動退避保護
+        create_backup_snapshot_async(restored_by, trigger_reason="データ復元直前の現行データ自動保護")
+
+        with execute_with_retry() as conn:
+            # 物理削除ではなく、既存データをクリアしてバックアップデータを投入
+            conn.execute(text("DELETE FROM transactions;"))
+            for r in records:
+                p = int(clean_num(r.get("unit_price", 0)))
+                q = int(clean_num(r.get("quantity", 0)))
+                sub = int(clean_num(r.get("subtotal", p * q)))
+                conn.execute(
+                    text("""
+                        INSERT INTO transactions 
+                        (date, market_number, category, item_code, item_name, unit_price, quantity, subtotal, user_id, sheet_name, is_deleted, created_at)
+                        VALUES (:d, :m, :c, :ic, :in, :p, :q, :sub, :u, :sn, 0, :cat)
+                    """),
+                    {
+                        "d": str(r.get("date", "")),
+                        "m": str(r.get("market_number", "")),
+                        "c": str(r.get("category", "")),
+                        "ic": str(r.get("item_code", "")),
+                        "in": str(r.get("item_name", "")),
+                        "p": p, "q": q, "sub": sub,
+                        "u": str(r.get("user_id", "restored")),
+                        "sn": str(r.get("sheet_name", "Sheet1")),
+                        "cat": str(r.get("created_at", datetime.now()))
+                    }
+                )
+        invalidate_records_cache()
+        return {"success": True, "restored_count": len(records)}
+    except Exception as e:
+        return {"success": False, "message": f"復元処理エラー: {str(e)}"}
+
 # ==========================================
 # 7. 商品マスタ & カテゴリー連動定義
 # ==========================================
