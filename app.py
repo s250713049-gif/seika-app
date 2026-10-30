@@ -3861,9 +3861,7 @@ with tabs[2]:
   }
 }
 """
-    # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
-    def _xml_escape(val: Any) -> str:
-
+   
     # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
     def _xml_escape(val: Any) -> str:
         if val is None:
