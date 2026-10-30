@@ -3873,10 +3873,8 @@ with tabs[2]:
                      .replace("'", "&apos;"))
 
    def _generate_styled_xlsx_from_layout(layout: dict, slip_dict: dict) -> bytes:
-        """
-        AIが解析したレイアウト・書式情報から openpyxl 等の外部ライブラリを一切使わず
-        純粋な Zip と生 XML で Excel 規格完全準拠の .xlsx バイナリを構築します。
-        """
+        # AIが解析したレイアウト・書式情報から openpyxl 等の外部ライブラリを一切使わず
+        # 純粋な Zip と生 XML で Excel 規格完全準拠の .xlsx バイナリを構築します
         cells_data = layout.get("cells", []) if isinstance(layout, dict) else []
         sheet_name = str(layout.get("sheet_name", slip_dict.get("slip_type", "伝票"))).strip()[:31]
         for ch in [':', '\\', '/', '?', '*', '[', ']']:
