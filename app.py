@@ -3773,73 +3773,38 @@ with tabs[2]:
 
    # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
 　 def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
-        """
-        超高精度Vision AIにより手書き請求書・伝票・納品書画像を完全解析し、
-        テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
-        """
-        key = _resolve_gemini_key()
-        last_err_msg = ""
-        
-        today_s = datetime.now().strftime("%Y%m%d")
-        rl_key = f"rate_limit_ai_{current_user}_{today_s}"
-        cur_calls = st.session_state.get(rl_key, 0)
-        if cur_calls >= 50 and not is_admin:
-            return {
-                "slip_type": "制限到達", "customer_name": "", "issuer_name": "", "date": datetime.now().strftime("%Y-%m-%d"),
-                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "10%",
-                "items": [], "layout": None,
-                "error_message": "本日のAI伝票解析上限（50回/日）に達しました。明日再度ご利用いただくか手入力フォームをご利用ください。"
-            }
+    """
+    超高精度Vision AIにより手書き請求書・伝票・納品書画像を完全解析し、
+    テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
+    """
+    key = _resolve_gemini_key()
+    if not key:
+        return {
+            "slip_type": "エラー", "customer_name": "", "issuer_name": "",
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
+            "items": [], "layout": None,
+            "error_message": "Gemini APIキーが設定されていません。"
+        }
 
-        if not key:
-            return {
-                "slip_type": "未設定", "customer_name": "", "issuer_name": "",
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "10%",
-                "items": [], "layout": None,
-                "error_message": "Gemini APIキーが設定されていません。Secretsまたは環境変数を確認してください。"
-            }
+    import base64
+    b64_img = base64.b64encode(image_bytes).decode("utf-8")
 
-        import base64
-        b64_img = base64.b64encode(image_bytes).decode("utf-8")
-        
-        vision_prompt = """あなたは日本の青果卸売・農業・商業流通における手書き請求書・納品書・受領証・仕入伝票の最高峰OCR・Vision AI解析エンジンです。
-提供された画像の実在する文字（手書き文字・青ペン文字・ゴム印・スタンプ印・印刷文字）、表構造、罫線を極めて高精度に解析し、必ず以下の有効なJSON形式のみを出力してください。架空のデータの捏造は絶対に禁止です。
+    vision_prompt = """あなたは日本の青果卸売・農業流通における「手書き請求書・納品書・伝票」を1文字も漏らさず完全読取・解析する超高精度Vision AIです。
+提供された画像（手書き文字、和暦、スタンプ印、複写紙、印刷罫線）を隅々まで解読し、必ず以下のJSON構造のみを出力してください。
 
-【添付伝票（実画像）の厳格な読取・変換規則】
-1. 伝票種別 (slip_type):
-   - 画像中央上部に印刷されているタイトル（例:「請求書」「納品書」「受領証」等）から正確に特定してください。
-   - 「請求書」とある場合は必ず「請求書」としてください。
+【厳格な読取・変換ルール】
+1. 伝票種別 (slip_type): 画像上部の文字（「請求書」「納品書」「受領書」「出荷伝票」等）から正確に特定。
+2. 宛名 (customer_name): 「〇〇 殿」「〇〇 様御中」等の文字を特定（例: 「（株）庄定 殿」）。
+3. 発行元 (issuer_name): 出荷者・組合名・住所・TEL・登録番号（例: 「築館なめこ生産組合」）。
+4. 日付 (date): 和暦（例: 「R8年9月23日」「令8.9.23」）や「9/23」等は必ず西暦「YYYY-MM-DD」（例: 「2026-09-23」）へ完全標準化。
+5. 明細項目 (items): 手書きの表内のすべての行（品名、規格・ロット、数量、単価、金額、税率）を漏らさず配列化。
+6. レイアウト (layout): 画像の表のセル配置を再現するための cells, merges, col_widths 情報を生成。
 
-2. 宛名・請求先 (customer_name) と 出荷元・発行者 (issuer_name) の峻別:
-   - 「(株)庄定 様」のようにゴム印または手書きで押印・記載された宛先（「様」「殿」「御中」のつく側）を customer_name に設定してください（例: 「(株)庄定」）。
-   - 「築館なめこ生産組合」のように、出荷者・組合名・住所・TEL/FAX・登録番号（T9700150112284）が記載された発行元を issuer_name に設定してください（例: 「築館なめこ生産組合」）。混同は厳禁です。
-
-3. 日付 (date):
-   - 手書きの和暦日付（例: 「R8年 9月 23日」「令8.9.23」等）は、令和年数+2018（例: 令和8年→2026年）として必ず西暦「YYYY-MM-DD」（例: 「2026-09-23」）へ完全標準化してください。
-
-4. 表構造と明細項目 (items):
-   - 印刷された表の見出し（品名、数量、単価、金額など）の下にある手書き明細行を1行も漏らさず抽出してください。
-   - 単価や金額欄が空欄、または「10/S」などの記号・メモ書きであっても、行を落とさず（スキップせず）抽出してください。
-   - 各明細行の抽出項目:
-     * item_name: 品名・規格（例: 「なめこ 100g A S」）
-     * quantity: 数量（例: 「40入」なら 40、読取不可なら 1）
-     * unit: 単位（例: 「入」「箱」「パック」等。なければ空文字）
-     * unit_price: 単価（数値。空欄や記号の場合は 0）
-     * subtotal: 金額（数値。空欄の場合は 0）
-     * tax_rate: 適用税率（"8%" または "10%"）
-     * remarks: 備考・規格ロット・単価欄の記号（例: 「10/S」等）
-
-5. 金額情報 (total_amount_with_tax, subtotal_without_tax, tax_amount):
-   - 合計欄に手書き数値があればその数値を抽出してください。空欄の場合は 0 としてください。
-
-6. 元配置レイアウト (layout):
-   - 画像の伝票配置・表をExcelで完全再現するための cells, merges, col_widths を必ず構築して返却してください。
-
-```json
+【返却するJSONフォーマット】
 {
   "slip_type": "請求書",
-  "customer_name": "(株)庄定",
+  "customer_name": "（株）庄定",
   "issuer_name": "築館なめこ生産組合",
   "date": "2026-09-23",
   "total_amount_with_tax": 0,
@@ -3850,7 +3815,6 @@ with tabs[2]:
     {
       "item_name": "なめこ 100g A S",
       "quantity": 40,
-      "unit": "入",
       "unit_price": 0,
       "subtotal": 0,
       "tax_rate": "10%",
@@ -3859,17 +3823,76 @@ with tabs[2]:
   ],
   "layout": {
     "sheet_name": "請求書",
-    "orientation": "landscape",
-    "col_widths": [24, 10, 12, 14, 10, 15],
-    "merges": ["A1:F1", "A2:C2", "D2:F2"],
+    "col_widths": [20, 10, 12, 14, 10, 15],
     "cells": [
-      {"r": 1, "c": 1, "v": "請求書", "type": "text", "font": {"b": true, "sz": 16}, "align": {"h": "center"}},
-      {"r": 2, "c": 1, "v": "(株)庄定 様", "type": "text", "font": {"b": true, "sz": 12}},
-      {"r": 2, "c": 4, "v": "築館なめこ生産組合", "type": "text", "font": {"sz": 10}, "align": {"h": "right"}},
-      {"r": 3, "c": 1, "v": "日付: 2026-09-23", "type": "text"}
+      {"r": 1, "c": 1, "v": "請求書", "font": {"b": true, "sz": 16}},
+      {"r": 2, "c": 1, "v": "（株）庄定 殿", "font": {"b": true}},
+      {"r": 2, "c": 4, "v": "築館なめこ生産組合"},
+      {"r": 3, "c": 1, "v": "日付: 2026-09-23"}
     ]
   }
 }
+"""
+
+    models_to_try = [AI_MODEL_PRIMARY, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    last_err_msg = ""
+
+    for m_name in models_to_try:
+        try:
+            url = f"{GEMINI_API_BASE}/{m_name}:generateContent"
+            headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+            payload = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                        {"text": vision_prompt}
+                    ]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0.1,
+                    "maxOutputTokens": 4096
+                }
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=(10, 45))
+            if resp.status_code == 200:
+                txt = _extract_gemini_text(resp.json())
+                if txt:
+                    clean_str = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
+                    clean_str = re.sub(r"\s*```$", "", clean_str)
+                    parsed = json.loads(clean_str)
+
+                    if parsed and isinstance(parsed, dict):
+                        raw_d = parsed.get("date", "")
+                        parsed["date"] = parse_japanese_date(raw_d) or datetime.now().strftime("%Y-%m-%d")
+                        
+                        items = parsed.get("items", [])
+                        valid_items = []
+                        for it in items:
+                            q = clean_num(it.get("quantity", 1))
+                            p = clean_num(it.get("unit_price", 0))
+                            s = clean_num(it.get("subtotal", p * q if p > 0 else 0))
+                            it["quantity"] = q if q > 0 else 1
+                            it["unit_price"] = p
+                            it["subtotal"] = s
+                            if it.get("item_name"):
+                                valid_items.append(it)
+                        parsed["items"] = valid_items
+                        return parsed
+            else:
+                last_err_msg = f"{m_name} HTTP {resp.status_code}"
+        except Exception as ex:
+            last_err_msg = str(ex)
+            continue
+
+    return {
+        "slip_type": "未検出", "customer_name": "", "issuer_name": "",
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
+        "items": [], "layout": None,
+        "error_message": f"解析エラー: {last_err_msg}"
+    }
 """
    
     # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
