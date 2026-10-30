@@ -3778,6 +3778,7 @@ with tabs[2]:
     テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
     """
     key = _resolve_gemini_key()
+    key = _resolve_gemini_key()
     if not key:
         return {
             "slip_type": "エラー", "customer_name": "", "issuer_name": "",
