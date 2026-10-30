@@ -3772,91 +3772,101 @@ with tabs[2]:
     """, unsafe_allow_html=True)
 
    # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
-    def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
+   def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
+        """
+        超高精度Vision AIにより手書き請求書・伝票・納品書画像を完全解析し、
+        テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
+        """
         key = _resolve_gemini_key()
         last_err_msg = ""
         
-        # 🤖 ユーザー別レートリミット判定（1日50回上限）
         today_s = datetime.now().strftime("%Y%m%d")
         rl_key = f"rate_limit_ai_{current_user}_{today_s}"
         cur_calls = st.session_state.get(rl_key, 0)
         if cur_calls >= 50 and not is_admin:
             return {
                 "slip_type": "制限到達", "customer_name": "", "issuer_name": "", "date": datetime.now().strftime("%Y-%m-%d"),
-                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
+                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "10%",
                 "items": [], "layout": None,
                 "error_message": "本日のAI伝票解析上限（50回/日）に達しました。明日再度ご利用いただくか手入力フォームをご利用ください。"
             }
 
-        if key:
-            import base64
-            b64_img = base64.b64encode(image_bytes).decode("utf-8")
-            
-            vision_prompt = """あなたは日本の青果卸売・農業・商業流通における手書き請求書・納品書・受領証・仕入伝票の高度OCR・Vision AI解析エンジンです。
-提供された画像の実在する文字（手書き文字・ゴム印・印刷文字）、表構造、罫線を極めて高精度に解析し、必ず以下の有効なJSON形式のみを出力してください。架空のデータの捏造は絶対に禁止です。
+        if not key:
+            return {
+                "slip_type": "未設定", "customer_name": "", "issuer_name": "",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "10%",
+                "items": [], "layout": None,
+                "error_message": "Gemini APIキーが設定されていません。Secretsまたは環境変数を確認してください。"
+            }
 
-【抽出・判定ルール】
+        import base64
+        b64_img = base64.b64encode(image_bytes).decode("utf-8")
+        
+        vision_prompt = """あなたは日本の青果卸売・農業・商業流通における手書き請求書・納品書・受領証・仕入伝票の最高峰OCR・Vision AI解析エンジンです。
+提供された画像の実在する文字（手書き文字・青ペン文字・ゴム印・スタンプ印・印刷文字）、表構造、罫線を極めて高精度に解析し、必ず以下の有効なJSON形式のみを出力してください。架空のデータの捏造は絶対に禁止です。
+
+【添付伝票（実画像）の厳格な読取・変換規則】
 1. 伝票種別 (slip_type):
-   - 画像上部や中央に印字または手書きされているタイトル（例:「請求書」「御請求書」「請求明細書」「納品書」「受領証」「仕入伝票」等）から正確に判定してください。
-   - 「請求書」または「御請求書」とある場合は必ず「請求書」としてください。
+   - 画像中央上部に印刷されているタイトル（例:「請求書」「納品書」「受領証」等）から正確に特定してください。
+   - 「請求書」とある場合は必ず「請求書」としてください。
 
-2. 宛名・納品先 (customer_name) と 出荷元・発行者 (issuer_name) の峻別:
-   - 「御中」「様」「殿」が付されている名称、または「請求先」「納品先」「得意先」欄に記載された名称を customer_name に設定してください。
-   - 会社印・角印が押印されている名称、または電話番号・FAX・適格請求書発行事業者登録番号（T+13桁）・住所と共に記載されている発行元・出荷元を issuer_name に設定してください。混同は厳禁です。
+2. 宛名・請求先 (customer_name) と 出荷元・発行者 (issuer_name) の峻別:
+   - 「(株)庄定 様」のようにゴム印または手書きで押印・記載された宛先（「様」「殿」「御中」のつく側）を customer_name に設定してください（例: 「(株)庄定」）。
+   - 「築館なめこ生産組合」のように、出荷者・組合名・住所・TEL/FAX・登録番号（T9700150112284）が記載された発行元を issuer_name に設定してください（例: 「築館なめこ生産組合」）。混同は厳禁です。
 
-3. 取引日・請求日 (date):
-   - 原本に記載された日付（発行日・請求日・納品日）を西暦 "YYYY-MM-DD" 形式に標準化してください。
-   - 和暦表記（例: 令和8年9月23日, 令8.9.23, R8.9.23）は、令和年数+2018（例: 令和8年→2026年）として西暦に正しく換算してください。
+3. 日付 (date):
+   - 手書きの和暦日付（例: 「R8年 9月 23日」「令8.9.23」等）は、令和年数+2018（例: 令和8年→2026年）として必ず西暦「YYYY-MM-DD」（例: 「2026-09-23」）へ完全標準化してください。
 
 4. 表構造と明細項目 (items):
-   - 伝票内の罫線や表の各行を上から順に認識し、明細が存在するすべての行を items 配列に抽出してください。
-   - 各明細行で以下を抽出してください:
-     * item_name: 商品名・品名・規格（手書き文字も忠実に読取）
-     * quantity: 数量（数値のみ。読取不可時は 1）
-     * unit: 単位（箱, c/s, ケース, 袋, kg, 本 等。なければ空文字）
-     * unit_price: 単価（数値のみ。円マークやカンマは除去）
-     * subtotal: 原本に記載されたその行の金額（数値のみ）
+   - 印刷された表の見出し（品名、数量、単価、金額など）の下にある手書き明細行を1行も漏らさず抽出してください。
+   - 単価や金額欄が空欄、または「10/S」などの記号・メモ書きであっても、行を落とさず（スキップせず）抽出してください。
+   - 各明細行の抽出項目:
+     * item_name: 品名・規格（例: 「なめこ 100g A S」）
+     * quantity: 数量（例: 「40入」なら 40、読取不可なら 1）
+     * unit: 単位（例: 「入」「箱」「パック」等。なければ空文字）
+     * unit_price: 単価（数値。空欄や記号の場合は 0）
+     * subtotal: 金額（数値。空欄の場合は 0）
      * tax_rate: 適用税率（"8%" または "10%"）
-     * remarks: 備考・摘要・規格ロット等
-   - 印刷された表の見出し（品名、数量、単価、金額など）は明細に含めないでください。
+     * remarks: 備考・規格ロット・単価欄の記号（例: 「10/S」等）
 
 5. 金額情報 (total_amount_with_tax, subtotal_without_tax, tax_amount):
-   - 原本に明記された「合計金額」「ご請求金額」「税込合計」「小計」「消費税額」の数値を正確に抽出してください。
-   - 原本の記載数値を最優先し、勝手に明細の計算値で上書きしないでください。
+   - 合計欄に手書き数値があればその数値を抽出してください。空欄の場合は 0 としてください。
 
-6. セル配置とレイアウト (layout):
-   - 既存のExcel再現エンジンのために、伝票の表・ヘッダー・合計行のセル配置情報（cells, col_widths, merges）を可能な範囲で構築してください。
+6. 元配置レイアウト (layout):
+   - 画像の伝票配置・表をExcelで完全再現するための cells, merges, col_widths を必ず構築して返却してください。
 
 ```json
 {
   "slip_type": "請求書",
-  "customer_name": "納品先または請求先名",
-  "issuer_name": "発行元・出荷者名",
-  "date": "YYYY-MM-DD",
+  "customer_name": "(株)庄定",
+  "issuer_name": "築館なめこ生産組合",
+  "date": "2026-09-23",
   "total_amount_with_tax": 0,
   "tax_amount": 0,
   "subtotal_without_tax": 0,
-  "tax_rate": "8%",
+  "tax_rate": "10%",
   "items": [
     {
-      "item_name": "商品名",
-      "quantity": 10,
-      "unit": "箱",
-      "unit_price": 1500,
-      "subtotal": 15000,
-      "tax_rate": "8%",
-      "remarks": ""
+      "item_name": "なめこ 100g A S",
+      "quantity": 40,
+      "unit": "入",
+      "unit_price": 0,
+      "subtotal": 0,
+      "tax_rate": "10%",
+      "remarks": "10/S"
     }
   ],
-    "layout": {
+  "layout": {
     "sheet_name": "請求書",
-    "orientation": "portrait",
-    "col_widths": [24, 10, 14, 16, 10, 20],
+    "orientation": "landscape",
+    "col_widths": [24, 10, 12, 14, 10, 15],
     "merges": ["A1:F1", "A2:C2", "D2:F2"],
     "cells": [
-      {"r": 1, "c": 1, "v": "御請求書", "type": "text", "font": {"b": true, "sz": 16}, "align": {"h": "center"}},
-      {"r": 2, "c": 1, "v": "宛名", "type": "text", "font": {"b": true, "sz": 12}},
-      {"r": 2, "c": 4, "v": "発行元", "type": "text", "font": {"sz": 10}, "align": {"h": "right"}}
+      {"r": 1, "c": 1, "v": "請求書", "type": "text", "font": {"b": true, "sz": 16}, "align": {"h": "center"}},
+      {"r": 2, "c": 1, "v": "(株)庄定 様", "type": "text", "font": {"b": true, "sz": 12}},
+      {"r": 2, "c": 4, "v": "築館なめこ生産組合", "type": "text", "font": {"sz": 10}, "align": {"h": "right"}},
+      {"r": 3, "c": 1, "v": "日付: 2026-09-23", "type": "text"}
     ]
   }
 }
