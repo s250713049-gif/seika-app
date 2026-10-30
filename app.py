@@ -4365,16 +4365,16 @@ with tabs[2]:
             key="handwritten_slip_uploader_unified_v2"
         )
    with col_u2:
-        st.markdown("""
-            <div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; font-size: 12px; color: #475569;">
-                <b>[解析機能] 高精度画像解析 & ハッシュ検知機能:</b><br>
-                &bull; <b>画像変更時に旧解析結果キャッシュを即座に破棄</b><br>
-                &bull; 宛名、出荷元、和暦日付（西暦換算）、品名規格を自動認識<br>
-                &bull; 元伝票の<b>行・列・合計位置を完全保持したExcel化</b><br>
-                &bull; ワンクリックで<b>データベースへ即時自動記録</b>
-            </div>
-        """, unsafe_allow_html=True)
-
+        info_html = (
+            '<div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; font-size: 12px; color: #475569;">'
+            '<b>[解析機能] 高精度画像解析 &amp; ハッシュ検知機能:</b><br>'
+            '&bull; <b>画像変更時に旧解析結果キャッシュを即座に破棄</b><br>'
+            '&bull; 宛名 / 出荷元 / 和暦日付(西暦換算) / 品名規格を自動認識<br>'
+            '&bull; 元伝票の<b>行・列・合計位置を完全保持したExcel化</b><br>'
+            '&bull; ワンクリックで<b>データベースへ即時自動記録</b>'
+            '</div>'
+        )
+        st.markdown(info_html, unsafe_allow_html=True)
     if uploaded_slip_img is not None:
         img_bytes = uploaded_slip_img.getvalue()
         mime_type = uploaded_slip_img.type or "image/jpeg"
