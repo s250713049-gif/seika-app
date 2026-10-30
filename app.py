@@ -3848,7 +3848,7 @@ with tabs[2]:
       "remarks": ""
     }
   ],
-  "layout": {
+    "layout": {
     "sheet_name": "請求書",
     "orientation": "portrait",
     "col_widths": [24, 10, 14, 16, 10, 20],
@@ -3860,6 +3860,10 @@ with tabs[2]:
     ]
   }
 }
+"""
+    # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
+    def _xml_escape(val: Any) -> str:
+
     # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
     def _xml_escape(val: Any) -> str:
         if val is None:
@@ -3872,7 +3876,7 @@ with tabs[2]:
                      .replace('"', "&quot;")
                      .replace("'", "&apos;"))
 
-   def _generate_styled_xlsx_from_layout(layout: dict, slip_dict: dict) -> bytes:
+    def _generate_styled_xlsx_from_layout(layout: dict, slip_dict: dict) -> bytes:
         # AIが解析したレイアウト・書式情報から openpyxl 等の外部ライブラリを一切使わず
         # 純粋な Zip と生 XML で Excel 規格完全準拠の .xlsx バイナリを構築します
         cells_data = layout.get("cells", []) if isinstance(layout, dict) else []
