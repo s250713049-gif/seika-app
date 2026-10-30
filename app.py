@@ -4367,7 +4367,7 @@ with tabs[2]:
     with col_u2:
         st.markdown("""
             <div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; font-size: 12px; color: #475569;">
-                <b>🛡️ 高精度画像解析 & ハッシュ検知機能:</b><br>
+                <b>[解析機能] 高精度画像解析 & ハッシュ検知機能:</b><br>
                 • <b>画像変更時に旧解析結果キャッシュを即座に破棄</b><br>
                 • 宛名、出荷元、和暦日付（西暦換算）、品名規格を自動認識<br>
                 • 元伝票の<b>行・列・合計位置を完全保持したExcel化</b><br>
