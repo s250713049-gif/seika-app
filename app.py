@@ -4259,11 +4259,9 @@ with tabs[2]:
 
         return bio.getvalue()
 
-    def build_handwritten_slip_exact_xlsx(slip_dict: dict) -> bytes:
-        """
-        AIが検出したレイアウト情報がある場合は完全書式保持でExcelを生成し、
-        レイアウトが無い場合でも架空データを含まない安全なグリッドフォールバックでExcelを生成します。
-        """
+   def build_handwritten_slip_exact_xlsx(slip_dict: dict) -> bytes:
+        # AIが検出したレイアウト情報がある場合は完全書式保持でExcelを生成し、
+        # レイアウトが無い場合でも実データに基づき安全なグリッドでExcelを生成します。
         layout = slip_dict.get("layout") if isinstance(slip_dict, dict) else None
         
         # 1. AI抽出レイアウトが存在する場合: 完全書式保持OOXML生成
