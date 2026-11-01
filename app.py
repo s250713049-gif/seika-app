@@ -4545,7 +4545,16 @@ with tabs[3]:
         cat_summary_str = cat_summary if cat_summary else "単一課運用"
         sample_lines_str = "\n".join(sample_lines)
 
-       return f"""
+        return (
+            "【最新の社内青果取引実績データ】\n"
+            f"・集計期間: {min_d} 〜 {max_d}\n"
+            f"・総取引件数: {total_rec:,} 件 / 総仕入額: ¥{total_sub:,} / 取扱数量: {total_q:,}\n"
+            f"・平均取引単価: ¥{avg_p:,}\n"
+            f"・課別構成比: {cat_summary_str}\n"
+            f"・売上上位品目: {top_items_str}\n"
+            "・最新取引明細抜粋:\n"
+            f"{sample_lines_str}"
+        )
 【最新の社内青果取引実績データ】
 ・集計期間: {min_d} 〜 {max_d}
 ・総取引件数: {total_rec:,} 件 / 総仕入額: ¥{total_sub:,} / 取扱数量: {total_q:,}
