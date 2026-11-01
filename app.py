@@ -4564,7 +4564,7 @@ with tabs[3]:
 ・最新取引明細抜粋:
 {chr(10).join(sample_lines)}
 """
-差し替えて保存しアプリを再起動（またはブラウザリロード）すると、正常に起動します。
+
 
     # 2. 対話型AIエンジン呼出（Gemini 1.5 Pro / 高精度ローカルフォールバック両対応）
     def ask_produce_ai_chat(history_msgs: list, df_context: pd.DataFrame) -> str:
