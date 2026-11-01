@@ -4515,7 +4515,7 @@ with tabs[2]:
 with tabs[3]:
     st.markdown('<div class="section-title">🧠 対話型スマート青果AIアナライザー (最高峰AIモデル・文脈自動参照)</div>', unsafe_allow_html=True)
 
-    # 1. 社内DBコンテキストの動的生成（RAGコンテキスト注入）
+   # 1. 社内DBコンテキストの動的生成（RAGコンテキスト注入）
     def build_produce_db_context_str(df: pd.DataFrame) -> str:
         if df is None or df.empty:
             return "現在データベースに登録された取引データはありません。"
@@ -4541,7 +4541,20 @@ with tabs[3]:
         for _, row_item in df[display_cols].head(6).iterrows():
             sample_lines.append(f"- {row_item.get('日付')}: {row_item.get('品名')} 単価¥{row_item.get('単価')} 数量{row_item.get('数量')} 金額¥{row_item.get('仕入金額')} ({row_item.get('カテゴリー')})")
 
-        return f"""
+        top_items_str = ", ".join(top_items_list) if top_items_list else "集計中"
+        cat_summary_str = cat_summary if cat_summary else "単一課運用"
+        sample_lines_str = "\n".join(sample_lines)
+
+        return (
+            "【最新の社内青果取引実績データ】\n"
+            f"・集計期間: {min_d} 〜 {max_d}\n"
+            f"・総取引件数: {total_rec:,} 件 / 総仕入額: ¥{total_sub:,} / 取扱数量: {total_q:,}\n"
+            f"・平均取引単価: ¥{avg_p:,}\n"
+            f"・課別構成比: {cat_summary_str}\n"
+            f"・売上上位品目: {top_items_str}\n"
+            "・最新取引明細抜粋:\n"
+            f"{sample_lines_str}"
+        )
 【最新の社内青果取引実績データ】
 ・集計期間: {min_d} 〜 {max_d}
 ・総取引件数: {total_rec:,} 件 / 総仕入額: ¥{total_sub:,} / 取扱数量: {total_q:,}
