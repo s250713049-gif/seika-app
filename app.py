@@ -3771,27 +3771,26 @@ with tabs[2]:
         </div>
     """, unsafe_allow_html=True)
 
-   # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
+  # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
     def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         """
         超高精度Vision AIにより手書き請求書・伝票・納品書画像を完全解析し、
         テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
         """
         key = _resolve_gemini_key()
-        key = _resolve_gemini_key()
-    if not key:
-        return {
-            "slip_type": "エラー", "customer_name": "", "issuer_name": "",
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
-            "items": [], "layout": None,
-            "error_message": "Gemini APIキーが設定されていません。"
-        }
+        if not key:
+            return {
+                "slip_type": "エラー", "customer_name": "", "issuer_name": "",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
+                "items": [], "layout": None,
+                "error_message": "Gemini APIキーが設定されていません。"
+            }
 
-    import base64
-    b64_img = base64.b64encode(image_bytes).decode("utf-8")
+        import base64
+        b64_img = base64.b64encode(image_bytes).decode("utf-8")
 
-    vision_prompt = """あなたは日本の青果卸売・農業流通における「手書き請求書・納品書・伝票」を1文字も漏らさず完全読取・解析する超高精度Vision AIです。
+        vision_prompt = """あなたは日本の青果卸売・農業流通における「手書き請求書・納品書・伝票」を1文字も漏らさず完全読取・解析する超高精度Vision AIです。
 提供された画像（手書き文字、和暦、スタンプ印、複写紙、印刷罫線）を隅々まで解読し、必ず以下のJSON構造のみを出力してください。
 
 【厳格な読取・変換ルール】
@@ -3835,66 +3834,65 @@ with tabs[2]:
 }
 """
 
-    models_to_try = [AI_MODEL_PRIMARY, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-    last_err_msg = ""
+        models_to_try = [AI_MODEL_PRIMARY, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        last_err_msg = ""
 
-    for m_name in models_to_try:
-        try:
-            url = f"{GEMINI_API_BASE}/{m_name}:generateContent"
-            headers = {"Content-Type": "application/json", "x-goog-api-key": key}
-            payload = {
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"inlineData": {"mimeType": mime_type, "data": b64_img}},
-                        {"text": vision_prompt}
-                    ]
-                }],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "temperature": 0.1,
-                    "maxOutputTokens": 4096
+        for m_name in models_to_try:
+            try:
+                url = f"{GEMINI_API_BASE}/{m_name}:generateContent"
+                headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+                payload = {
+                    "contents": [{
+                        "role": "user",
+                        "parts": [
+                            {"inlineData": {"mimeType": mime_type, "data": b64_img}},
+                            {"text": vision_prompt}
+                        ]
+                    }],
+                    "generationConfig": {
+                        "responseMimeType": "application/json",
+                        "temperature": 0.1,
+                        "maxOutputTokens": 4096
+                    }
                 }
-            }
-            resp = requests.post(url, headers=headers, json=payload, timeout=(10, 45))
-            if resp.status_code == 200:
-                txt = _extract_gemini_text(resp.json())
-                if txt:
-                    clean_str = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
-                    clean_str = re.sub(r"\s*```$", "", clean_str)
-                    parsed = json.loads(clean_str)
+                resp = requests.post(url, headers=headers, json=payload, timeout=(10, 45))
+                if resp.status_code == 200:
+                    txt = _extract_gemini_text(resp.json())
+                    if txt:
+                        clean_str = re.sub(r"^```(?:json)?\s*", "", txt.strip(), flags=re.I)
+                        clean_str = re.sub(r"\s*```$", "", clean_str)
+                        parsed = json.loads(clean_str)
 
-                    if parsed and isinstance(parsed, dict):
-                        raw_d = parsed.get("date", "")
-                        parsed["date"] = parse_japanese_date(raw_d) or datetime.now().strftime("%Y-%m-%d")
-                        
-                        items = parsed.get("items", [])
-                        valid_items = []
-                        for it in items:
-                            q = clean_num(it.get("quantity", 1))
-                            p = clean_num(it.get("unit_price", 0))
-                            s = clean_num(it.get("subtotal", p * q if p > 0 else 0))
-                            it["quantity"] = q if q > 0 else 1
-                            it["unit_price"] = p
-                            it["subtotal"] = s
-                            if it.get("item_name"):
-                                valid_items.append(it)
-                        parsed["items"] = valid_items
-                        return parsed
-            else:
-                last_err_msg = f"{m_name} HTTP {resp.status_code}"
-        except Exception as ex:
-            last_err_msg = str(ex)
-            continue
+                        if parsed and isinstance(parsed, dict):
+                            raw_d = parsed.get("date", "")
+                            parsed["date"] = parse_japanese_date(raw_d) or datetime.now().strftime("%Y-%m-%d")
+                            
+                            items = parsed.get("items", [])
+                            valid_items = []
+                            for it in items:
+                                q = clean_num(it.get("quantity", 1))
+                                p = clean_num(it.get("unit_price", 0))
+                                s = clean_num(it.get("subtotal", p * q if p > 0 else 0))
+                                it["quantity"] = q if q > 0 else 1
+                                it["unit_price"] = p
+                                it["subtotal"] = s
+                                if it.get("item_name"):
+                                    valid_items.append(it)
+                            parsed["items"] = valid_items
+                            return parsed
+                else:
+                    last_err_msg = f"{m_name} HTTP {resp.status_code}"
+            except Exception as ex:
+                last_err_msg = str(ex)
+                continue
 
-    return {
-        "slip_type": "未検出", "customer_name": "", "issuer_name": "",
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
-        "items": [], "layout": None,
-        "error_message": f"解析エラー: {last_err_msg}"
-    }
-"""
+        return {
+            "slip_type": "未検出", "customer_name": "", "issuer_name": "",
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
+            "items": [], "layout": None,
+            "error_message": f"解析エラー: {last_err_msg}"
+        }
    
     # 2. 完全書式保持・OOXMLダイレクト生成エンジン（styles.xml・結合・罫線・列幅・行高対応）
     def _xml_escape(val: Any) -> str:
@@ -4259,7 +4257,7 @@ with tabs[2]:
 
         return bio.getvalue()
 
-   def build_handwritten_slip_exact_xlsx(slip_dict: dict) -> bytes:
+        def build_handwritten_slip_exact_xlsx(slip_dict: dict) -> bytes:
         # AIが検出したレイアウト情報がある場合は完全書式保持でExcelを生成し、
         # レイアウトが無い場合でも実データに基づき安全なグリッドでExcelを生成します。
         layout = slip_dict.get("layout") if isinstance(slip_dict, dict) else None
@@ -4555,15 +4553,7 @@ with tabs[3]:
             "・最新取引明細抜粋:\n"
             f"{sample_lines_str}"
         )
-【最新の社内青果取引実績データ】
-・集計期間: {min_d} 〜 {max_d}
-・総取引件数: {total_rec:,} 件 / 総仕入額: ¥{total_sub:,} / 取扱数量: {total_q:,}
-・平均取引単価: ¥{avg_p:,}
-・課別構成比: {cat_summary if cat_summary else "単一課運用"}
-・売上上位品目: {', '.join(top_items_list) if top_items_list else "集計中"}
-・最新取引明細抜粋:
-{chr(10).join(sample_lines)}
-"""
+
 
     # 2. 対話型AIエンジン呼出（Gemini 1.5 Pro / 高精度ローカルフォールバック両対応）
     def ask_produce_ai_chat(history_msgs: list, df_context: pd.DataFrame) -> str:
