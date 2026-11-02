@@ -4541,7 +4541,7 @@ with tabs[3]:
         for _, row_item in df[display_cols].head(6).iterrows():
             sample_lines.append(f"- {row_item.get('日付')}: {row_item.get('品名')} 単価¥{row_item.get('単価')} 数量{row_item.get('数量')} 金額¥{row_item.get('仕入金額')} ({row_item.get('カテゴリー')})")
 
-       top_items_str = ", ".join(top_items_list) if top_items_list else "集計中"
+        top_items_str = ", ".join(top_items_list) if top_items_list else "集計中"
         cat_summary_str = cat_summary if cat_summary else "単一課運用"
         sample_lines_str = "\n".join(sample_lines)
 
@@ -4564,7 +4564,6 @@ with tabs[3]:
 ・最新取引明細抜粋:
 {chr(10).join(sample_lines)}
 """
-
 
     # 2. 対話型AIエンジン呼出（Gemini 1.5 Pro / 高精度ローカルフォールバック両対応）
     def ask_produce_ai_chat(history_msgs: list, df_context: pd.DataFrame) -> str:
