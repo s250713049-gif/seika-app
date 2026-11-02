@@ -4364,7 +4364,7 @@ with tabs[2]:
             type=["jpg", "jpeg", "png"],
             key="handwritten_slip_uploader_unified_v2"
         )
-   with col_u2:
+    with col_u2:
         info_html = (
             '<div style="background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 12px; font-size: 12px; color: #475569;">'
             '<b>[解析機能] 高精度画像解析 &amp; ハッシュ検知機能:</b><br>'
