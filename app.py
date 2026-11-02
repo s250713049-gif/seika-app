@@ -1,4 +1,4 @@
-import streamlit as st
+　import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import os
@@ -3773,12 +3773,12 @@ with tabs[2]:
 
    # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
     def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
-    """
-    超高精度Vision AIにより手書き請求書・伝票・納品書画像を完全解析し、
-    テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
-    """
-    key = _resolve_gemini_key()
-    key = _resolve_gemini_key()
+        """
+        超高精度Vision AIにより手書き請求書・伝票・納品書画像を完全解析し、
+        テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
+        """
+        key = _resolve_gemini_key()
+        key = _resolve_gemini_key()
     if not key:
         return {
             "slip_type": "エラー", "customer_name": "", "issuer_name": "",
