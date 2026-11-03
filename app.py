@@ -3999,7 +3999,7 @@ with tabs[2]:
             "confidence": {"customer": "低", "issuer": "低", "date": "低", "total": "低", "items": "低"},
             "error_message": f"解析エラー: {last_err_msg}"
         }
-                }
+               }
                 resp = requests.post(url, headers=headers, json=payload, timeout=(10, 60))
                 if resp.status_code == 200:
                     txt = _extract_gemini_text(resp.json())
