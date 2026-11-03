@@ -4509,7 +4509,7 @@ with tabs[2]:
         with col_img_view:
             st.image(img_bytes, caption=f"アップロードされた伝票: {uploaded_slip_img.name}", use_container_width=True)
 
-with col_result_view:
+        with col_result_view:
             detected_slip_type = slip_res.get('slip_type') or '請求書'
             st.markdown(f"#### 🔍 AI解析結果プレビュー（帳票種別: **{detected_slip_type}**）")
 
@@ -4656,9 +4656,8 @@ with col_result_view:
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
                         st.toast(f"🎉 請求書取引データ（{len(recs_to_add)}件 / 取引先: {c_name}）をデータベースへ自動記録しました！")
                         st.rerun()
-    　　    else:
-             st.info("💡 手書きの納品書・受領書・請求書の写真（.jpg / .png）をアップロードすると、ここに自動解析結果プレビューおよびExcel変換ボタンが表示されます。")
-
+    else:
+        st.info("💡 手書きの納品書・受領書・請求書の写真（.jpg / .png）をアップロードすると、ここに自動解析結果プレビューおよびExcel変換ボタンが表示されます。")
 # ==========================================
 # タブ 4: 対話型スマート青果AIアナライザー (Gemini 1.5 Pro & 高度対話チャット)
 # ==========================================
