@@ -3989,7 +3989,7 @@ with tabs[2]:
                 last_err_msg = str(ex)
                 continue
 
-        return {
+       return {
             "slip_type": "未検出", "customer_name": "", "issuer_name": "",
             "partner_name": "取引先未判定", "invoice_number": "", "date": "",
             "invoice_date": "", "delivery_date": "", "due_date": "",
