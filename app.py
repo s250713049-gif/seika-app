@@ -3774,67 +3774,102 @@ with tabs[2]:
  # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
     def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         """
-        超高精度Vision AIにより手書き請求書・伝票・納品書画像を完全解析し、
-        テキスト・数値・和暦日付・明細行・元配置レイアウトを100%抽出する改善エンジン
+        超高精度Vision AIにより手書き・印刷請求書/納品書/伝票画像を完全解析し、
+        取引先情報・和暦西暦日付・明細行・税率別金額・レイアウトを正確に抽出するエンジン
         """
         key = _resolve_gemini_key()
         if not key:
             return {
-                "slip_type": "エラー", "customer_name": "", "issuer_name": "",
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
-                "items": [], "layout": None,
+                "slip_type": "未検出", "customer_name": "未検出", "issuer_name": "未検出",
+                "invoice_number": "", "date": "", "invoice_date": "", "delivery_date": "", "due_date": "",
+                "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0,
+                "tax_rate": "8%", "tax_8_subtotal": 0, "tax_10_subtotal": 0,
+                "items": [], "layout": None, "warnings": [],
+                "confidence": {"customer": "低", "issuer": "低", "date": "低", "total": "低", "items": "低"},
                 "error_message": "Gemini APIキーが設定されていません。"
             }
 
         import base64
         b64_img = base64.b64encode(image_bytes).decode("utf-8")
 
-        vision_prompt = """あなたは日本の青果卸売・農業流通における「手書き請求書・納品書・伝票」を1文字も漏らさず完全読取・解析する超高精度Vision AIです。
-提供された画像（手書き文字、和暦、スタンプ印、複写紙、印刷罫線）を隅々まで解読し、必ず以下のJSON構造のみを出力してください。
+        vision_prompt = """あなたは日本の商業流通・青果卸売における「請求書・納品書・受領書・出荷伝票」の専門OCRおよび帳票解析AIです。
+提供された画像（印刷活字、手書き文字、和暦、インボイス登録番号、ゴム印、表罫線、各種レイアウト）を精密に解析し、必ず以下の仕様に従ってJSONのみを出力してください。
 
-【厳格な読取・変換ルール】
-1. 伝票種別 (slip_type): 画像上部の文字（「請求書」「納品書」「受領書」「出荷伝票」等）から正確に特定。
-2. 宛名 (customer_name): 「〇〇 殿」「〇〇 様御中」等の文字を特定（例: 「（株）庄定 殿」）。
-3. 発行元 (issuer_name): 出荷者・組合名・住所・TEL・登録番号（例: 「築館なめこ生産組合」）。
-4. 日付 (date): 和暦（例: 「R8年9月23日」「令8.9.23」）や「9/23」等は必ず西暦「YYYY-MM-DD」（例: 「2026-09-23」）へ完全標準化。
-5. 明細項目 (items): 手書きの表内のすべての行（品名、規格・ロット、数量、単価、金額、税率）を漏らさず配列化。
-6. レイアウト (layout): 画像の表のセル配置を再現するための cells, merges, col_widths 情報を生成。
+【厳格な抽出・認識ルール】
+1. 帳票種別 (slip_type):
+   - 画像上部や中央の見出しから「請求書」「適格請求書」「御請求書」「納品書」「受領書」「出荷明細書」等を特定。不明なら「請求書」。
+
+2. 宛名・請求先・納品先 (customer_name):
+   - 「〇〇 殿」「〇〇 御中」「〇〇 様」「請求先：〇〇」「納入先：〇〇」など、請求や納品を受ける側の企業名・屋号を特定。
+   - 敬称（御中、様、殿）の有無に関わらず、正式名称を抽出。画像から確認できない場合は空文字 ""（勝手に推測しない）。
+
+3. 出荷元・発行元・荷主 (issuer_name):
+   - 請求書を発行した側（出荷元、荷主、販売元、農協、生産組合、会社名）。通常は右上、上部、または最下部に記載。
+   - インボイス登録番号 (invoice_number): 「T+13桁の数字」（例: T1234567890123）があれば抽出。
+
+4. 日付の識別・完全標準化 (date, invoice_date, delivery_date, due_date):
+   - 【最重要】画像内に記載されている実日付のみを抽出すること。画像に日付が一切見当たらない場合は、絶対に今日の日付を捏造せず空文字 "" を返却すること。
+   - 令和 (R/令/令和)、平成 (H/平/平成)、昭和の和暦は必ず西暦「YYYY-MM-DD」形式に変換（例: 「令8年9月23日」→「2026-09-23」、「R8.11.1」→「2026-11-01」）。
+   - 「発行日 / 請求日 (invoice_date)」「取引日 / 出荷日 (date)」「納品日 (delivery_date)」「支払期日 / 振込期限 (due_date)」をそれぞれ判別。主たる取引日は date に格納。
+
+5. 金額情報 (total_amount_with_tax, subtotal_without_tax, tax_amount):
+   - 「合計金額」「ご請求金額」「税込合計」「総計」等の数値を total_amount_with_tax に整数として正確に抽出。
+   - 「税抜小計」「本体価格計」を subtotal_without_tax に、「消費税額」「税額」を tax_amount に格納。
+   - 軽減税率8%対象額と10%対象額の区分記載があれば、tax_8_subtotal, tax_10_subtotal に格納。
+
+6. 明細項目 (items):
+   - 表内のすべての明細行を漏らさず配列化。
+   - 各行のキー: item_name (品名・商品名・規格), quantity (数量), unit (単位: ケース, 袋, 箱, kg, 本等), unit_price (単価), subtotal (金額), tax_rate (税率: "8%"または"10%"), remarks (規格ロット・備考)。
+   - 単価×数量の計算値と原本記載の金額の整合性を確認すること。
+
+7. 認識信頼度 (confidence):
+   - 各主要項目 (customer, issuer, date, total, items) について "高" / "中" / "低" の信頼度を設定。
 
 【返却するJSONフォーマット】
 {
   "slip_type": "請求書",
-  "customer_name": "（株）庄定",
+  "customer_name": "株式会社丸果青果 殿",
   "issuer_name": "築館なめこ生産組合",
+  "invoice_number": "T1012345678901",
   "date": "2026-09-23",
-  "total_amount_with_tax": 0,
-  "tax_amount": 0,
-  "subtotal_without_tax": 0,
-  "tax_rate": "10%",
+  "invoice_date": "2026-09-23",
+  "delivery_date": "2026-09-22",
+  "due_date": "2026-10-31",
+  "total_amount_with_tax": 23760,
+  "subtotal_without_tax": 22000,
+  "tax_amount": 1760,
+  "tax_rate": "8%",
+  "tax_8_subtotal": 22000,
+  "tax_10_subtotal": 0,
+  "confidence": {
+    "customer": "高",
+    "issuer": "高",
+    "date": "高",
+    "total": "高",
+    "items": "高"
+  },
+  "warnings": [],
   "items": [
     {
-      "item_name": "なめこ 100g A S",
-      "quantity": 40,
-      "unit_price": 0,
-      "subtotal": 0,
-      "tax_rate": "10%",
-      "remarks": "10/S"
+      "item_name": "築館なめこ 100g 40入",
+      "quantity": 6,
+      "unit": "箱",
+      "unit_price": 2000,
+      "subtotal": 12000,
+      "tax_rate": "8%",
+      "remarks": "特選A"
     }
   ],
   "layout": {
     "sheet_name": "請求書",
-    "col_widths": [20, 10, 12, 14, 10, 15],
-    "cells": [
-      {"r": 1, "c": 1, "v": "請求書", "font": {"b": true, "sz": 16}},
-      {"r": 2, "c": 1, "v": "（株）庄定 殿", "font": {"b": true}},
-      {"r": 2, "c": 4, "v": "築館なめこ生産組合"},
-      {"r": 3, "c": 1, "v": "日付: 2026-09-23"}
-    ]
+    "orientation": "portrait",
+    "col_widths": [24, 10, 10, 14, 16, 10, 18]
   }
 }
 """
 
-        models_to_try = [AI_MODEL_PRIMARY, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        # 最新の安定Visionモデルから順にフォールバック実行
+        models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
         last_err_msg = ""
 
         for m_name in models_to_try:
@@ -3852,10 +3887,10 @@ with tabs[2]:
                     "generationConfig": {
                         "responseMimeType": "application/json",
                         "temperature": 0.1,
-                        "maxOutputTokens": 4096
+                        "maxOutputTokens": 8192
                     }
                 }
-                resp = requests.post(url, headers=headers, json=payload, timeout=(10, 45))
+                resp = requests.post(url, headers=headers, json=payload, timeout=(10, 60))
                 if resp.status_code == 200:
                     txt = _extract_gemini_text(resp.json())
                     if txt:
@@ -3864,21 +3899,69 @@ with tabs[2]:
                         parsed = json.loads(clean_str)
 
                         if parsed and isinstance(parsed, dict):
-                            raw_d = parsed.get("date", "")
-                            parsed["date"] = parse_japanese_date(raw_d) or datetime.now().strftime("%Y-%m-%d")
+                            # 日付の正規化（画像に記載がない場合は空文字を維持。今日の日付を勝手に設定しない）
+                            raw_d = str(parsed.get("date") or parsed.get("invoice_date") or "").strip()
+                            parsed["date"] = parse_japanese_date(raw_d) if raw_d else ""
                             
+                            inv_d = str(parsed.get("invoice_date") or "").strip()
+                            if inv_d: parsed["invoice_date"] = parse_japanese_date(inv_d)
+                            
+                            deliv_d = str(parsed.get("delivery_date") or "").strip()
+                            if deliv_d: parsed["delivery_date"] = parse_japanese_date(deliv_d)
+
+                            due_d = str(parsed.get("due_date") or "").strip()
+                            if due_d: parsed["due_date"] = parse_japanese_date(due_d)
+
+                            # 金額数値のクレンジング
+                            parsed["total_amount_with_tax"] = int(clean_num(parsed.get("total_amount_with_tax", 0)))
+                            parsed["subtotal_without_tax"] = int(clean_num(parsed.get("subtotal_without_tax", 0)))
+                            parsed["tax_amount"] = int(clean_num(parsed.get("tax_amount", 0)))
+
+                            # 明細行のクレンジングと算術検算
                             items = parsed.get("items", [])
                             valid_items = []
+                            calc_subtotal = 0
                             for it in items:
+                                it_name = str(it.get("item_name") or "").strip()
+                                if not it_name or it_name in ("合計", "小計", "消費税"):
+                                    continue
                                 q = clean_num(it.get("quantity", 1))
                                 p = clean_num(it.get("unit_price", 0))
-                                s = clean_num(it.get("subtotal", p * q if p > 0 else 0))
+                                s = clean_num(it.get("subtotal", p * q if (p > 0 and q > 0) else 0))
+                                
+                                it["item_name"] = it_name
                                 it["quantity"] = q if q > 0 else 1
                                 it["unit_price"] = p
                                 it["subtotal"] = s
-                                if it.get("item_name"):
-                                    valid_items.append(it)
+                                it["unit"] = str(it.get("unit") or "").strip()
+                                it["tax_rate"] = str(it.get("tax_rate") or "8%").strip()
+                                it["remarks"] = str(it.get("remarks") or "").strip()
+                                valid_items.append(it)
+                                calc_subtotal += s
+
                             parsed["items"] = valid_items
+
+                            # 検算と補正
+                            warnings = []
+                            if parsed["subtotal_without_tax"] == 0 and calc_subtotal > 0:
+                                parsed["subtotal_without_tax"] = calc_subtotal
+
+                            if parsed["total_amount_with_tax"] == 0 and parsed["subtotal_without_tax"] > 0:
+                                estimated_tax = int(round(parsed["subtotal_without_tax"] * 0.08))
+                                parsed["tax_amount"] = estimated_tax
+                                parsed["total_amount_with_tax"] = parsed["subtotal_without_tax"] + estimated_tax
+                                warnings.append("合計金額が未検出のため、明細計算値より推計しました。")
+
+                            # 整合性チェック
+                            if calc_subtotal > 0 and parsed["subtotal_without_tax"] > 0:
+                                diff = abs(calc_subtotal - parsed["subtotal_without_tax"])
+                                if diff > 10:
+                                    warnings.append(f"明細小計合計（¥{calc_subtotal:,}）と原本税抜小計（¥{parsed['subtotal_without_tax']:,}）に差額 ¥{diff:,} があります。")
+
+                            parsed["warnings"] = warnings
+                            if "confidence" not in parsed:
+                                parsed["confidence"] = {"customer": "高", "issuer": "高", "date": "高" if parsed["date"] else "低", "total": "高", "items": "高"}
+
                             return parsed
                 else:
                     last_err_msg = f"{m_name} HTTP {resp.status_code}"
@@ -3887,10 +3970,12 @@ with tabs[2]:
                 continue
 
         return {
-            "slip_type": "未検出", "customer_name": "", "issuer_name": "",
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0, "tax_rate": "8%",
-            "items": [], "layout": None,
+            "slip_type": "未検出", "customer_name": "未検出", "issuer_name": "未検出",
+            "invoice_number": "", "date": "", "invoice_date": "", "delivery_date": "", "due_date": "",
+            "total_amount_with_tax": 0, "tax_amount": 0, "subtotal_without_tax": 0,
+            "tax_rate": "8%", "tax_8_subtotal": 0, "tax_10_subtotal": 0,
+            "items": [], "layout": None, "warnings": [f"AI通信エラー: {last_err_msg}"],
+            "confidence": {"customer": "低", "issuer": "低", "date": "低", "total": "低", "items": "低"},
             "error_message": f"解析エラー: {last_err_msg}"
         }
    
@@ -4258,22 +4343,27 @@ with tabs[2]:
         return bio.getvalue()
 
     def build_handwritten_slip_exact_xlsx(slip_dict: dict) -> bytes:
-        # AIが検出したレイアウト情報がある場合は完全書式保持でExcelを生成し、
-        # レイアウトが無い場合でも実データに基づき安全なグリッドでExcelを生成します。
+        """
+        請求書・納品書のレイアウト、宛名・発行元・インボイス番号・明細表・税率別内訳・合計を
+        元の帳票の配置・書式を可能な限り再現して編集可能なExcel (.xlsx) バイナリを動的生成
+        """
         layout = slip_dict.get("layout") if isinstance(slip_dict, dict) else None
         
-        # 1. AI抽出レイアウトが存在する場合: 完全書式保持OOXML生成
+        # 1. AIが抽出したカスタムセルレイアウトが存在する場合: 完全書式保持OOXML生成
         if layout and isinstance(layout, dict) and layout.get("cells"):
             try:
                 return _generate_styled_xlsx_from_layout(layout, slip_dict)
             except Exception:
                 pass
 
-        # 2. レイアウト情報が無い場合: 実データに基づきフォールバックグリッドを動的構築（架空データは一切排除）
-        stype = str(slip_dict.get("slip_type") or "伝票").strip()
+        # 2. 動的請求書レイアウト生成（固定テンプレートではなく、実データ構造に合わせて構築）
+        stype = str(slip_dict.get("slip_type") or "請求書").strip()
         c_name = str(slip_dict.get("customer_name") or "").strip()
         i_name = str(slip_dict.get("issuer_name") or "").strip()
-        s_date = str(slip_dict.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
+        inv_no = str(slip_dict.get("invoice_number") or "").strip()
+        s_date = str(slip_dict.get("date") or slip_dict.get("invoice_date") or "").strip()
+        due_d = str(slip_dict.get("due_date") or "").strip()
+        
         tot_tax = int(clean_num(slip_dict.get("total_amount_with_tax", 0)))
         tax_val = int(clean_num(slip_dict.get("tax_amount", 0)))
         sub_notax = int(clean_num(slip_dict.get("subtotal_without_tax", 0)))
@@ -4281,76 +4371,97 @@ with tabs[2]:
         items = slip_dict.get("items", []) if isinstance(slip_dict.get("items"), list) else []
 
         fallback_layout = {
-            "sheet_name": stype or "伝票",
+            "sheet_name": stype or "請求書",
             "orientation": "portrait",
-            "col_widths": [24, 10, 14, 16, 10, 20],
-            "row_heights": {"1": 28, "2": 22, "3": 20, "4": 20, "5": 22},
-            "merges": ["A1:F1", "A2:C2", "D2:F2", "A3:C3", "D3:F3"],
+            "col_widths": [26, 10, 8, 14, 16, 10, 20],
+            "row_heights": {"1": 30, "2": 22, "3": 20, "4": 20, "5": 22},
+            "merges": ["A1:G1", "A2:D2", "E2:G2", "A3:D3", "E3:G3", "A4:D4", "E4:G4"],
             "cells": [
+                # 表題（帳票種別見出し）
                 {
                     "r": 1, "c": 1, "v": f"　{stype}　", "type": "text",
-                    "font": {"b": True, "sz": 16, "color": "FF1E293B"},
+                    "font": {"b": True, "sz": 18, "color": "FF1E293B"},
                     "align": {"h": "center", "v": "center"},
                     "border": {"b": "double"}
                 },
+                # 宛名（請求先・納品先）
                 {
-                    "r": 2, "c": 1, "v": f"宛名: {c_name}" if c_name else "", "type": "text",
-                    "font": {"b": True, "sz": 12}, "align": {"h": "left", "v": "center"}
+                    "r": 2, "c": 1, "v": f"宛名: {c_name}" if c_name else "宛名: （未記載）", "type": "text",
+                    "font": {"b": True, "sz": 13}, "align": {"h": "left", "v": "center"}
                 },
+                # 発行元（出荷者・販売者）
                 {
-                    "r": 2, "c": 4, "v": f"発行: {i_name}" if i_name else "", "type": "text",
-                    "font": {"sz": 10}, "align": {"h": "right", "v": "center"}
+                    "r": 2, "c": 5, "v": f"発行元: {i_name}" if i_name else "", "type": "text",
+                    "font": {"b": True, "sz": 11}, "align": {"h": "right", "v": "center"}
                 },
+                # 取引日・発行日
                 {
-                    "r": 3, "c": 1, "v": f"取引日: {s_date}", "type": "text",
+                    "r": 3, "c": 1, "v": f"取引日付: {s_date}" if s_date else "取引日付: （未記載）", "type": "text",
                     "font": {"sz": 10}, "align": {"h": "left", "v": "center"}
                 },
+                # インボイス登録番号
                 {
-                    "r": 3, "c": 4, "v": f"合計金額 (税込): ¥{tot_tax:,}" if tot_tax > 0 else "", "type": "text",
-                    "font": {"b": True, "sz": 11, "color": "FF166534"}, "align": {"h": "right", "v": "center"}
+                    "r": 3, "c": 5, "v": f"登録番号: {inv_no}" if inv_no else "", "type": "text",
+                    "font": {"sz": 10}, "align": {"h": "right", "v": "center"}
                 },
-                # 表ヘッダー
-                {"r": 5, "c": 1, "v": "品名・規格", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": 5, "c": 2, "v": "数量", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": 5, "c": 3, "v": "単価 (円)", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": 5, "c": 4, "v": "金額 (税抜)", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": 5, "c": 5, "v": "税率", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": 5, "c": 6, "v": "備考・規格ロット", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}}
+                # 支払期日（存在する場合）
+                {
+                    "r": 4, "c": 1, "v": f"支払期日: {due_d}" if due_d else "", "type": "text",
+                    "font": {"sz": 10}, "align": {"h": "left", "v": "center"}
+                },
+                # 税込ご請求合計（ヘッダーバナー）
+                {
+                    "r": 4, "c": 5, "v": f"ご請求金額 (税込): ¥{tot_tax:,}" if tot_tax > 0 else "", "type": "text",
+                    "font": {"b": True, "sz": 13, "color": "FF166534"}, "align": {"h": "right", "v": "center"}
+                },
+                # 明細表ヘッダー
+                {"r": 6, "c": 1, "v": "品名・規格", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 6, "c": 2, "v": "数量", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 6, "c": 3, "v": "単位", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 6, "c": 4, "v": "単価 (円)", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 6, "c": 5, "v": "金額 (税抜)", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 6, "c": 6, "v": "税率", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": 6, "c": 7, "v": "備考・規格ロット", "type": "text", "font": {"b": True, "sz": 10}, "fill": "FFF1F5F9", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}}
             ]
         }
 
-        # 明細行の追記
-        cur_row = 6
+        # 明細行の動的展開
+        cur_row = 7
         for it in items:
             q_v = int(clean_num(it.get("quantity", 1)))
             p_v = int(clean_num(it.get("unit_price", 0)))
             sub_v = int(clean_num(it.get("subtotal", p_v * q_v if p_v > 0 else 0)))
+            u_str = str(it.get("unit") or "")
+            rem_str = str(it.get("remarks") or "")
+            it_rate = str(it.get("tax_rate") or t_rate)
+
             fallback_layout["cells"].extend([
                 {"r": cur_row, "c": 1, "v": str(it.get("item_name", "")), "type": "text", "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
                 {"r": cur_row, "c": 2, "v": q_v, "type": "number", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 3, "v": p_v if p_v > 0 else "", "type": "number" if p_v > 0 else "text", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 4, "v": sub_v if sub_v > 0 else "", "type": "number" if sub_v > 0 else "text", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 5, "v": str(it.get("tax_rate", t_rate)), "type": "text", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 6, "v": str(it.get("remarks", "")), "type": "text", "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}}
+                {"r": cur_row, "c": 3, "v": u_str, "type": "text", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 4, "v": p_v if p_v > 0 else "", "type": "number" if p_v > 0 else "text", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 5, "v": sub_v if sub_v > 0 else "", "type": "number" if sub_v > 0 else "text", "numfmt": "#,##0", "align": {"h": "right"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 6, "v": it_rate, "type": "text", "align": {"h": "center"}, "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 7, "v": rem_str, "type": "text", "border": {"t": "thin", "b": "thin", "l": "thin", "r": "thin"}}
             ])
             cur_row += 1
 
-        # 合計行
+        # 合計ブロックの動的構築
         if tot_tax > 0 or sub_notax > 0:
-            fallback_layout["merges"].append(f"A{cur_row}:C{cur_row}")
+            fallback_layout["merges"].append(f"A{cur_row}:D{cur_row}")
             fallback_layout["cells"].extend([
-                {"r": cur_row, "c": 1, "v": "合計 (税抜)", "type": "text", "font": {"b": True}, "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 4, "v": sub_notax if sub_notax > 0 else "", "type": "number", "numfmt": "#,##0", "font": {"b": True}, "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 5, "v": f"消費税 ({t_rate})", "type": "text", "fill": "FFF8FAFC", "align": {"h": "center"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 6, "v": tax_val if tax_val > 0 else "", "type": "number", "numfmt": "#,##0", "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}}
+                {"r": cur_row, "c": 1, "v": "税抜小計 合計", "type": "text", "font": {"b": True}, "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 5, "v": sub_notax if sub_notax > 0 else "", "type": "number", "numfmt": "#,##0", "font": {"b": True}, "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 6, "v": f"消費税 ({t_rate})", "type": "text", "fill": "FFF8FAFC", "align": {"h": "center"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 7, "v": tax_val if tax_val > 0 else "", "type": "number", "numfmt": "#,##0", "fill": "FFF8FAFC", "align": {"h": "right"}, "border": {"t": "medium", "b": "thin", "l": "thin", "r": "thin"}}
             ])
             cur_row += 1
-            fallback_layout["merges"].append(f"A{cur_row}:C{cur_row}")
+            fallback_layout["merges"].append(f"A{cur_row}:D{cur_row}")
             fallback_layout["cells"].extend([
-                {"r": cur_row, "c": 1, "v": "税込総合計", "type": "text", "font": {"b": True, "color": "FF166534"}, "fill": "FFDCFCE7", "align": {"h": "right"}, "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 4, "v": tot_tax if tot_tax > 0 else "", "type": "number", "numfmt": "#,##0", "font": {"b": True, "color": "FF166534"}, "fill": "FFDCFCE7", "align": {"h": "right"}, "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 5, "v": "", "type": "text", "fill": "FFDCFCE7", "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
-                {"r": cur_row, "c": 6, "v": "", "type": "text", "fill": "FFDCFCE7", "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}}
+                {"r": cur_row, "c": 1, "v": "税込総合計", "type": "text", "font": {"b": True, "sz": 12, "color": "FF166534"}, "fill": "FFDCFCE7", "align": {"h": "right"}, "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 5, "v": tot_tax if tot_tax > 0 else "", "type": "number", "numfmt": "#,##0", "font": {"b": True, "sz": 12, "color": "FF166534"}, "fill": "FFDCFCE7", "align": {"h": "right"}, "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 6, "v": "", "type": "text", "fill": "FFDCFCE7", "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}},
+                {"r": cur_row, "c": 7, "v": "", "type": "text", "fill": "FFDCFCE7", "border": {"t": "thin", "b": "double", "l": "thin", "r": "thin"}}
             ])
 
         return _generate_styled_xlsx_from_layout(fallback_layout, slip_dict)
@@ -4398,101 +4509,142 @@ with tabs[2]:
         with col_img_view:
             st.image(img_bytes, caption=f"アップロードされた伝票: {uploaded_slip_img.name}", use_container_width=True)
 
-        with col_result_view:
-            detected_slip_type = slip_res.get('slip_type') or slip_res.get('document_type') or '伝票'
-            st.markdown(f"#### 🔍 AI解析結果プレビュー（伝票種別: **{detected_slip_type}**）")
-            
-            c_head1, c_head2 = st.columns(2)
-            with c_head1:
-                disp_cust = slip_res.get('customer_name') or '未検出'
-                disp_date = slip_res.get('date') or '未検出'
-                st.write(f"• 宛名（請求先/納品先）: **{disp_cust}**")
-                st.write(f"• 取引日（発行日）: **{disp_date}**")
-            with c_head2:
-                disp_issuer = slip_res.get('issuer_name') or '未検出'
-                tot_amt = int(clean_num(slip_res.get('total_amount_with_tax', 0)))
-                st.write(f"• 出荷元（発行者/荷主）: **{disp_issuer}**")
-                st.write(f"• 税込合計金額: **¥ {tot_amt:,}**" if tot_amt > 0 else "• 税込合計金額: **-**")
+with col_result_view:
+            detected_slip_type = slip_res.get('slip_type') or '請求書'
+            st.markdown(f"#### 🔍 AI解析結果プレビュー（帳票種別: **{detected_slip_type}**）")
 
-            # 警告情報の表示（原本と計算値の差異など）
+            # 信頼度バッジの算出・表示
+            conf_dict = slip_res.get("confidence", {})
+            overall_conf = "高" if all(v == "高" for v in conf_dict.values()) else ("中" if any(v in ("高", "中") for v in conf_dict.values()) else "低")
+            conf_color = "#16a34a" if overall_conf == "高" else ("#d97706" if overall_conf == "中" else "#dc2626")
+            st.markdown(f"""
+                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 8px; font-size: 12px;">
+                    <span style="background-color: {conf_color}20; color: {conf_color}; border: 1px solid {conf_color}; padding: 2px 8px; border-radius: 4px; font-weight: bold;">
+                        AI認識精度: {overall_conf}
+                    </span>
+                    <span style="color: #64748b;">（画面上で直接手動修正できます。修正内容はExcel保存・DB登録に完全反映されます）</span>
+                </div>
+            """, unsafe_allow_html=True)
+
+            # 警告情報の表示（原本と計算値の差異、未検出項目等）
             slip_warnings = slip_res.get("warnings", [])
             for w in slip_warnings:
-                st.caption(f"<span style='color: #b45309;'>{w}</span>", unsafe_allow_html=True)
+                st.caption(f"<span style='color: #b45309; font-weight: bold;'>⚠️ {w}</span>", unsafe_allow_html=True)
 
-            sub_amt = int(clean_num(slip_res.get('subtotal_without_tax', 0)))
-            tax_amt = int(clean_num(slip_res.get('tax_amount', 0)))
-            t_rate_str = str(slip_res.get('tax_rate', '8%'))
-            if sub_amt > 0 or tax_amt > 0:
-                c_tax1, c_tax2, c_tax3 = st.columns(3)
-                c_tax1.caption(f"税抜小計: **¥ {sub_amt:,}**")
-                c_tax2.caption(f"消費税 ({t_rate_str}): **¥ {tax_amt:,}**")
-                c_tax3.caption(f"税込合計: **¥ {tot_amt:,}**")
+            # 基本情報の編集可能フォーム
+            st.markdown("##### 📌 基本情報（取引先・日付・金額）")
+            c_f1, c_f2 = st.columns(2)
+            with c_f1:
+                cur_cust = slip_res.get('customer_name') or ''
+                edit_cust = st.text_input("🏢 宛名（請求先・納品先）", value=cur_cust, placeholder="未検出（手入力可能）", key="edit_slip_customer")
+                
+                cur_date = slip_res.get('date') or ''
+                edit_date = st.text_input("📅 取引日 / 発行日 (YYYY-MM-DD)", value=cur_date, placeholder="未検出（手入力可能）", help="画像内の実日付。和暦も自動標準化されます", key="edit_slip_date")
+                
+                cur_inv_no = slip_res.get('invoice_number') or ''
+                edit_inv_no = st.text_input("🔢 インボイス登録番号", value=cur_inv_no, placeholder="例: T1234567890123", key="edit_slip_inv_no")
+
+            with c_f2:
+                cur_issuer = slip_res.get('issuer_name') or ''
+                edit_issuer = st.text_input("🏪 出荷元（発行者・荷主）", value=cur_issuer, placeholder="未検出（手入力可能）", key="edit_slip_issuer")
+
+                cur_tot = int(clean_num(slip_res.get('total_amount_with_tax', 0)))
+                edit_tot = st.number_input("💰 税込合計金額 (円)", min_value=0, value=cur_tot, step=100, key="edit_slip_total_amt")
+
+                cur_sub = int(clean_num(slip_res.get('subtotal_without_tax', 0)))
+                cur_tax = int(clean_num(slip_res.get('tax_amount', 0)))
+                st.caption(f"税抜小計: **¥ {cur_sub:,}** ｜ 消費税額: **¥ {cur_tax:,}** (税率: {slip_res.get('tax_rate', '8%')})")
 
             st.write("")
-            st.markdown("##### 🛒 認識された明細項目")
+            st.markdown("##### 🛒 認識明細項目（セルをクリックして修正・行追加・削除可能）")
             items_list = slip_res.get("items", [])
+            
+            # 編集用DataFrameの構築
             if items_list:
                 items_df = pd.DataFrame(items_list)
-                # 列の安全マッピング
-                col_rename = {
-                    "item_name": "品名・規格",
-                    "quantity": "数量",
-                    "unit": "単位",
-                    "unit_price": "単価 (円)",
-                    "subtotal": "金額 (円)",
-                    "tax_rate": "税率",
-                    "remarks": "備考・規格ロット"
-                }
-                present_cols = [c for c in ["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"] if c in items_df.columns]
-                items_display_df = items_df[present_cols].rename(columns=col_rename)
-                st.dataframe(items_display_df, use_container_width=True)
             else:
-                st.warning("⚠️ 明細項目が検出されませんでした。")
+                items_df = pd.DataFrame([{
+                    "item_name": "品名未指定", "quantity": 1, "unit": "箱",
+                    "unit_price": 0, "subtotal": 0, "tax_rate": "8%", "remarks": ""
+                }])
+
+            for col_req in ["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"]:
+                if col_req not in items_df.columns:
+                    items_df[col_req] = ""
+
+            edited_items_df = st.data_editor(
+                items_df[["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"]],
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config={
+                    "item_name": st.column_config.TextColumn("品名・商品名・規格", required=True),
+                    "quantity": st.column_config.NumberColumn("数量", min_value=1, step=1),
+                    "unit": st.column_config.TextColumn("単位 (箱/袋/kg)"),
+                    "unit_price": st.column_config.NumberColumn("単価 (円)", min_value=0, step=10),
+                    "subtotal": st.column_config.NumberColumn("金額 (円)", min_value=0, step=100),
+                    "tax_rate": st.column_config.SelectboxColumn("税率", options=["8%", "10%"]),
+                    "remarks": st.column_config.TextColumn("備考・ロット")
+                },
+                key="slip_items_data_editor"
+            )
+
+            # 修正内容を最新辞書オブジェクトへ反映（Excel出力・DB記録と100%完全同期）
+            updated_items = edited_items_df.to_dict(orient="records")
+            calc_updated_sub = sum(int(clean_num(it.get("subtotal", 0))) for it in updated_items)
+            calc_updated_tot = edit_tot if edit_tot > 0 else int(round(calc_updated_sub * 1.08))
+
+            synced_slip_data = dict(slip_res)
+            synced_slip_data.update({
+                "slip_type": detected_slip_type,
+                "customer_name": edit_cust.strip(),
+                "issuer_name": edit_issuer.strip(),
+                "invoice_number": edit_inv_no.strip(),
+                "date": edit_date.strip(),
+                "total_amount_with_tax": calc_updated_tot,
+                "subtotal_without_tax": calc_updated_sub,
+                "tax_amount": calc_updated_tot - calc_updated_sub if calc_updated_tot >= calc_updated_sub else 0,
+                "items": updated_items
+            })
 
             st.write("")
             col_act_dl, col_act_db = st.columns(2)
 
-            # Excel ダウンロード（元書式・配置保持）
+            # 📗 Excel ダウンロード（修正後データを元書式・配置保持で生成）
             with col_act_dl:
-                slip_xlsx_bytes = build_handwritten_slip_exact_xlsx(slip_res)
+                slip_xlsx_bytes = build_handwritten_slip_exact_xlsx(synced_slip_data)
                 slip_base_name = uploaded_slip_img.name.rsplit(".", 1)[0]
                 st.download_button(
                     label="📗 元書式保持 Excel (.xlsx) で保存",
                     data=slip_xlsx_bytes,
-                    file_name=f"{slip_base_name}_元配置保持変換.xlsx",
+                    file_name=f"{slip_base_name}_レイアウト変換.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                     type="primary",
-                    key="dl_slip_xlsx_btn_v2"
+                    key="dl_slip_xlsx_btn_v3"
                 )
 
-            # データベースへの即時自動記録
+            # ⚡ データベースへの即時自動記録（修正後データを登録）
             with col_act_db:
-                if st.button("⚡ この伝票内容を直ちに自動記録する", use_container_width=True, key="btn_import_slip_to_db_v2"):
+                if st.button("⚡ この伝票内容を直ちに自動記録する", use_container_width=True, key="btn_import_slip_to_db_v3"):
                     recs_to_add = []
-                    s_date = str(slip_res.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()
-                    # 出荷元（仕入元）があれば最優先、なければ宛名、どちらも無ければデフォルト
-                    c_name = str(slip_res.get("issuer_name") or slip_res.get("customer_name") or "手書き取引先").strip()
-                    sheet_tag = f"手書き伝票_{s_date.replace('-', '')}"
+                    s_date = synced_slip_data["date"] or datetime.now().strftime("%Y-%m-%d")
+                    c_name = synced_slip_data["issuer_name"] or synced_slip_data["customer_name"] or "手書き取引先"
+                    sheet_tag = f"請求書_{s_date.replace('-', '')}"
 
-                    for it in items_list:
+                    for it in updated_items:
+                        it_name = str(it.get("item_name") or "品名未指定").strip() or "品名未指定"
                         q_val = int(clean_num(it.get("quantity"), 1))
                         p_val = int(clean_num(it.get("unit_price"), 0))
-                        # 原本金額を最優先、0の場合は単価×数量で補完
                         sub_val = int(clean_num(it.get("subtotal"), p_val * q_val if p_val > 0 else 0))
-                        item_str = str(it.get("item_name") or "品名未指定").strip() or "品名未指定"
-                        unit_str = str(it.get("unit") or "").strip()
-                        if unit_str and unit_str not in item_str:
-                            item_display_name = f"{item_str} ({unit_str})"
-                        else:
-                            item_display_name = item_str
+                        u_str = str(it.get("unit") or "").strip()
+                        display_name = f"{it_name} ({u_str})" if u_str and u_str not in it_name else it_name
 
                         recs_to_add.append({
                             "日付": s_date,
                             "市場番号": c_name,
                             "カテゴリー": "1課 (熊谷・大宮)",
                             "商品コード": "AUTO",
-                            "品名": item_display_name,
+                            "品名": display_name,
                             "単価": p_val,
                             "数量": q_val,
                             "仕入金額": sub_val,
@@ -4502,7 +4654,7 @@ with tabs[2]:
                     if recs_to_add:
                         insert_records_to_db(current_user, recs_to_add)
                         st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"🎉 手書き伝票（{len(recs_to_add)}件 / 取引先: {c_name}）をデータベースへ自動記録しました！")
+                        st.toast(f"🎉 請求書取引データ（{len(recs_to_add)}件 / 取引先: {c_name}）をデータベースへ自動記録しました！")
                         st.rerun()
     else:
         st.info("💡 手書きの納品書・受領書・請求書の写真（.jpg / .png）をアップロードすると、ここに自動解析結果プレビューおよびExcel変換ボタンが表示されます。")
