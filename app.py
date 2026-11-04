@@ -3772,7 +3772,7 @@ with tabs[2]:
     """, unsafe_allow_html=True)
 
  # 1. 汎用 Vision AI 伝票・請求書・納品書 算術チェックサム検証＆レートリミット内蔵エンジン
-    def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
+   def analyze_handwritten_slip_image_dynamic(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
         """
         超高精度Vision AIにより手書き・印刷請求書/納品書/伝票画像を完全解析し、
         取引先情報・和暦西暦日付・明細行・税率別金額・レイアウトを正確に抽出するエンジン
@@ -3780,6 +3780,7 @@ with tabs[2]:
         key = _resolve_gemini_key()
         if not key:
             return {
+                "is_api_key_missing": True,
                 "slip_type": "未検出", "customer_name": "", "issuer_name": "",
                 "partner_name": "取引先未判定", "invoice_number": "", "date": "",
                 "invoice_date": "", "delivery_date": "", "due_date": "",
@@ -3787,7 +3788,7 @@ with tabs[2]:
                 "tax_rate": "8%", "tax_8_subtotal": 0, "tax_10_subtotal": 0,
                 "items": [], "layout": None, "warnings": ["Gemini APIキーが設定されていません。"],
                 "confidence": {"customer": "低", "issuer": "低", "date": "低", "total": "低", "items": "低"},
-                "error_message": "Gemini APIキーが設定されていません。"
+                "error_message": "Gemini APIキーが設定されていません。上の設定欄またはStreamlit Secretsから設定してください。"
             }
 
         import base64
@@ -3802,16 +3803,17 @@ with tabs[2]:
 
 2. 宛名・請求先・納品先 (customer_name):
    - 請求を受ける側の企業名・屋号・店舗名（「〇〇 殿」「〇〇 御中」「〇〇 様」「請求先：〇〇」）。
-   - 敬称を除いた正式名称と敬称を含めて認識。画像に記載がない場合は空文字 "" を返却（勝手に推測・補完しない）。
+   - 敬称を除いた正式名称と敬称を含めて認識。画像に記載がない場合は空文字 "" を返却（推測で補完しない）。
 
 3. 出荷元・発行元・荷主 (issuer_name) ＆ 取引先判別 (partner_name):
-   - 請求書を発行した側（通常は右上または最下部の会社名、組合名、屋号、住所、TEL）。
+   - 請求書を発行した側（通常は右上または最下部の会社名、組合名、屋号、住所、TEL、FAX）。
    - 取引先代表名 (partner_name) を特定。判別できない場合は「取引先未判定」とする。
-   - インボイス適格請求書発行事業者登録番号 (invoice_number): 「T+13桁の数字」（例: T1234567890123）があれば確実に抽出。
+   - インボイス適格請求書発行事業者登録番号 (invoice_number): 「T+13桁の数字」（例: T9700150112284）があれば確実に抽出。
 
 4. 日付情報の厳格識別・和暦変換 (date, invoice_date, delivery_date, due_date):
    - 【最重要禁止事項】画像に日付が記載されていない場合、システムの今日の日付を勝手に代入してはいけません。記載がない場合は必ず空文字 "" としてください。
-   - 令和 (R/令/令和)、平成 (H/平/平成)、昭和の和暦表記は、必ず西暦「YYYY-MM-DD」形式に変換してください（例: 「令8年9月23日」→「2026-09-23」、「R8.11.1」→「2026-11-01」、「9/23」は年不明なら今年または前後の記載から西暦標準化）。
+   - 令和 (R/令/令和)、平成 (H/平/平成)、昭和の和暦表記は、必ず西暦「YYYY-MM-DD」形式に変換してください（例: 「R8年9月23日」→「2026-09-23」、「令8.9.23」→「2026-09-23」）。
+   - 年の記載がない場合は、根拠なく現在の年を補完せず、月日のみまたは空文字としてください。
    - 日付の役割を分離:
      - date: 主たる取引日（納品日や出荷日）
      - invoice_date: 請求書の発行日
@@ -3819,13 +3821,14 @@ with tabs[2]:
      - due_date: お支払期日・振込期限
 
 5. 金額情報・複数税率内訳 (total_amount_with_tax, subtotal_without_tax, tax_amount):
-   - 「合計金額」「ご請求額」「今回請求額」「税込合計」などの確定総額を total_amount_with_tax に数値（整数）で抽出。
+   - 「合計金額」「ご請求額」「今回請求額」「税込合計」などの確定総額を total_amount_with_tax に数値（整数）で抽出。読み取れない場合は 0 とする。
    - 「税抜小計」「本体計」を subtotal_without_tax に、「消費税等」を tax_amount に格納。
    - 8%軽減税率対象額 (tax_8_subtotal) と 10%標準税率対象額 (tax_10_subtotal) を区別して抽出。
 
 6. 明細表の全行抽出 (items):
    - 表内のすべての明細行（品名・規格、数量、単位、単価、金額、税率、備考）を漏れなく配列化。
-   - 各行キー: item_name (品名・規格・型番), quantity (数量), unit (単位: 箱, ケース, kg, 袋, 個等), unit_price (単価), subtotal (金額), tax_rate (税率: "8%"または"10%"), remarks (備考・ロット)。
+   - 各行キー: item_name (品名・規格・型番), quantity (数量), unit (単位: 箱, ケース, s, kg, 袋, 個等), unit_price (単価), subtotal (金額), tax_rate (税率: "8%"または"10%"), remarks (備考・ロット)。
+   - 数量・単価・金額が読み取れない場合に勝手に 1 や推測値を入力しない。
 
 7. 項目別認識信頼度 (confidence):
    - customer, issuer, date, total, items の各項目について、文字の明瞭度・確実性に基づき "高", "中", "低" を判定。
@@ -3836,7 +3839,7 @@ with tabs[2]:
   "customer_name": "株式会社丸果青果 殿",
   "issuer_name": "築館なめこ生産組合",
   "partner_name": "築館なめこ生産組合",
-  "invoice_number": "T1012345678901",
+  "invoice_number": "T9700150112284",
   "date": "2026-09-23",
   "invoice_date": "2026-09-23",
   "delivery_date": "2026-09-22",
@@ -3874,7 +3877,7 @@ with tabs[2]:
 }
 """
 
-        models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+        models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
         last_err_msg = ""
 
         for m_name in models_to_try:
@@ -3904,7 +3907,6 @@ with tabs[2]:
                         parsed = json.loads(clean_str)
 
                         if parsed and isinstance(parsed, dict):
-                            # 日付の厳格抽出（画像に実在しない場合は空文字を維持。絶対に今日の日付を代入しない）
                             raw_d = str(parsed.get("date") or parsed.get("invoice_date") or "").strip()
                             parsed["date"] = parse_japanese_date(raw_d) if raw_d else ""
                             
@@ -3917,19 +3919,16 @@ with tabs[2]:
                             due_d = str(parsed.get("due_date") or "").strip()
                             parsed["due_date"] = parse_japanese_date(due_d) if due_d else ""
 
-                            # 取引先名の確実な保持
                             issuer = str(parsed.get("issuer_name") or "").strip()
                             cust = str(parsed.get("customer_name") or "").strip()
                             partner = str(parsed.get("partner_name") or "").strip()
                             if not partner or partner == "取引先未判定":
                                 parsed["partner_name"] = issuer or cust or "取引先未判定"
 
-                            # 金額数値のクレンジング
                             parsed["total_amount_with_tax"] = int(clean_num(parsed.get("total_amount_with_tax", 0)))
                             parsed["subtotal_without_tax"] = int(clean_num(parsed.get("subtotal_without_tax", 0)))
                             parsed["tax_amount"] = int(clean_num(parsed.get("tax_amount", 0)))
 
-                            # 明細行のクレンジングと算術検算
                             items = parsed.get("items", [])
                             valid_items = []
                             calc_subtotal = 0
@@ -3953,7 +3952,6 @@ with tabs[2]:
 
                             parsed["items"] = valid_items
 
-                            # 金額の自動検証と警告
                             warnings = []
                             if parsed["subtotal_without_tax"] == 0 and calc_subtotal > 0:
                                 parsed["subtotal_without_tax"] = calc_subtotal
@@ -3983,6 +3981,10 @@ with tabs[2]:
                                 }
 
                             return parsed
+                elif resp.status_code in (401, 403):
+                    last_err_msg = f"{m_name}: APIキー認証エラー (HTTP {resp.status_code})。キーが正しいか確認してください。"
+                elif resp.status_code == 429:
+                    last_err_msg = f"{m_name}: API利用制限・レートリミット到達 (HTTP 429)。少し待って再試行してください。"
                 else:
                     last_err_msg = f"{m_name} HTTP {resp.status_code}"
             except Exception as ex:
@@ -4486,7 +4488,35 @@ with tabs[2]:
             ])
 
         return _generate_styled_xlsx_from_layout(fallback_layout, slip_dict)
-    # 3. アップロード & プレビュー UI
+   # 3. アップロード & プレビュー UI
+    cur_api_key = _resolve_gemini_key()
+    with st.expander("🔑 Gemini APIキー設定（未設定の場合はここに入力）", expanded=(not bool(cur_api_key))):
+        c_k1, c_k2 = st.columns([3, 1.2])
+        with c_k1:
+            inp_k = st.text_input(
+                "Gemini APIキー",
+                value=st.session_state.get("custom_gemini_api_key", ""),
+                type="password",
+                placeholder="AIzaSy...",
+                help="Google AI Studioで取得したAPIキーを入力してください",
+                key="inp_gemini_key_tab3"
+            )
+        with c_k2:
+            st.write("")
+            if st.button("💾 キーを適用して保存", use_container_width=True, key="save_gemini_key_tab3_btn"):
+                if inp_k.strip():
+                    st.session_state["custom_gemini_api_key"] = inp_k.strip()
+                    if "active_slip_res" in st.session_state:
+                        del st.session_state["active_slip_res"]
+                    st.toast("✅ Gemini APIキーを適用しました！")
+                    st.rerun()
+                else:
+                    st.error("APIキーを入力してください")
+        if cur_api_key:
+            st.success("✅ Gemini APIキーが有効です（Vision AI解析が利用可能です）")
+        else:
+            st.info("💡 Streamlit Cloudの「Settings」>「Secrets」に `GEMINI_API_KEY = \"AIzaSy...\"` を設定すると次回以降も自動読み込みされます。")
+
     col_u1, col_u2 = st.columns([2.5, 1.5])
     with col_u1:
         uploaded_slip_img = st.file_uploader(
@@ -4505,201 +4535,203 @@ with tabs[2]:
             '</div>'
         )
         st.markdown(info_html, unsafe_allow_html=True)
+
     if uploaded_slip_img is not None:
         img_bytes = uploaded_slip_img.getvalue()
         mime_type = uploaded_slip_img.type or "image/jpeg"
 
-        # ★ 要件1: 画像ハッシュ判定による過去キャッシュの完全破棄と動的再解析
-        current_img_hash = hashlib.md5(img_bytes).hexdigest()
-        prev_img_hash = st.session_state.get("last_uploaded_slip_hash")
+        if not cur_api_key:
+            st.warning("⚠️ Gemini APIキーが設定されていません。上の『🔑 Gemini APIキー設定』からAPIキーを入力するか、Streamlit Secretsに設定してください。")
+            st.image(img_bytes, caption=f"アップロードされた伝票: {uploaded_slip_img.name}", width=420)
+        else:
+            current_img_hash = hashlib.md5(img_bytes).hexdigest()
+            prev_img_hash = st.session_state.get("last_uploaded_slip_hash")
 
-        if prev_img_hash != current_img_hash:
-            st.session_state["last_uploaded_slip_hash"] = current_img_hash
-            if "active_slip_res" in st.session_state:
-                del st.session_state["active_slip_res"]
+            if prev_img_hash != current_img_hash:
+                st.session_state["last_uploaded_slip_hash"] = current_img_hash
+                if "active_slip_res" in st.session_state:
+                    del st.session_state["active_slip_res"]
 
-        # 解析結果の取得（未解析または新規画像時のみ実行）
-        if "active_slip_res" not in st.session_state:
-            with st.spinner("🤖 手書き文字・数値・レイアウトを精密解析中..."):
-                st.session_state["active_slip_res"] = analyze_handwritten_slip_image_dynamic(img_bytes, mime_type)
+            c_re1, c_re2 = st.columns([2, 3])
+            with c_re1:
+                if st.button("🔄 最新画像でAI再解析を実行", key="btn_force_reanalyze_slip", use_container_width=True):
+                    if "active_slip_res" in st.session_state:
+                        del st.session_state["active_slip_res"]
+                    st.rerun()
 
-        slip_res = st.session_state["active_slip_res"]
+            if "active_slip_res" not in st.session_state:
+                with st.spinner("🤖 手書き文字・数値・レイアウトを精密解析中..."):
+                    st.session_state["active_slip_res"] = analyze_handwritten_slip_image_dynamic(img_bytes, mime_type)
 
-        col_img_view, col_result_view = st.columns([1.8, 2.2])
+            slip_res = st.session_state["active_slip_res"]
 
-        with col_img_view:
-            st.image(img_bytes, caption=f"アップロードされた伝票: {uploaded_slip_img.name}", use_container_width=True)
+            col_img_view, col_result_view = st.columns([1.8, 2.2])
 
-        with col_result_view:
-            detected_slip_type = slip_res.get('slip_type') or '請求書'
-            partner_label = slip_res.get('partner_name') or '取引先未判定'
-            
-            c_title1, c_title2 = st.columns([2.5, 1.5])
-            with c_title1:
-                st.markdown(f"#### 🔍 AI解析結果プレビュー（帳票種別: **{detected_slip_type}**）")
-            with c_title2:
-                # 判定された取引先バッジの表示
+            with col_img_view:
+                st.image(img_bytes, caption=f"アップロードされた伝票: {uploaded_slip_img.name}", use_container_width=True)
+
+            with col_result_view:
+                detected_slip_type = slip_res.get('slip_type') or '請求書'
+                partner_label = slip_res.get('partner_name') or '取引先未判定'
+                
+                c_title1, c_title2 = st.columns([2.5, 1.5])
+                with c_title1:
+                    st.markdown(f"#### 🔍 AI解析結果プレビュー（帳票種別: **{detected_slip_type}**）")
+                with c_title2:
+                    st.markdown(f"""
+                        <div style="text-align: right; padding-top: 4px;">
+                            <span style="background-color: #e0f2fe; color: #0369a1; border: 1px solid #7dd3fc; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: bold;">
+                                🏢 判定取引先: {partner_label}
+                            </span>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                conf_dict = slip_res.get("confidence", {})
+                c_badges = []
+                for k, label in [("customer", "宛名"), ("issuer", "発行元"), ("date", "日付"), ("total", "合計額"), ("items", "明細")]:
+                    lvl = conf_dict.get(k, "中")
+                    clr = "#16a34a" if lvl == "高" else ("#d97706" if lvl == "中" else "#dc2626")
+                    c_badges.append(f"<span style='background-color: {clr}15; color: {clr}; border: 1px solid {clr}; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: bold;'>{label}: {lvl}</span>")
+
                 st.markdown(f"""
-                    <div style="text-align: right; padding-top: 4px;">
-                        <span style="background-color: #e0f2fe; color: #0369a1; border: 1px solid #7dd3fc; padding: 3px 8px; border-radius: 6px; font-size: 11px; font-weight: bold;">
-                            🏢 判定取引先: {partner_label}
-                        </span>
+                    <div style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px;">
+                        <span style="font-size: 11px; color: #475569; font-weight: bold;">AI認識信頼度:</span>
+                        {' '.join(c_badges)}
+                        <span style="font-size: 11px; color: #64748b; margin-left: 4px;">（手動修正した内容は即座にExcel出力・DB保存へ100%反映されます）</span>
                     </div>
                 """, unsafe_allow_html=True)
 
-            # 項目別の認識信頼度バッジ表示
-            conf_dict = slip_res.get("confidence", {})
-            c_badges = []
-            for k, label in [("customer", "宛名"), ("issuer", "発行元"), ("date", "日付"), ("total", "合計額"), ("items", "明細")]:
-                lvl = conf_dict.get(k, "中")
-                clr = "#16a34a" if lvl == "高" else ("#d97706" if lvl == "中" else "#dc2626")
-                c_badges.append(f"<span style='background-color: {clr}15; color: {clr}; border: 1px solid {clr}; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: bold;'>{label}: {lvl}</span>")
+                slip_warnings = slip_res.get("warnings", [])
+                for w in slip_warnings:
+                    st.caption(f"<span style='color: #b45309; font-weight: bold;'>⚠️ {w}</span>", unsafe_allow_html=True)
 
-            st.markdown(f"""
-                <div style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px;">
-                    <span style="font-size: 11px; color: #475569; font-weight: bold;">AI認識信頼度:</span>
-                    {' '.join(c_badges)}
-                    <span style="font-size: 11px; color: #64748b; margin-left: 4px;">（手動修正した内容は即座にExcel出力・DB保存へ100%反映されます）</span>
-                </div>
-            """, unsafe_allow_html=True)
+                st.markdown("##### 📌 基本情報（取引先・日付・金額の照合と修正）")
+                c_f1, c_f2 = st.columns(2)
+                with c_f1:
+                    cur_cust = slip_res.get('customer_name') or ''
+                    edit_cust = st.text_input("🏢 宛名（請求先・納品先）", value=cur_cust, placeholder="未検出（手入力してください）", key="edit_slip_customer_v4")
+                    
+                    cur_date = slip_res.get('date') or ''
+                    edit_date = st.text_input("📅 取引日 / 出荷日 (YYYY-MM-DD)", value=cur_date, placeholder="未検出（画像内に日付がない場合は空欄可）", help="画像内の実日付のみを抽出。今日日付を勝手に補完しません", key="edit_slip_date_v4")
+                    
+                    cur_inv_no = slip_res.get('invoice_number') or ''
+                    edit_inv_no = st.text_input("🔢 インボイス登録番号 (T+13桁)", value=cur_inv_no, placeholder="例: T1234567890123", key="edit_slip_inv_no_v4")
 
-            # 警告情報の表示（原本差額、日付未検出アラート等）
-            slip_warnings = slip_res.get("warnings", [])
-            for w in slip_warnings:
-                st.caption(f"<span style='color: #b45309; font-weight: bold;'>⚠️ {w}</span>", unsafe_allow_html=True)
+                with c_f2:
+                    cur_issuer = slip_res.get('issuer_name') or ''
+                    edit_issuer = st.text_input("🏪 出荷元 / 発行者（取引先名）", value=cur_issuer, placeholder="未検出（手入力してください）", key="edit_slip_issuer_v4")
 
-            # 基本情報のインテリジェント手動修正パネル
-            st.markdown("##### 📌 基本情報（取引先・日付・金額の照合と修正）")
-            c_f1, c_f2 = st.columns(2)
-            with c_f1:
-                cur_cust = slip_res.get('customer_name') or ''
-                edit_cust = st.text_input("🏢 宛名（請求先・納品先）", value=cur_cust, placeholder="未検出（手入力してください）", key="edit_slip_customer_v4")
+                    cur_tot = int(clean_num(slip_res.get('total_amount_with_tax', 0)))
+                    edit_tot = st.number_input("💰 税込合計金額 (円)", min_value=0, value=cur_tot, step=100, key="edit_slip_total_amt_v4")
+
+                    cur_sub = int(clean_num(slip_res.get('subtotal_without_tax', 0)))
+                    cur_tax = int(clean_num(slip_res.get('tax_amount', 0)))
+                    st.caption(f"税抜小計: **¥ {cur_sub:,}** ｜ 消費税額: **¥ {cur_tax:,}** (税率: {slip_res.get('tax_rate', '8%')})")
+
+                st.write("")
+                st.markdown("##### 🛒 認識明細項目（セルを直接クリックして修正・追加・削除可能）")
+                items_list = slip_res.get("items", [])
                 
-                cur_date = slip_res.get('date') or ''
-                edit_date = st.text_input("📅 取引日 / 出荷日 (YYYY-MM-DD)", value=cur_date, placeholder="未検出（画像内に日付がない場合は空欄可）", help="画像内の実日付のみを抽出。今日日付を勝手に補完しません", key="edit_slip_date_v4")
-                
-                cur_inv_no = slip_res.get('invoice_number') or ''
-                edit_inv_no = st.text_input("🔢 インボイス登録番号 (T+13桁)", value=cur_inv_no, placeholder="例: T1234567890123", key="edit_slip_inv_no_v4")
+                if items_list:
+                    items_df = pd.DataFrame(items_list)
+                else:
+                    items_df = pd.DataFrame([{
+                        "item_name": "品名未指定", "quantity": 1, "unit": "箱",
+                        "unit_price": 0, "subtotal": 0, "tax_rate": "8%", "remarks": ""
+                    }])
 
-            with c_f2:
-                cur_issuer = slip_res.get('issuer_name') or ''
-                edit_issuer = st.text_input("🏪 出荷元 / 発行者（取引先名）", value=cur_issuer, placeholder="未検出（手入力してください）", key="edit_slip_issuer_v4")
+                for col_req in ["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"]:
+                    if col_req not in items_df.columns:
+                        items_df[col_req] = ""
 
-                cur_tot = int(clean_num(slip_res.get('total_amount_with_tax', 0)))
-                edit_tot = st.number_input("💰 税込合計金額 (円)", min_value=0, value=cur_tot, step=100, key="edit_slip_total_amt_v4")
-
-                cur_sub = int(clean_num(slip_res.get('subtotal_without_tax', 0)))
-                cur_tax = int(clean_num(slip_res.get('tax_amount', 0)))
-                st.caption(f"税抜小計: **¥ {cur_sub:,}** ｜ 消費税額: **¥ {cur_tax:,}** (税率: {slip_res.get('tax_rate', '8%')})")
-
-            st.write("")
-            st.markdown("##### 🛒 認識明細項目（セルを直接クリックして修正・追加・削除可能）")
-            items_list = slip_res.get("items", [])
-            
-            # 編集用DataFrameの構築
-            if items_list:
-                items_df = pd.DataFrame(items_list)
-            else:
-                items_df = pd.DataFrame([{
-                    "item_name": "品名未指定", "quantity": 1, "unit": "箱",
-                    "unit_price": 0, "subtotal": 0, "tax_rate": "8%", "remarks": ""
-                }])
-
-            for col_req in ["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"]:
-                if col_req not in items_df.columns:
-                    items_df[col_req] = ""
-
-            edited_items_df = st.data_editor(
-                items_df[["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"]],
-                use_container_width=True,
-                num_rows="dynamic",
-                column_config={
-                    "item_name": st.column_config.TextColumn("品名・商品名・規格・型番", required=True),
-                    "quantity": st.column_config.NumberColumn("数量", min_value=1, step=1),
-                    "unit": st.column_config.TextColumn("単位 (箱/袋/kg/個/束)"),
-                    "unit_price": st.column_config.NumberColumn("単価 (円)", min_value=0, step=10),
-                    "subtotal": st.column_config.NumberColumn("金額 (税抜・円)", min_value=0, step=100),
-                    "tax_rate": st.column_config.SelectboxColumn("税率", options=["8%", "10%"]),
-                    "remarks": st.column_config.TextColumn("備考・規格ロット・摘要")
-                },
-                key="slip_items_data_editor_v4"
-            )
-
-            # ユーザーの手動修正を最新辞書オブジェクトへ完全統合（Excel出力・DB記録と100%同期）
-            updated_items = edited_items_df.to_dict(orient="records")
-            calc_updated_sub = sum(int(clean_num(it.get("subtotal", 0))) for it in updated_items)
-            calc_updated_tot = edit_tot if edit_tot > 0 else int(round(calc_updated_sub * 1.08))
-
-            clean_partner = edit_issuer.strip() or edit_cust.strip() or partner_label
-            clean_date = edit_date.strip()
-
-            synced_slip_data = dict(slip_res)
-            synced_slip_data.update({
-                "slip_type": detected_slip_type,
-                "customer_name": edit_cust.strip(),
-                "issuer_name": edit_issuer.strip(),
-                "partner_name": clean_partner,
-                "invoice_number": edit_inv_no.strip(),
-                "date": clean_date,
-                "total_amount_with_tax": calc_updated_tot,
-                "subtotal_without_tax": calc_updated_sub,
-                "tax_amount": calc_updated_tot - calc_updated_sub if calc_updated_tot >= calc_updated_sub else 0,
-                "items": updated_items
-            })
-
-            st.write("")
-            col_act_dl, col_act_db = st.columns(2)
-
-            # 📗 取引先別・動的レイアウト Excel ダウンロード（修正後データを100%反映）
-            with col_act_dl:
-                slip_xlsx_bytes = build_handwritten_slip_exact_xlsx(synced_slip_data)
-                clean_fn_partner = re.sub(r'[\/\\:\*\?"<>\|]', '_', clean_partner)
-                clean_fn_date = clean_date if clean_date else "日付未検出"
-                export_xlsx_filename = f"{detected_slip_type}_{clean_fn_partner}_{clean_fn_date}.xlsx"
-
-                st.download_button(
-                    label=f"📗 取引先別 Excel (.xlsx) で出力保存",
-                    data=slip_xlsx_bytes,
-                    file_name=export_xlsx_filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                edited_items_df = st.data_editor(
+                    items_df[["item_name", "quantity", "unit", "unit_price", "subtotal", "tax_rate", "remarks"]],
                     use_container_width=True,
-                    type="primary",
-                    key="dl_slip_xlsx_btn_v4"
+                    num_rows="dynamic",
+                    column_config={
+                        "item_name": st.column_config.TextColumn("品名・商品名・規格・型番", required=True),
+                        "quantity": st.column_config.NumberColumn("数量", min_value=1, step=1),
+                        "unit": st.column_config.TextColumn("単位 (箱/袋/kg/個/束)"),
+                        "unit_price": st.column_config.NumberColumn("単価 (円)", min_value=0, step=10),
+                        "subtotal": st.column_config.NumberColumn("金額 (税抜・円)", min_value=0, step=100),
+                        "tax_rate": st.column_config.SelectboxColumn("税率", options=["8%", "10%"]),
+                        "remarks": st.column_config.TextColumn("備考・規格ロット・摘要")
+                    },
+                    key="slip_items_data_editor_v4"
                 )
 
-            # ⚡ 取引データベースへの即時自動記録（修正後データを登録）
-            with col_act_db:
-                if st.button("⚡ この伝票内容を直ちに自動記録する", use_container_width=True, key="btn_import_slip_to_db_v4"):
-                    recs_to_add = []
-                    s_date = clean_date or datetime.now().strftime("%Y-%m-%d")
-                    c_name = clean_partner
-                    sheet_tag = f"請求書_{s_date.replace('-', '')}"
+                updated_items = edited_items_df.to_dict(orient="records")
+                calc_updated_sub = sum(int(clean_num(it.get("subtotal", 0))) for it in updated_items)
+                calc_updated_tot = edit_tot if edit_tot > 0 else int(round(calc_updated_sub * 1.08))
 
-                    for it in updated_items:
-                        it_name = str(it.get("item_name") or "品名未指定").strip() or "品名未指定"
-                        q_val = int(clean_num(it.get("quantity"), 1))
-                        p_val = int(clean_num(it.get("unit_price"), 0))
-                        sub_val = int(clean_num(it.get("subtotal"), p_val * q_val if p_val > 0 else 0))
-                        u_str = str(it.get("unit") or "").strip()
-                        display_name = f"{it_name} ({u_str})" if u_str and u_str not in it_name else it_name
+                clean_partner = edit_issuer.strip() or edit_cust.strip() or partner_label
+                clean_date = edit_date.strip()
 
-                        recs_to_add.append({
-                            "日付": s_date,
-                            "市場番号": c_name,
-                            "カテゴリー": "1課 (熊谷・大宮)",
-                            "商品コード": "AUTO",
-                            "品名": display_name,
-                            "単価": p_val,
-                            "数量": q_val,
-                            "仕入金額": sub_val,
-                            "シート名": sheet_tag
-                        })
+                synced_slip_data = dict(slip_res)
+                synced_slip_data.update({
+                    "slip_type": detected_slip_type,
+                    "customer_name": edit_cust.strip(),
+                    "issuer_name": edit_issuer.strip(),
+                    "partner_name": clean_partner,
+                    "invoice_number": edit_inv_no.strip(),
+                    "date": clean_date,
+                    "total_amount_with_tax": calc_updated_tot,
+                    "subtotal_without_tax": calc_updated_sub,
+                    "tax_amount": calc_updated_tot - calc_updated_sub if calc_updated_tot >= calc_updated_sub else 0,
+                    "items": updated_items
+                })
 
-                    if recs_to_add:
-                        insert_records_to_db(current_user, recs_to_add)
-                        st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
-                        st.toast(f"🎉 請求書取引データ（{len(recs_to_add)}件 / 取引先: {c_name}）をデータベースへ自動記録しました！")
-                        st.rerun()
+                st.write("")
+                col_act_dl, col_act_db = st.columns(2)
+
+                with col_act_dl:
+                    slip_xlsx_bytes = build_handwritten_slip_exact_xlsx(synced_slip_data)
+                    clean_fn_partner = re.sub(r'[\/\\:\*\?"<>\|]', '_', clean_partner)
+                    clean_fn_date = clean_date if clean_date else "日付未検出"
+                    export_xlsx_filename = f"{detected_slip_type}_{clean_fn_partner}_{clean_fn_date}.xlsx"
+
+                    st.download_button(
+                        label=f"📗 取引先別 Excel (.xlsx) で出力保存",
+                        data=slip_xlsx_bytes,
+                        file_name=export_xlsx_filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary",
+                        key="dl_slip_xlsx_btn_v4"
+                    )
+
+                with col_act_db:
+                    if st.button("⚡ この伝票内容を直ちに自動記録する", use_container_width=True, key="btn_import_slip_to_db_v4"):
+                        recs_to_add = []
+                        s_date = clean_date or datetime.now().strftime("%Y-%m-%d")
+                        c_name = clean_partner
+                        sheet_tag = f"請求書_{s_date.replace('-', '')}"
+
+                        for it in updated_items:
+                            it_name = str(it.get("item_name") or "品名未指定").strip() or "品名未指定"
+                            q_val = int(clean_num(it.get("quantity"), 1))
+                            p_val = int(clean_num(it.get("unit_price"), 0))
+                            sub_val = int(clean_num(it.get("subtotal"), p_val * q_val if p_val > 0 else 0))
+                            u_str = str(it.get("unit") or "").strip()
+                            display_name = f"{it_name} ({u_str})" if u_str and u_str not in it_name else it_name
+
+                            recs_to_add.append({
+                                "日付": s_date,
+                                "市場番号": c_name,
+                                "カテゴリー": "1課 (熊谷・大宮)",
+                                "商品コード": "AUTO",
+                                "品名": display_name,
+                                "単価": p_val,
+                                "数量": q_val,
+                                "仕入金額": sub_val,
+                                "シート名": sheet_tag
+                            })
+
+                        if recs_to_add:
+                            insert_records_to_db(current_user, recs_to_add)
+                            st.session_state.editor_version = st.session_state.get("editor_version", 0) + 1
+                            st.toast(f"🎉 請求書取引データ（{len(recs_to_add)}件 / 取引先: {c_name}）をデータベースへ自動記録しました！")
+                            st.rerun()
     else:
         st.info("💡 手書きの納品書・受領書・請求書の写真（.jpg / .png）をアップロードすると、ここに自動解析結果プレビューおよびExcel変換ボタンが表示されます。")
 # ==========================================
